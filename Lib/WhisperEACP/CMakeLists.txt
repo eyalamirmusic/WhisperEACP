@@ -5,8 +5,24 @@ add_subdirectory(Core)
 # talks to a capture device.
 add_subdirectory(Audio)
 
+# The op set the encoder and decoder are assembled from. Nothing below it
+# depends on it, so it names no Whisper shape of its own.
+add_subdirectory(Kernels)
+
+# The front-end, on top of Audio's contract.
+add_subdirectory(Mel)
+
+# The weights and the vocabulary. Both read published files rather than a
+# format of ours, and neither includes a header from the two above.
+add_subdirectory(Model)
+add_subdirectory(Tokenizer)
+
 # The whole library, for consumers that don't want to name the modules they use.
 add_library(WhisperEACP INTERFACE)
 target_link_libraries(WhisperEACP INTERFACE
         whisper-core
-        whisper-audio)
+        whisper-audio
+        whisper-kernels
+        whisper-mel
+        whisper-model
+        whisper-tokenizer)
