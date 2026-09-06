@@ -10,9 +10,9 @@ namespace WSP
 // The row maximum is subtracted before the exponential, which is what keeps an
 // attention row of large logits finite: exp overflows to infinity somewhere
 // past 88 in float32, and the ratio it is heading for is unchanged by the
-// shift. The exponential is evaluated twice per element rather than kept in a
-// buffer between the two passes — an OutputBuffer is write-only, and a scratch
-// allocation the size of the attention matrix costs more than the second exp.
+// shift. Each exponential is evaluated once and parked in output as it is
+// summed, then read back and scaled in place — a thread owns its whole row, so
+// every read-after-write here is of its own store.
 struct Softmax final : ComputeProgram
 {
     Softmax() { compile(); }
@@ -39,19 +39,23 @@ struct Softmax final : ComputeProgram
         loop(summing < rowLength,
              [&]
              {
-                 total += exp(input[base + summing] - rowMaximum);
+                 auto at = base + summing;
+                 auto weight = exp(input[at] - rowMaximum);
+
+                 write(output, at, weight);
+                 total += weight;
                  summing += 1u;
              });
 
         auto normaliser = 1.f / total.get();
-        auto writing = var(0u);
+        auto scaling = var(0u);
 
-        loop(writing < rowLength,
+        loop(scaling < rowLength,
              [&]
              {
-                 auto at = base + writing;
-                 write(output, at, exp(input[at] - rowMaximum) * normaliser);
-                 writing += 1u;
+                 auto at = base + scaling;
+                 write(output, at, output[at] * normaliser);
+                 scaling += 1u;
              });
     }
 

@@ -195,14 +195,18 @@ auto tTinyEnWeightToGpuBuffer = test("Model/TinyEn/weightToGpuBuffer") = []
     const auto name = std::string {"model.encoder.layer_norm.weight"};
 
     const auto values = weights.readFloats(name);
-    const auto buffer = weights.makeBuffer(name);
+    const auto weight = weights.makeBuffer(name);
 
-    check(buffer.isValid());
-    check(buffer.size() == values.size() * static_cast<int>(sizeof(float)));
+    // tiny.en is F32 throughout, so this is the unpacked path: the buffer is
+    // the blob itself and holds one float per element.
+    check(weight.storage == TensorType::F32);
+    check(!weight.isPackedHalf());
+    check(weight.buffer.isValid());
+    check(weight.buffer.size() == values.size() * static_cast<int>(sizeof(float)));
 
     auto readBack = Vector<float> {};
     readBack.resize(values.size());
-    buffer.read(readBack.data(), buffer.size());
+    weight.buffer.read(readBack.data(), weight.buffer.size());
 
     check(readBack == values);
 };

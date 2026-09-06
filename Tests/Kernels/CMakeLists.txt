@@ -1,6 +1,10 @@
 set(kernel_test_sources
+        AddTests.cpp
+        AttentionTests.cpp
+        Conv1dTests.cpp
         GeluTests.cpp
         LayerNormTests.cpp
+        LinearTests.cpp
         MatMulTests.cpp
         SoftmaxTests.cpp)
 

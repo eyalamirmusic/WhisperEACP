@@ -110,6 +110,52 @@ auto tSoftmaxSurvivesLargeLogits = test("Kernels/softmaxSurvivesLargeLogits") = 
     }
 };
 
+// The exponentials live in the output buffer between the summing pass and the
+// scaling one, so a read that came back with whatever the buffer held before
+// the store would pass unnoticed against a fresh allocation of zeroes. Binding
+// an output already full of a large constant is what makes that loud: scaling
+// the constant instead of the exponential leaves a row summing to rowLength
+// times it, and every element far from what the reference says.
+auto tSoftmaxIgnoresPoisonedOutput =
+    test("Kernels/softmaxIgnoresPoisonedOutput") = []
+{
+    auto& device = Device::shared();
+
+    if (!device.isValid())
+        return;
+
+    constexpr auto poison = 1e9f;
+
+    auto input = spreadValues(rowCount * rowLength, 424242u, 4.f);
+    auto inputBuffer = storageOf(input);
+
+    auto poisoned = Vector<float> {};
+    poisoned.assign(rowCount * rowLength, poison);
+
+    auto output = storageOf(poisoned);
+
+    auto kernel = Softmax {};
+    kernel.input = inputBuffer;
+    kernel.output = output;
+    kernel.rowLength = (unsigned) rowLength;
+
+    auto result = runOverRows(kernel, output, rowCount, rowCount * rowLength);
+    auto expected = softmaxReference(input, rowCount, rowLength);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
+
+    for (auto row = 0; row < rowCount; ++row)
+    {
+        auto total = 0.0;
+
+        for (auto i = 0; i < rowLength; ++i)
+            total += result[row * rowLength + i];
+
+        check(isClose((float) total, 1.0, 1e-5));
+    }
+};
+
 // A row of equal logits is the one case the answer can be written down without
 // computing it, and the one a missing normalisation still gets wrong.
 auto tSoftmaxUniformRowIsUniform = test("Kernels/softmaxUniformRowIsUniform") = []

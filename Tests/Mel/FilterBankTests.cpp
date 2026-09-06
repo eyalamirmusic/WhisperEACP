@@ -6,11 +6,13 @@ using namespace eacp::GPU;
 
 namespace
 {
-// The EDSL has no log10, so the kernel takes a natural log and changes base.
-// Both backends leave a shader's log a few units in the last place loose, and
-// that is a few parts in a million of a log around ten rather than of the
-// value it came from — hence a tolerance that grows with the magnitude of the
-// log rather than a fixed one.
+// The kernel calls eacp's log10, native in both shading languages. A shader's
+// logarithm is still only specified to a handful of units in the last place,
+// and an ulp of a log around ten is four orders larger than an ulp of a log
+// around zero — hence a separate tolerance at the floor rather than one loose
+// number everywhere. Metal returns exactly -10 for log10(1e-10), where the
+// change of base this replaced returned -9.99998856; the margin left here is
+// what D3D's 21-ulp log2 needs, and is what eacp's own log10 test allows.
 constexpr auto logTolerance = 1e-5;
 constexpr auto floorTolerance = 1e-4;
 

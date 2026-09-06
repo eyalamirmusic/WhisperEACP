@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -55,6 +56,34 @@ Vector<std::uint8_t> toBytes(std::initializer_list<Element> values)
 
     return bytes;
 }
+
+// The same assembled bytes, on disk, for the path that maps a file instead of
+// taking a buffer. Removed when the test that made it ends, so nothing is left
+// in the temporary directory whether the test passed or threw.
+class ScratchFile
+{
+public:
+    ScratchFile(std::string_view name, const Vector<std::uint8_t>& bytes)
+        : filePath(std::filesystem::temp_directory_path() / name)
+    {
+        auto out = std::ofstream {filePath, std::ios::binary | std::ios::trunc};
+        out.write(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+    }
+
+    ScratchFile(const ScratchFile&) = delete;
+    ScratchFile& operator=(const ScratchFile&) = delete;
+
+    ~ScratchFile()
+    {
+        auto error = std::error_code {};
+        std::filesystem::remove(filePath, error);
+    }
+
+    const std::filesystem::path& path() const { return filePath; }
+
+private:
+    std::filesystem::path filePath;
+};
 
 template <typename Body>
 bool throwsModelError(Body&& body)

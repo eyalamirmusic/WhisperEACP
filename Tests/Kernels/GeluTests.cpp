@@ -8,16 +8,17 @@ using namespace eacp::GPU;
 
 namespace
 {
-// The reference is the definition itself — std::erf, which the EDSL has no
-// intrinsic for and the kernel therefore approximates. Comparing against it is
-// how the substitute's error gets a number rather than an assurance.
+// The reference is the definition itself, in double precision through
+// std::erf. The kernel goes through eacp's erf, which is a float32
+// approximation of the same function, so comparing against this is how its
+// error gets a number rather than an assurance.
 double exactGeluReference(double x)
 {
     return 0.5 * x * (1.0 + std::erf(x / std::sqrt(2.0)));
 }
 
-// What whisper.cpp uses in place of erf, kept here only so the kernel's
-// accuracy has something to be better than.
+// The GELU whisper.cpp settles for, kept here only so the kernel's accuracy
+// has something to be better than.
 double tanhGeluReference(double x)
 {
     constexpr auto rootTwoOverPi = 0.7978845608028654;
@@ -25,8 +26,8 @@ double tanhGeluReference(double x)
     return 0.5 * x * (1.0 + std::tanh(rootTwoOverPi * (x + 0.044715 * x * x * x)));
 }
 
-// A sweep dense enough to land on the region the two approximations disagree
-// most about, which is |x| between one and three rather than at either tail.
+// A sweep dense enough to land on the region the two GELUs disagree most
+// about, which is |x| between one and three rather than at either tail.
 Vector<float> sweptValues(int count, double from, double to)
 {
     auto values = sized(count);
@@ -61,10 +62,10 @@ auto tGeluMatchesExactCpu = test("Kernels/geluMatchesExactCpu") = []
         check(isClose(result[i], exactGeluReference(input[i]), 1e-6));
 };
 
-// The claim the erf substitute is chosen on: over the range a transformer's
-// activations actually occupy it is nearer the exact function than the tanh
+// The claim the exact GELU is chosen on: over the range a transformer's
+// activations actually occupy it is nearer the true function than the tanh
 // form the reference implementations settle for, by about three orders of
-// magnitude.
+// magnitude — eacp's erf being an approximation does not cost that margin.
 auto tGeluBeatsTanhApproximation = test("Kernels/geluBeatsTanhApproximation") = []
 {
     auto& device = Device::shared();
@@ -98,9 +99,9 @@ auto tGeluBeatsTanhApproximation = test("Kernels/geluBeatsTanhApproximation") = 
     check(worstKernelError < worstTanhError / 100.0);
 };
 
-// Both tails, where the exponential the substitute is built out of underflows:
-// GELU is the identity far to the right and zero far to the left, and neither
-// may arrive as a NaN.
+// Both tails, where the exponential inside erf underflows: GELU is the
+// identity far to the right and zero far to the left, and neither may arrive
+// as a NaN.
 auto tGeluTailsStayFinite = test("Kernels/geluTailsStayFinite") = []
 {
     auto& device = Device::shared();

@@ -208,6 +208,32 @@ TensorInfo parseTensor(const std::string& name,
     return tensor;
 }
 
+eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
+{
+    return eacp::GPU::Device::shared().makeBuffer(
+        raw.data(), raw.size(), eacp::GPU::BufferUsage::Storage);
+}
+
+// A buffer of halves is read one 32-bit word at a time — readHalf(i) fetches
+// word i / 2 and picks a side of it — so an odd count of halves needs a
+// padding half rather than a read one element past the allocation. An even
+// count, which is every weight matrix of an even width, still goes up
+// untouched.
+eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
+{
+    constexpr auto wordBytes = 4;
+    const auto remainder = raw.size() % wordBytes;
+
+    if (remainder == 0)
+        return uploadBytes(raw);
+
+    auto padded = Vector<std::uint8_t> {};
+    padded.resize(raw.size() + wordBytes - remainder);
+    std::memcpy(padded.data(), raw.data(), static_cast<std::size_t>(raw.size()));
+
+    return uploadBytes(padded);
+}
+
 std::map<std::string, std::string> parseMetadata(const Miro::Json::Value& value)
 {
     if (!value.isObject())
@@ -251,7 +277,15 @@ SafeTensors SafeTensors::fromFile(const std::filesystem::path& path)
 {
     try
     {
-        return fromBytes(ModelIO::readFileBytes(path));
+        auto file = SafeTensors {};
+        file.mappedFile.emplace(eacp::FilePath {path});
+
+        if (!file.mappedFile->isValid())
+            throw ModelError {"cannot be opened and mapped"};
+
+        file.readHeader();
+
+        return file;
     }
     catch (const ModelError& error)
     {
@@ -262,40 +296,59 @@ SafeTensors SafeTensors::fromFile(const std::filesystem::path& path)
 SafeTensors SafeTensors::fromBytes(Vector<std::uint8_t> fileBytes)
 {
     auto file = SafeTensors {};
-    file.bytes = std::move(fileBytes);
+    file.ownedBytes = std::move(fileBytes);
+    file.readHeader();
 
-    const auto fileSize = static_cast<std::uint64_t>(file.bytes.size());
+    return file;
+}
+
+Span<const std::uint8_t> SafeTensors::fileBytes() const
+{
+    if (mappedFile.has_value())
+        return mappedFile->bytes();
+
+    return ownedBytes;
+}
+
+void SafeTensors::readHeader()
+{
+    const auto bytes = fileBytes();
+    const auto fileSize = static_cast<std::uint64_t>(bytes.getSize());
+
+    // A mapping is not bounded by the int a Vector indexes with, so this is
+    // where the limit lives now. It is eacp::GPU::Buffer's, whose sizes are
+    // int, and every byte count narrowed to an int below is narrowed under it.
+    if (fileSize > static_cast<std::uint64_t>(std::numeric_limits<int>::max()))
+        throw ModelError {"safetensors file is larger than 2 GB"};
 
     if (fileSize < headerLengthBytes)
         throw ModelError {"safetensors file is shorter than its length prefix"};
 
-    const auto headerSize = readHeaderLength(file.bytes);
+    const auto headerSize = readHeaderLength(bytes);
 
     if (headerSize > fileSize - headerLengthBytes)
         throw ModelError {"safetensors header length runs past the end of "
                           "the file"};
 
-    file.blobOffset = headerLengthBytes + headerSize;
+    blobOffset = headerLengthBytes + headerSize;
 
     const auto header = ModelIO::parseObject(
-        ModelIO::textOf(Span<const std::uint8_t> {
-            file.bytes.data() + headerLengthBytes, static_cast<int>(headerSize)}),
+        ModelIO::textOf(Span<const std::uint8_t> {bytes.data() + headerLengthBytes,
+                                                  static_cast<int>(headerSize)}),
         "safetensors header");
 
-    const auto blobSize = fileSize - file.blobOffset;
+    const auto blobSize = fileSize - blobOffset;
 
     for (const auto& [name, value]: header.asObject())
     {
         if (name == "__metadata__")
         {
-            file.metadataEntries = parseMetadata(value);
+            metadataEntries = parseMetadata(value);
             continue;
         }
 
-        file.entries.add(parseTensor(name, value, blobSize));
+        entries.add(parseTensor(name, value, blobSize));
     }
-
-    return file;
 }
 
 const Vector<TensorInfo>& SafeTensors::tensors() const
@@ -349,7 +402,7 @@ const std::map<std::string, std::string>& SafeTensors::metadata() const
 
 Span<const std::uint8_t> SafeTensors::rawBytes(const TensorInfo& tensor) const
 {
-    return {bytes.data() + blobOffset + tensor.blobOffset,
+    return {fileBytes().data() + blobOffset + tensor.blobOffset,
             static_cast<int>(tensor.byteCount)};
 }
 
@@ -380,21 +433,21 @@ void SafeTensors::readFloats(std::string_view name, Span<float> destination) con
     widenToFloat(tensor, rawBytes(tensor), destination);
 }
 
-eacp::GPU::Buffer SafeTensors::makeBuffer(std::string_view name) const
+TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
 {
     const auto& tensor = info(name);
-    auto& device = eacp::GPU::Device::shared();
 
-    // Already the layout a kernel binds, so an F32 tensor goes straight from
-    // the blob rather than through a widened copy of itself — which for
-    // tiny.en, whose every tensor is F32, is every tensor.
+    // Already a layout a kernel binds, so these go straight from the blob
+    // rather than through a widened copy of themselves: F32 as the floats a
+    // subscript reads, F16 as the packed halves readHalf reads.
     if (tensor.type == TensorType::F32)
-    {
-        const auto raw = rawBytes(tensor);
-        return device.makeBuffer(
-            raw.data(), raw.size(), eacp::GPU::BufferUsage::Storage);
-    }
+        return {uploadBytes(rawBytes(tensor)), tensor.type};
 
+    if (tensor.type == TensorType::F16)
+        return {uploadPackedHalves(rawBytes(tensor)), tensor.type};
+
+    // BF16 and F64 have no shader read of their own, so the conversion has to
+    // happen somewhere and doing it once here beats doing it in every kernel.
     const auto values = readFloats(name);
     const auto byteCount = static_cast<std::int64_t>(values.size())
                            * static_cast<std::int64_t>(sizeof(float));
@@ -403,7 +456,9 @@ eacp::GPU::Buffer SafeTensors::makeBuffer(std::string_view name) const
         throw ModelError {"tensor '" + tensor.name
                           + "' is too large for a GPU buffer"};
 
-    return device.makeBuffer(
-        values.data(), static_cast<int>(byteCount), eacp::GPU::BufferUsage::Storage);
+    return {eacp::GPU::Device::shared().makeBuffer(values.data(),
+                                                   static_cast<int>(byteCount),
+                                                   eacp::GPU::BufferUsage::Storage),
+            TensorType::F32};
 }
 } // namespace WSP

@@ -17,6 +17,11 @@ add_subdirectory(Mel)
 add_subdirectory(Model)
 add_subdirectory(Tokenizer)
 
+# The first module above the seam: it includes headers from two of the four
+# below it, which is what "assembled from Kernels/, fed by Mel/ and Model/"
+# means once there is something to assemble.
+add_subdirectory(Encoder)
+
 # The whole library, for consumers that don't want to name the modules they use.
 add_library(WhisperEACP INTERFACE)
 target_link_libraries(WhisperEACP INTERFACE
@@ -25,4 +30,5 @@ target_link_libraries(WhisperEACP INTERFACE
         whisper-kernels
         whisper-mel
         whisper-model
-        whisper-tokenizer)
+        whisper-tokenizer
+        whisper-encoder)

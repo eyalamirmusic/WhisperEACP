@@ -4,11 +4,13 @@
 #include <WhisperEACP/Model/ModelError.h>
 #include <WhisperEACP/Model/TensorType.h>
 
+#include <eacp/Core/Utils/MemoryMappedFile.h>
 #include <eacp/GPU/Buffer/Buffer.h>
 
 #include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -32,16 +34,38 @@ struct TensorInfo
     std::int64_t dimension(int index) const;
 };
 
-// A safetensors file held in memory: eight bytes of little-endian header
-// length, that many bytes of JSON naming every tensor, then one raw blob the
-// offsets in that JSON are relative to.
+// A tensor uploaded to the device, and what the buffer's elements are: F32 for
+// the float buffer a kernel subscripts, F16 for one still packed two halves to
+// a word, which a kernel reads through InputBuffer::readHalf.
+//
+// The two travel together because nothing about a GPU::Buffer says which of
+// them it holds, and binding a packed buffer where a float one is expected is
+// wrong by a factor of two in every index while staying silent on both
+// backends.
+struct TensorBuffer
+{
+    eacp::GPU::Buffer buffer;
+    TensorType storage = TensorType::F32;
+
+    bool isPackedHalf() const { return storage == TensorType::F16; }
+};
+
+// A safetensors file: eight bytes of little-endian header length, that many
+// bytes of JSON naming every tensor, then one raw blob the offsets in that JSON
+// are relative to.
+//
+// fromFile maps the file rather than reading it, so a 151 MB blob is never
+// resident before the first GPU copy and the pages a load touches arrive from
+// the page cache as it touches them; fromBytes takes a buffer already in
+// memory. Either way the bytes outlive every Span handed out, which is why this
+// is move-only.
 //
 // Nothing here trusts the header. A file shorter than the length prefix, a
 // header length that runs past the end, JSON that does not parse or is not an
 // object, an entry missing dtype / shape / data_offsets, a dtype this build
 // does not know, a negative or reversed byte range, a range that leaves the
 // blob, and a shape whose element count disagrees with that range are each a
-// ModelError rather than a read past the end of the buffer. `__metadata__` is
+// ModelError rather than a read past the end of the mapping. `__metadata__` is
 // not a tensor and is kept separately.
 class SafeTensors
 {
@@ -66,19 +90,27 @@ public:
     Span<const std::uint8_t> rawBytes(const TensorInfo& tensor) const;
     Span<const std::uint8_t> rawBytes(std::string_view name) const;
 
-    // Widened to float32 on the way out whatever the file holds, because the
-    // shader EDSL has no half: every buffer a kernel binds is float32, so the
-    // conversion has to happen somewhere and doing it once at load beats doing
-    // it in every kernel that reads a weight.
+    // Widened to float32 on the way out whatever the file holds, for a caller
+    // that wants the values on the CPU. What the GPU gets is makeBuffer's
+    // business and not necessarily this: fp16 to fp32 is exact, so widening
+    // here and widening in the shader agree bit for bit.
     Vector<float> readFloats(std::string_view name) const;
     void readFloats(std::string_view name, Span<float> destination) const;
 
-    eacp::GPU::Buffer makeBuffer(std::string_view name) const;
+    // F32 and F16 go to the device as they lie in the blob — the first is the
+    // float buffer a kernel subscripts, the second the packed one readHalf
+    // reads — so neither costs a widened copy. BF16 and F64 have no shader
+    // read of their own and are widened here.
+    TensorBuffer makeBuffer(std::string_view name) const;
 
 private:
     SafeTensors() = default;
 
-    Vector<std::uint8_t> bytes;
+    Span<const std::uint8_t> fileBytes() const;
+    void readHeader();
+
+    Vector<std::uint8_t> ownedBytes;
+    std::optional<eacp::MemoryMappedFile> mappedFile;
     std::uint64_t blobOffset = 0;
     Vector<TensorInfo> entries;
     std::map<std::string, std::string> metadataEntries;

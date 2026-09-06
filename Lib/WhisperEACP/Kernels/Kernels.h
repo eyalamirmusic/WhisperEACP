@@ -15,8 +15,12 @@
 // the version a scalar CPU reference can be checked against without argument,
 // and the one an optimised kernel later has to keep agreeing with.
 
+#include "Add.h"
+#include "Attention.h"
+#include "Conv1d.h"
 #include "Gelu.h"
 #include "KernelTypes.h"
 #include "LayerNorm.h"
+#include "Linear.h"
 #include "MatMul.h"
 #include "Softmax.h"

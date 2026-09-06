@@ -20,6 +20,24 @@ Vector<std::uint8_t> singleTensorFile()
                     toBytes<float>({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}));
 }
 
+// One tensor of each width the loader treats differently, plus metadata, so the
+// mapped and in-memory parses are compared over everything a header carries.
+Vector<std::uint8_t> mixedTensorFile()
+{
+    const auto header =
+        std::string {R"({"__metadata__":{"format":"pt"},)"
+                     R"("bias":{"dtype":"F32","shape":[2],"data_offsets":[0,8]},)"
+                     R"("weight":{"dtype":"F16","shape":[4],)"
+                     R"("data_offsets":[8,16]}})"};
+
+    auto blob = toBytes<float>({0.25f, -0.5f});
+
+    for (auto byte: toBytes<std::uint16_t>({0x3C00, 0xC000, 0x0000, 0x4000}))
+        blob.add(byte);
+
+    return assemble(header, blob);
+}
+
 SafeTensors parseHeaderOnly(const std::string& header)
 {
     return SafeTensors::fromBytes(assemble(header));
@@ -356,50 +374,147 @@ auto tMissingFileIsAnError = test("Model/SafeTensors/missingFileIsAnError") = []
 {
     check(throwsModelError(
         [] { return SafeTensors::fromFile("no/such/model.safetensors"); }));
+
+    // Openable and unmappable, which is the other way MemoryMappedFile comes
+    // back invalid and the one an ifstream would have taken for an empty read.
+    check(throwsModelError(
+        []
+        { return SafeTensors::fromFile(std::filesystem::temp_directory_path()); }));
 };
 
-auto tTensorToGpuBuffer = test("Model/SafeTensors/tensorToGpuBuffer") = []
+// fromFile maps the file rather than reading it, and that is an implementation
+// detail of where the bytes live: the same bytes on disk have to parse to the
+// same tensors, byte range for byte range, as the buffer they were written from.
+auto tMappedFileMatchesBytes = test("Model/SafeTensors/mappedFileMatchesBytes") = []
 {
-    auto& device = eacp::GPU::Device::shared();
+    const auto bytes = mixedTensorFile();
+    const auto scratch = ScratchFile {"whisper-mapped.safetensors", bytes};
 
-    if (!device.isValid())
+    const auto mapped = SafeTensors::fromFile(scratch.path());
+    const auto inMemory = SafeTensors::fromBytes(bytes);
+
+    check(mapped.names() == inMemory.names());
+    check(mapped.metadata() == inMemory.metadata());
+
+    for (const auto& tensor: inMemory.tensors())
+    {
+        const auto& same = mapped.info(tensor.name);
+
+        check(same.type == tensor.type);
+        check(same.shape == tensor.shape);
+        check(same.blobOffset == tensor.blobOffset);
+        check(same.byteCount == tensor.byteCount);
+        check(mapped.rawBytes(same) == inMemory.rawBytes(tensor));
+        check(mapped.readFloats(tensor.name) == inMemory.readFloats(tensor.name));
+    }
+};
+
+auto tMappedFileRejectsABadHeader =
+    test("Model/SafeTensors/mappedFileRejectsABadHeader") = []
+{
+    const auto scratch =
+        ScratchFile {"whisper-bad-header.safetensors", assemble("{not json")};
+
+    check(throwsModelError([&] { return SafeTensors::fromFile(scratch.path()); }));
+};
+
+namespace
+{
+// What the device holds, against what it was handed. The F32 and F16 paths both
+// promise the buffer *is* the blob, and this is the assertion that says no
+// widened copy happened on the way.
+bool deviceBytesEqual(const eacp::GPU::Buffer& buffer,
+                      Span<const std::uint8_t> expected)
+{
+    auto bytes = Vector<std::uint8_t> {};
+    bytes.resize(buffer.size());
+    buffer.read(bytes.data(), buffer.size());
+
+    return Span<const std::uint8_t> {bytes} == expected;
+}
+} // namespace
+
+// F16 reaches the device packed: the EDSL reads a half now, so the buffer is
+// the blob's own sixteen-bit words and the widening happens in the shader,
+// where it costs nothing and halves the traffic getting there.
+auto tHalfTensorStaysPacked = test("Model/SafeTensors/halfTensorStaysPacked") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto bits = toBytes<std::uint16_t>({0x3C00, 0xC000, 0x0000, 0x4000});
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}})", bits));
+
+    const auto weight = file.makeBuffer("w");
+
+    check(weight.storage == TensorType::F16);
+    check(weight.isPackedHalf());
+    check(weight.buffer.isValid());
+    check(weight.buffer.size() == 8);
+    check(deviceBytesEqual(weight.buffer, bits));
+};
+
+// readHalf(i) fetches word i / 2 whether or not the last word is whole, so an
+// odd count of halves is padded up rather than read one element past the end.
+auto tOddHalfCountIsPadded = test("Model/SafeTensors/oddHalfCountIsPadded") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
         return;
 
     const auto file = SafeTensors::fromBytes(
-        assemble(R"({"w":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}})",
-                 toBytes<std::uint16_t>({0x3C00, 0xC000, 0x0000, 0x4000})));
+        assemble(R"({"w":{"dtype":"F16","shape":[3],"data_offsets":[0,6]}})",
+                 toBytes<std::uint16_t>({0x3C00, 0xC000, 0x4000})));
 
-    const auto buffer = file.makeBuffer("w");
-    check(buffer.isValid());
-    check(buffer.size() == 16);
+    const auto weight = file.makeBuffer("w");
 
-    auto readBack = Vector<float> {};
-    readBack.resize(4);
-    buffer.read(readBack.data(), buffer.size());
+    auto expected = toBytes<std::uint16_t>({0x3C00, 0xC000, 0x4000});
+    expected.add(0);
+    expected.add(0);
 
-    check(readBack[0] == 1.0f);
-    check(readBack[1] == -2.0f);
-    check(readBack[2] == 0.0f);
-    check(readBack[3] == 2.0f);
+    check(weight.isPackedHalf());
+    check(weight.buffer.size() == 8);
+    check(deviceBytesEqual(weight.buffer, expected));
 };
 
 // The F32 path is the other branch of makeBuffer: the blob is already the
-// layout a kernel binds, so it goes to the device without a widened copy.
+// layout a kernel binds, so the buffer's bytes are exactly the blob's.
 auto tFloatTensorToGpuBuffer = test("Model/SafeTensors/floatTensorToGpuBuffer") = []
 {
     if (!eacp::GPU::Device::shared().isValid())
         return;
 
     const auto file = SafeTensors::fromBytes(singleTensorFile());
-    const auto buffer = file.makeBuffer("weight");
+    const auto weight = file.makeBuffer("weight");
 
-    check(buffer.isValid());
-    check(buffer.size() == 24);
+    check(weight.storage == TensorType::F32);
+    check(!weight.isPackedHalf());
+    check(weight.buffer.isValid());
+    check(weight.buffer.size() == 24);
+    check(deviceBytesEqual(weight.buffer, file.rawBytes("weight")));
+};
+
+// BF16 and F64 have no shader read of their own, so they are the two that are
+// still widened on the way in — and the buffer that comes back says so.
+auto tBfloatBufferIsWidened = test("Model/SafeTensors/bfloatBufferIsWidened") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"BF16","shape":[4],"data_offsets":[0,8]}})",
+                 toBytes<std::uint16_t>({0x0000, 0x3F80, 0xC000, 0x4049})));
+
+    const auto weight = file.makeBuffer("w");
+
+    check(weight.storage == TensorType::F32);
+    check(!weight.isPackedHalf());
+    check(weight.buffer.size() == 16);
 
     auto readBack = Vector<float> {};
-    readBack.resize(6);
-    buffer.read(readBack.data(), buffer.size());
+    readBack.resize(4);
+    weight.buffer.read(readBack.data(), weight.buffer.size());
 
-    for (auto index = 0; index < readBack.size(); ++index)
-        check(readBack[index] == static_cast<float>(index + 1));
+    check(readBack[1] == 1.0f);
+    check(readBack[2] == -2.0f);
 };

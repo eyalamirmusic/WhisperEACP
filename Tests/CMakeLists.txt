@@ -9,6 +9,7 @@ set(WHISPER_GPU_TEST_MAIN "${CMAKE_CURRENT_LIST_DIR}/Support/GpuTestMain.cpp")
 
 add_subdirectory(Core)
 add_subdirectory(Audio)
+add_subdirectory(Encoder)
 add_subdirectory(GPU)
 add_subdirectory(Kernels)
 add_subdirectory(Mel)

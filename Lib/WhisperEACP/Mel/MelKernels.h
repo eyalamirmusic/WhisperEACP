@@ -21,15 +21,6 @@ using eacp::GPU::Uniform;
 inline constexpr auto radiansPerTurn = 6.283185307179586f;
 inline constexpr auto lowestFloat = std::numeric_limits<float>::lowest();
 
-// The EDSL has log and log2 and no log10, so this is the change of base rather
-// than a helper hiding a gap: log10 belongs in eacp beside the two that are
-// already there, and this is what it would be.
-inline Float decimalLog(const Float& value)
-{
-    constexpr auto reciprocalLogOfTen = 0.43429448190325176f;
-    return log(value) * reciprocalLogOfTen;
-}
-
 // Where a padded index lands once folded back inside [0, lastIndex]: the
 // reflect the STFT's centre padding is spelled with, about the edge sample
 // rather than about the edge itself. abs() twice rather than two branches,
@@ -115,7 +106,7 @@ struct MelProjectKernel final : ComputeProgram
 
         write(logMel,
               position.y * frameCount + position.x,
-              decimalLog(max(total.get(), 1e-10f)));
+              log10(max(total.get(), 1e-10f)));
     }
 
     Uniform<InputBuffer> power;
