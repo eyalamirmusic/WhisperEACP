@@ -148,9 +148,9 @@ CPMAddPackage(
         DOWNLOAD_ONLY YES)
 ```
 
-Pin `URL_HASH` on each once the model choice settles, and set
-`CPM_SOURCE_CACHE` so the 151 MB weights are downloaded once per machine rather
-than once per build directory.
+Pin `URL_HASH` on each once the model choice settles.
+
+Do not use `CPM_SOURCE_CACHE`.
 
 ## Correctness validation
 
