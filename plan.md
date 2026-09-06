@@ -37,10 +37,12 @@ These are the pieces the encoder and decoder are later written *out of*, so they
 take shapes as uniforms rather than baking Whisper's in. A matmul that only
 knows `tiny.en`'s widths is a matmul that gets rewritten for `base`.
 
-The EDSL has `exp`, `log`, `sqrt`, `rsqrt`, `pow`, `max`, `min`, `clamp`, `mix`
+The EDSL had `exp`, `log`, `sqrt`, `rsqrt`, `pow`, `max`, `min`, `clamp`, `mix`
 and the rest of the usual set — but **no `tanh` and no `erf`**, which is exactly
-the kind of gap this project exists to surface. GELU is derived from what is
-there, and the gap is written down for eacp rather than hidden behind a helper.
+the kind of gap this project exists to surface. GELU was derived from what was
+there, with the gap written down for eacp rather than hidden behind a helper.
+eacp has both now (see the gaps section), and `Kernels/Gelu.h` still carries
+its own polynomial until it is switched over.
 
 ### `Mel/` — `whisper-mel`, `Tests/Mel`
 
@@ -60,9 +62,10 @@ the blob, and hand the bytes to a `GPU::Buffer`. `config.json` beside it.
 
 `tiny.en` ships **F32**, not F16 — `"torch_dtype": "float32"`, and all 167
 tensors in its `model.safetensors` are `F32`. F16 is what the larger repos
-ship, so the loader handles both and widens on the way in: eacp's EDSL has no
-half type at all, so packed halves cannot be read by a kernel and the
-conversion would only move into every kernel that touches a weight.
+ship, so the loader handles both and widens on the way in. That was forced:
+eacp's EDSL had no way to read a packed half. It has one now — `readHalf`, in
+the gaps section — so keeping F16 packed on the GPU is the loader's next
+change rather than a constraint.
 
 The model itself is a download, never a commit. CPM fetches it, behind
 `WHISPER_EACP_FETCH_MODEL` (default off), with `DOWNLOAD_NO_EXTRACT YES` and
@@ -97,17 +100,36 @@ around silently — the substitute is named at the point it is used.
 
 ### The shader EDSL
 
-| gap | evidence | what it costs here |
-| --- | --- | --- |
-| no `tanh`, `sinh`, `cosh` | absent from the emitter's intrinsic table | native in **both** MSL and HLSL — pure EDSL surface |
-| no `log10` | same | `Mel/` changes base by `0.43429448190325176f` |
-| no `erf` / `erfc` | same | native in MSL, **absent from HLSL** — this one needs a polynomial fallback in the emitter, not just a name. `Kernels/Gelu.h`'s A&S 7.1.26 is the raw material: 4.4e-7 max error against exact GELU, where the tanh approximation whisper.cpp uses costs 4.7e-4 |
-| `InputBuffer::operator[]` takes only `const UInt&` | `AtomicBuffer::load(unsigned)` and `Shared<T>::operator[](unsigned)` both have literal overloads, and the comment on the first calls it "the same courtesy the intrinsics extend to a float literal" | reading element 0 of a one-element buffer needs a `var(0u)` to manufacture an index |
-| no half type | `ValueType` is `Float/Float2/.../UInt/Int/Bool`; `InputBuffer` yields `Float` | why `Model/` widens F16 on load. A large-v3 in F16 pays 2x GPU memory for it |
-| `Uniform<InputBuffer>` stores a pointer | assigning a temporary compiles and dangles, with no diagnostic | every bound buffer must be a named local |
-| `OutputBuffer` is write-only | no read accessor | softmax evaluates `exp` twice per element |
-| `GPU::Buffer` sizes are `int` | `makeBuffer(const void*, int)` | caps one buffer at 2 GB |
-| README drift | documents `sharedArray<T, N>()` and `threadIndexInGroup()` | the header has `shared<T>(int)` and `localId()` |
+All of these but one are fixed upstream, in eacp `develop` from commit `c13098b`,
+which this project fetches. Each was proven by a failing test in eacp's own
+`Tests/GPU` before the fix, and the emitted MSL and HLSL are both asserted as
+text on the Mac, since the emitter is pure string generation.
+
+| gap | what eacp does now |
+| --- | --- |
+| no `tanh`, `sinh`, `cosh` | componentwise intrinsics, native in both languages |
+| no `log10` | the same. `Mel/` still changes base by `0.43429448190325176f` until it is switched over |
+| no `erf` / `erfc` | this was recorded as native in MSL, and that was wrong: MSL has **no `erf` either** — the Metal compiler rejects it as an undeclared identifier. So the A&S 7.1.26 polynomial is the definition on *both* backends, emitted as a helper with `float2/3/4` overloads. Under 6e-7 absolute against `std::erf` on the CPU, 1.7e-7 on Metal. `erfc` is its own form rather than `1 - erf`, so the tail keeps its digits; its relative error out there is still the approximation's, around 1 percent by x = 3 |
+| `InputBuffer::operator[]` takes only `const UInt&` | an `unsigned` overload on the subscript and on `read2`/`read3`/`read4`, anchored on the buffer's graph the way `AtomicBuffer::load(unsigned)` is |
+| no half type | there is deliberately still none: the Windows backend compiles through FXC at `cs_5_0`, where `half` is a synonym for `float`, so a `Half` would mean two different things on the two backends. What landed is fp16 **storage** with fp32 arithmetic: `InputBuffer::readHalf(i)` (element `i` of a buffer of halves, widened), `readHalf2(i)`, `packHalf2`, `asFloat` and `writeHalf2`. Widening is exact; narrowing is the one place the backends differ — Metal rounds to nearest-even and overflows to infinity, D3D specifies round-toward-zero saturating to 65504 |
+| `Uniform<InputBuffer>` stores a pointer | every `Uniform<resource>` — the three buffers and the four textures — deletes its rvalue `operator=`, so assigning a temporary is a compile error |
+| `OutputBuffer` is write-only | readable through the same subscript and `read2`/`read3`/`read4`; both backends already declared it writable, so nothing new is bound. What it promises is read-after-write within one thread. Fixing it exposed an emitter bug: a buffer read hoisted to a local was never retired by a store to the same slot, so a reused read saw the pre-store value. Stores and atomic adds now stale such names, the rule variables and shared memory already had |
+| README drift | corrected to `shared<T>(count)` and `localId()` |
+
+The one left alone is **`GPU::Buffer` sizes are `int`**. eacp `6ef2cde` moved
+every interface to `int` on purpose the day before `c13098b`, keeping `size_t`
+only where the language or an OS API forces it, so widening `Buffer` is a
+decision for the maintainer rather than a gap to fill. No single Whisper tensor
+approaches 2 GB.
+
+Nothing here ran on Windows: the HLSL side is asserted as emitted text only,
+and D3D's `f32tof16` rounding is from the D3D11.3 functional spec rather than a
+run.
+
+Downstream, the workarounds these gaps forced are still in place, and taking
+them out is what comes next: `erf()` in `Kernels/Gelu.h`, `log10` in `Mel/`,
+one `exp` per element in softmax, and `Model/` keeping F16 packed instead of
+widening.
 
 Not a gap, and worth knowing: Metal's shader `log` is loose enough that
 `log10(1e-10)` comes back as -9.999989 (~14 ulp), so a test on the log of a
