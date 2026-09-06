@@ -9,6 +9,11 @@ nano_add_executable(TokenizerTests
 # -DWHISPER_EACP_TOKENIZER_JSON=<path> at configure time or the
 # WHISPER_TOKENIZER_JSON environment variable at run time.
 #
+# WHISPER_EACP_MODEL_DIR is the fallback both of those now have, because
+# tokenizer.json joined the model fetch: a build configured with
+# -DWHISPER_EACP_FETCH_MODEL=ON has the file beside the other three, and a run
+# with WHISPER_MODEL_DIR set has it wherever that points.
+#
 # The committed fixture beside it is reached by absolute path rather than by
 # guessing a working directory.
 set(WHISPER_EACP_TOKENIZER_JSON "" CACHE FILEPATH
@@ -16,4 +21,5 @@ set(WHISPER_EACP_TOKENIZER_JSON "" CACHE FILEPATH
 
 target_compile_definitions(TokenizerTests PRIVATE
         WHISPER_TOKENIZER_FIXTURE_DIR="${CMAKE_CURRENT_LIST_DIR}/Fixtures"
-        WHISPER_TOKENIZER_JSON_PATH="${WHISPER_EACP_TOKENIZER_JSON}")
+        WHISPER_TOKENIZER_JSON_PATH="${WHISPER_EACP_TOKENIZER_JSON}"
+        WHISPER_EACP_MODEL_DIR="${WHISPER_EACP_MODEL_DIR}")

@@ -16,8 +16,10 @@
 // and the one an optimised kernel later has to keep agreeing with.
 
 #include "Add.h"
+#include "Argmax.h"
 #include "Attention.h"
 #include "Conv1d.h"
+#include "Embed.h"
 #include "Gelu.h"
 #include "KernelTypes.h"
 #include "LayerNorm.h"

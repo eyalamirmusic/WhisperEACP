@@ -31,9 +31,37 @@ namespace WSP
 // dispatch(softmax, H * queryCount) with rowLength = keyCount is the softmax
 // over j the definition asks for.
 
+// The score a causally masked key gets, chosen so that Softmax next door turns
+// it into a weight of exactly zero and nothing else.
+//
+// The softmax subtracts the row maximum before exponentiating, so what has to
+// underflow is sentinel - rowMaximum, and exp of anything below about -104 is
+// zero in float32 — this leaves twenty-eight orders of magnitude of margin over
+// that, whatever the real scores are. It is finite rather than -infinity
+// because -inf - -inf is a NaN, and it stops eight orders of magnitude short of
+// -FLT_MAX so that the subtraction cannot overflow to -infinity either.
+//
+// It is never the row maximum: query i sits at absolute position
+// keyCount - queryCount + i, which is a key index in range, so every row has
+// its own diagonal unmasked and therefore at least one real score in it.
+inline constexpr auto causalMaskScore = -1e30f;
+
 // scores[h, i, j] = scale * dot(queries[i, head h], keys[j, head h]), with
 // scale = D^-0.5 supplied by the caller rather than derived here, since the
 // caller is the one that knows D as a number.
+//
+// With causal nonzero, a key later than its query is masked instead: query i
+// of queryCount stands at absolute position keyCount - queryCount + i, so the
+// queries are the last queryCount positions of the keyCount keys, and key j is
+// suppressed when j is past that. That is a KV cache's own shape — n keys
+// cached, one query appended, the query at position n — and it is the encoder's
+// shape too, where queryCount == keyCount makes it the plain lower triangle.
+// The comparison is spelled j + queryCount > i + keyCount so that unsigned
+// arithmetic never has to go below zero.
+//
+// With causal zero nothing is masked and the kernel is what it was: the same
+// product, the same store, the mask only choosing between two values already
+// computed.
 //
 // One thread per (j, (h, i)) over a 2D grid: dispatch(kernel, keyCount,
 // H * queryCount). eacp dispatches 1D or 2D and no further, so the head is
@@ -69,7 +97,12 @@ struct AttentionScores final : ComputeProgram
                  channel += 1u;
              });
 
-        write(scores, position.y * keyCount + key, scale * total.get());
+        auto laterThanQuery = key + queryCount > query + keyCount;
+        auto suppressed = causal != 0u && laterThanQuery;
+
+        write(scores,
+              position.y * keyCount + key,
+              select(suppressed, causalMaskScore, scale * total.get()));
     }
 
     Uniform<InputBuffer> queries;
@@ -79,10 +112,18 @@ struct AttentionScores final : ComputeProgram
     Uniform<UInt> headWidth;
     Uniform<UInt> queryCount;
     Uniform<UInt> keyCount;
+    Uniform<UInt> causal;
     Uniform<Float> scale;
 
-    EACP_SHADER(
-        queries, keys, scores, modelWidth, headWidth, queryCount, keyCount, scale)
+    EACP_SHADER(queries,
+                keys,
+                scores,
+                modelWidth,
+                headWidth,
+                queryCount,
+                keyCount,
+                causal,
+                scale)
 };
 
 // output[i, h * D + c] = sum over j of probabilities[h, i, j] * values[j,

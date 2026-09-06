@@ -8,6 +8,7 @@
 #include <NanoTest/NanoTest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <random>
 
 namespace WSP
@@ -41,6 +42,33 @@ inline Vector<float> readBack(const eacp::GPU::Buffer& buffer, int elementCount)
 {
     auto values = sized(elementCount);
     buffer.read(values.data(), (int) sizeof(float) * elementCount);
+    return values;
+}
+
+// The unsigned pair of the two above, for the buffers whose elements are
+// indices rather than numbers: token ids on the way in, an argmax on the way
+// out. Same bytes, same slot, a different element type at both ends — which is
+// the whole of what those kernels ask of the host.
+inline Vector<std::uint32_t> unsignedSized(int elementCount)
+{
+    auto values = Vector<std::uint32_t>();
+    values.resize(elementCount);
+    return values;
+}
+
+inline eacp::GPU::Buffer storageOf(const Vector<std::uint32_t>& values)
+{
+    return eacp::GPU::Device::shared().makeBuffer(values.data(),
+                                                  (int) sizeof(std::uint32_t)
+                                                      * values.size(),
+                                                  eacp::GPU::BufferUsage::Storage);
+}
+
+inline Vector<std::uint32_t> readBackUnsigned(const eacp::GPU::Buffer& buffer,
+                                              int elementCount)
+{
+    auto values = unsignedSized(elementCount);
+    buffer.read(values.data(), (int) sizeof(std::uint32_t) * elementCount);
     return values;
 }
 

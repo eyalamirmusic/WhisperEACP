@@ -2,9 +2,9 @@
 
 Derived from `CLAUDE.md`. The repository is set up, the toolchain is proven end
 to end by `Tests/GPU`, the four modules the model is assembled from are in, and
-the encoder is the layer being written out of them. This is the order those
-layers come in, what "done" means for each, and what writing them surfaced in
-the dependencies.
+the encoder and decoder are the layers written out of them. This is the order
+those layers come in, what "done" means for each, and what writing them
+surfaced in the dependencies.
 
 ## Where the ground truth lives
 
@@ -24,10 +24,12 @@ another project: the matrix is in the file.
 Each is a directory under `Lib/WhisperEACP/`, a target, and a test executable
 under `Tests/`. The first four were written in parallel because none of them
 includes a header from another — the seams below are the reason that holds.
-`Encoder/` is the first module assembled on top of two of them, which is what
-those seams were for.
+`Encoder/` and `Decoder/` are the two modules assembled on top of them, which is
+what those seams were for — neither includes the other's header, since the
+encoder's output reaches the decoder as a buffer. `Whisper/` is the call site
+that owns both and turns 30 seconds of audio into a string.
 
-150 tests across the suite. The ones that need a downloaded model or tokenizer
+222 tests across the suite, with the oracle on. The ones that need a downloaded model or tokenizer
 skip without one, the same shape as a GPU test returning early when
 `Device::shared().isValid()` is false; configure with
 `-DWHISPER_EACP_FETCH_MODEL=ON` and every one of them runs.
@@ -57,14 +59,16 @@ readable `OutputBuffer` at work. The emitted shader was checked to hold a single
 `exp` call site, and a test pre-fills the output with a poison value so a read
 that saw the pre-store value could not sum to one.
 
-Since then the set has grown into what the encoder is assembled from, each in
-its own header with a scalar reference in `Tests/Kernels`:
+Since then the set has grown into what the encoder and decoder are assembled
+from, each in its own header with a scalar reference in `Tests/Kernels`:
 
 | kernel | what it is |
 | --- | --- |
 | `Conv1d` | PyTorch's `nn.Conv1d`, the weight read in its `[out, in, k]` file layout untransposed. A pair of output strides lets one kernel write channel-major for the next convolution or frame-major for the transformer — HF's permute after conv2, done by the store |
-| `AttentionScores`, `AttentionApply` | the two halves of multi-head attention with `Softmax` between them. Query and key counts are separate uniforms, so cross-attention and a KV cache are the same kernels. The head is folded into the dispatch row, since eacp dispatches 1D or 2D and no further (see the gaps section) |
+| `AttentionScores`, `AttentionApply` | the two halves of multi-head attention with `Softmax` between them. Query and key counts are separate uniforms, so cross-attention and a KV cache are the same kernels, and a `causal` flag masks the keys later than each query — query `i` standing at `keyCount - queryCount + i`, which is a cache's own shape and the encoder's square lower triangle at once. The head is folded into the dispatch row, since eacp dispatches 1D or 2D and no further (see the gaps section) |
 | `Add` | the residual and positional sums |
+| `Embed` | the decoder's input row: the token and positional gathers and their sum in one store. Ids travel as uint32 and are read back with `asUInt`, because a vocabulary is indexed and not measured |
+| `Argmax` | greedy sampling's pick, with a caller-supplied mask taking Whisper's suppressed tokens out of the running before the comparison rather than after it. Lowest index on ties, which is what `torch.argmax` documents |
 | `MatMulProgram<WeightStorage>` | `MatMul` as before, and `HalfWeightMatMul` reading the weight operand as packed fp16 through `readHalf`; identical uniforms, so a call site swaps only the alias |
 
 The conv and attention kernels were mutation-checked rather than trusted green:
@@ -154,18 +158,188 @@ in the mixed measure `|a - e| / (1 + |e|)`. The full 30 s window gives
 clock around `commit()` from a Debug host build, which is the only clock
 available (below) — from the naive per-thread kernels with no tiling.
 
+### `Decoder/` — `whisper-decoder`, `Tests/Decoder`
+
+HuggingFace's `WhisperDecoder.forward` with a KV cache, out of the same kernels
+and reached by the same loader. `DecoderShape` is the config plus the encoder's
+row count — a parameter for the reason `EncoderShape::inputFrames` is one — and
+`DecoderWeights` loads every tensor under its HF name. There is no
+`proj_out.weight` in the file: the logits are `h · embed_tokensᵀ`, tied to the
+input embedding, which is why `embed_tokens` is the one tensor that must arrive
+F32 whatever the repo ships.
+
+A run is a `beginSequence` and then `step`s. `beginSequence` projects the
+cross-attention keys and values out of the encoder's rows once per layer — they
+do not depend on the tokens — and resets the position; a `step` appends however
+many tokens it is given, so the prompt is one call and each token after it is
+another. Buffers are sized once for the longest step, which is what lets those
+two be the same dispatches at different heights.
+
+The KV cache is the reason the `BufferRange` gap above was filled: the key and
+value projections write **into the cache at the step's own row** through a range
+bind, and the attention that follows reads the whole cache. Without it a step
+would need a scratch row and a copy per layer per token, or a row-offset uniform
+inside `Linear` that its every other call site would pay for.
+
+| test | tolerance | worst error measured |
+| --- | --- | --- |
+| small shape, a four-token prompt in one step | 5e-6 | 3.6e-7 |
+| the same tokens one at a time through the cache | 5e-6 | 3.6e-7 |
+| a prompt, single steps, then a second sequence on another encoder output | 5e-6 | 4.1e-7 |
+| the same with fp16 projections | 5e-6 | 1.8e-7 |
+| tiny.en over 4 tokens and 32 encoder rows, all 4 layers | 1e-4 | 5.4e-5 |
+
+in the mixed measure `|a - e| / (1 + |e|)`, against a double-precision decoder
+written in the test from HuggingFace's definition. The `Argmax` kernel's greedy
+pick is asserted against the reference's in every one of them, which puts it at
+the real 51864-wide row.
+
+A single-token step at the shape it is really run at — 1500 encoder rows, four
+layers, the full vocabulary — is about 9 ms of wall clock around `commit()`
+(4.6 to 13.7 over repeated runs from a Debug host build, which is the only clock
+available), after about 5 ms to project the cross-attention keys and values for
+the whole sequence. Naive per-thread kernels with no tiling, as everywhere else.
+
+Mutation-checked rather than trusted green: running cross-attention first,
+projecting k and v from the unnormalised hidden state, binding the cache one row
+out, and embedding at position zero each fail the suite. Dropping the causal
+flag fails five of the six and *has* to leave the one-token-at-a-time test
+standing — one query against n cached keys masks nothing, since the query stands
+at the last of them.
+
+What is deliberately not in here is `Argmax`. Which tokens are suppressed at
+which step is generation config, so greedy sampling is the layer above.
+
+### `Whisper/` — `whisper-runtime`, `Tests/Whisper`
+
+`WSP::Whisper` owns the config, the filterbank, both weight sets, the
+tokenizer, the mel front-end, the encoder, the decoder, `Argmax` and the two
+suppression masks. `load(directory)` reads the four HF files and names the
+missing one in a `ModelError`; `prepare()` is the GPU half. `transcribe` takes
+16 kHz mono samples up to 30 s, zero-fills to the window as HF does, and
+returns the sampled ids; `transcribeText` reads them back through the
+tokenizer with the specials dropped. More than 30 s is an error for now —
+chunking is a layer above this one.
+
+The search is HF's greedy `generate`: the prompt is `<|startoftranscript|>`
+then `<|notimestamps|>` in one step, `suppress_tokens` masks every sampled
+step, `begin_suppress_tokens` (a blank and end-of-text) only the first, and
+timestamps are not masked — HF adds its timestamp processor only when
+timestamps are asked for, and the prompt token is enough, which a mutation
+proves: drop it and the transcript fills with timestamps. whisper.cpp differs
+three ways (`whisper.cpp:6194`): with `no_timestamps` it masks every timestamp
+id at every step, it unconditionally masks `<|notimestamps|>` and the task and
+language tokens, and its non-speech list — HF's `suppress_tokens` — defaults
+to off, so a default whisper.cpp run suppresses less than a default HF one.
+Its per-segment cap of 220 tokens is a chunking policy and is not adopted; the
+cap here is HF's 448 positions.
+
+Each decode step is its own committed command buffer, because the sampled id
+has to reach the host before the next `Embed` can read it: eacp has no integer
+input buffer and `write()` takes a `UInt` only into an `AtomicBuffer`, so no
+kernel can hand a token to the next step on the device. That is the whole of
+the per-step cost below.
+
+On `jfk.wav`, tiny.en produces 24 tokens:
+
+```
+ And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
+```
+
+with the leading space and no comma after "Americans", which is what the model
+says and is pinned as a committed fixture (tier 3). From a Debug host build,
+wall clock around `commit()`:
+
+| stage | time |
+| --- | --- |
+| load and upload | 0.3 to 0.45 s |
+| mel and encoder | 53 to 66 ms |
+| decoding, 25 command buffers | 0.35 s, 14 ms per step |
+| mel to transcript | 0.42 s |
+
+`Apps/Console/Transcribe` runs the same on a WAV file and prints those. The
+WAV reader is `Audio/WavFile`, PCM16 or float, first channel, refusing any
+rate but 16 kHz; MakeASound links miniaudio privately and exposes no decoder.
+
+Mutation-checked: stopping one token early and dropping either prompt token
+fail the suite. Dropping the first-step mask is invisible on `jfk.wav` — and
+on eleven other signals swept for it: silence, noise, clicks, DC, the sample
+reversed, quieted and padded all come out word for word the same. A pure 440 Hz
+tone is the one that shows it, answering end-of-text at once and producing an
+empty transcript, so that is the test.
+
 ## Validation, in the order a failure is diagnosed
 
 1. **A scalar CPU reference inside the test itself**, for every kernel. No
    dependency, runs anywhere, and the only tier that catches a backend
    divergence — the same assertion runs against MSL here and HLSL on Windows.
    This is the bulk of the suite.
-2. **whisper.cpp as an in-process oracle**, not yet wired up. Stage-level, so a
-   mismatch bisects to a layer instead of reporting a wrong transcript.
+2. **whisper.cpp as an in-process oracle**, wired up behind
+   `WHISPER_EACP_ENABLE_WHISPER_CPP` (default off) in `Tests/Oracle`. Stage-level,
+   so a mismatch bisects to a layer instead of reporting a wrong transcript.
+   What it found is below.
 3. **Small committed fixtures** for what is cheap and stable.
 
 A GPU test returns early when `Device::shared().isValid()` is false, so the
 suite still passes on a machine with no GPU.
+
+### The oracle
+
+whisper.cpp `v1.9.3`, fetched with CPM and built CPU-only — `GGML_METAL`,
+`GGML_OPENMP`, `GGML_ACCELERATE` and `GGML_BLAS` all off, `BUILD_SHARED_LIBS`
+held off through CPM's CMP0077, and `CMAKE_BUILD_TYPE` saved and restored
+around the fetch because whisper.cpp force-sets it in the cache. Four targets
+and under three seconds from clean. Its `ggml-tiny.en.bin` (75 MB) is fetched
+beside it, hash pinned, and `tokenizer.json` joined the HF fetch list so the
+tokenizer can be compared at all. Every oracle test skips without the files.
+
+It goes both ways: whisper.cpp's `_LIBCPP_REMOVE_TRANSITIVE_INCLUDES` breaks
+ggml's own `gguf.cpp`, so the directory's compile definitions are cleared
+around the fetch and restored after.
+
+**The front-end, isolated through whisper.cpp's own encoder and decoder.**
+whisper.cpp does not expose its mel or its encoder output, but it accepts a mel
+and exposes logits, so the comparison is its logits from its own
+`whisper_pcm_to_mel` against its logits from our `MelSpectrogram` handed in
+through `whisper_set_mel`, with everything after the mel being whisper.cpp both
+times. On `jfk.wav`, zero-filled to 30 s, the rows differ by 0.036 at most
+(rms 0.013, logits ranging up to 20.8), and by 0.027 on a synthetic tone plus
+noise; the argmax agrees on both. The assertion is not a number picked by hand:
+the test moves every mel cell by one ulp and measures how far the reference's
+own row moves (0.04), and asserts ours is within twice that. The response
+saturates at once — 1e-7, 1e-6 and 1e-5 perturbations all move the row by
+about 0.04 — so that is the floor of what fp16 GGML weights let the comparison
+resolve, and our front-end sits at it.
+
+Format conversion ruled out first, as CLAUDE.md asks: the filterbank inside
+`ggml-tiny.en.bin` is bit-identical to `preprocessor_config.json`'s, all 16080
+entries. The residual is STFT arithmetic — their float radix-2 FFT against our
+per-bin DFT on the GPU. Two deliberate differences are documented in the test:
+whisper.cpp pads the tail with 30 s of zeros where HF reflects, which is why
+both signals are zero-filled to exactly 480000 samples so the two agree; and it
+frames 6000 windows of which the encoder reads 3000.
+
+**The two transformer stacks, at the logits.** Our mel through our encoder and
+decoder against the same mel through whisper.cpp's, for the prompt and four
+further steps fed the reference's own pick each time: the argmax agrees at
+every step, and the rows differ by 0.47 at most (rms 0.27) against the 0.04 the
+reference's one-ulp resolution gives — 11.6 times it, asserted at 25. The
+residual is the GGML fp16 conversion rather than ours: `Tests/Decoder` has the
+same decoder within 5.4e-5 of a double-precision reference on the same weights.
+
+**The transcript.** `transcribe` against `whisper_full` on `jfk.wav`, greedy,
+no timestamps, one segment, with whisper.cpp's non-speech suppression turned on
+so both sides run the same policy: 24 tokens to 24, token for token, and the
+joined text byte-identical.
+
+**The tokenizer.** Decode agrees on every id tried and every special token,
+and the vocabularies are the same size. Encode agrees on 7 of 8 strings; the
+one that differs, `"Le café était naïf."`, is ours that is right — byte-level
+BPE recomputed independently from `tokenizer.json`'s merge ranks gives our
+sequence, and whisper.cpp's `tokenize()` is not BPE but a greedy longest-match
+over a `std::regex` whose `[[:alpha:]]` is ASCII where GPT-2's pattern is
+`\p{L}`. Both segmentations decode back to the input, which is what the test
+asserts unconditionally; exact agreement is measured and printed.
 
 ## Gaps found in eacp and Miro
 
@@ -230,16 +404,45 @@ round of findings. None is worked around silently.
 | finding | where, and what it means |
 | --- | --- |
 | dispatch is 1D or 2D only | `Frame/ComputePass.h:77` and `:82`, with `ThreadPosition` (`ShaderValue.h:513`) carrying only `x` and `y`. Attention is natively a (key, query, head) grid, and both backends take three counts — `MTLSize` has a depth, `ID3D12GraphicsCommandList::Dispatch` takes three — so this is the layer's rank limit rather than either backend's. The head is folded into the row on the host and unfolded with a divide and a modulo in every thread; `Attention.h` says so. The one place a real net wanted a shape the layer would not express |
-| `Span::size()` is `int`; `MemoryMappedFile::bytes()` is not | `MemoryMappedFile.h:51` says the size is the full `size_t` "as is `bytes().getSize()`", but `Span::size()` asserts `fitsInt` (`ea_data_structures/Structures/Span.h:168`), so `mapped.bytes().size()` aborts in Debug and truncates in Release on exactly the file the class exists for. `Model/` uses `getSize()`; the fix upstream is a sentence beside `bytes()` |
-| `MemoryMappedFile` is not move-assignable | `Pimpl` (`Core/Utils/Pimpl.h:17`) defaults its move constructor and declares no `operator=`, so `std::optional<MemoryMappedFile>` takes `emplace()` but rejects assignment, which is surprising for a type its header says to "move". A defaulted `Pimpl& operator=(Pimpl&&)` closes it |
-| `readHalf` reads a whole word | `ShaderValue.h:2502` fetches `[index / 2]`, so a buffer holding an odd number of halves is read one word past its last whole word on the final element. Not written beside `readHalf`; the loader rounds the allocation up |
+| ~~`Span::size()` is `int`; `MemoryMappedFile::bytes()` is not~~ **written down** | `MemoryMappedFile.h:51` said the size is the full `size_t` "as is `bytes().getSize()`", but `Span::size()` asserts `fitsInt` (`ea_data_structures/Structures/Span.h:168`), so `mapped.bytes().size()` aborts in Debug and truncates in Release on exactly the file the class exists for. `Model/` uses `getSize()`, and eacp `0db26a3` puts the sentence beside `bytes()` |
+| ~~`MemoryMappedFile` is not move-assignable~~ **filled** | `Pimpl` (`Core/Utils/Pimpl.h:17`) defaulted its move constructor and declared no `operator=`, so `std::optional<MemoryMappedFile>` took `emplace()` but rejected assignment, which is surprising for a type its header says to "move". eacp `0db26a3` defaults `Pimpl& operator=(Pimpl&&)`, with a test in eacp's `Tests/Core` assigning over a live optional. What that leaves in view is that a moved-from `Pimpl` holds a null `shared_ptr`, so `->` on one is undefined — pre-existing, now reachable one more way, and the maintainer's call |
+| ~~`readHalf` reads a whole word~~ **written down** | `ShaderValue.h:2502` fetches `[index / 2]`, so a buffer holding an odd number of halves is read one word past its last whole word on the final element. The loader rounds the allocation up, and eacp `0db26a3` says so beside `readHalf` and in the README's fp16 section |
 | no `graph()` on a shipped program | `ShaderProgram` exposes `source()` for the active backend but not its graph, so pinning the *other* backend's text for a real kernel means re-authoring its body on a bare `ShaderBuilder` — which is how eacp's own tests do it. An accessor would let a shipped kernel's HLSL be asserted on a Mac |
 | loop-invariants are recomputed | the emitter gives up open names at a loop header by design (`StageEmitter`), so softmax's `1.0 / total` is divided once per element rather than hoisted. Harmless there; a real cost for a loop whose invariant is expensive and provably unwritten |
 | `erf(0)` is 1e-9 | eacp's helper ends in `x < 0 ? -e : e` where the deleted local one ended in `sign(x) * (...)`, so it is not odd-symmetric at the origin. GELU multiplies it by `x == 0`, so nothing here sees it; a caller wanting `erf` itself would |
-| `ComputePass` binds whole buffers only | `Frame/ComputePass.h:51` takes a `Buffer`, never the `BufferRange` that exists (`Buffer/Buffer.h:138`) and that `RenderPass::setVertexBuffer` (`Frame/RenderPass.h:145`) and `drawIndexed` already take. The encoder gets away with it because `embed_positions` is read as a prefix from offset 0; a KV cache, or a per-layer view of one packed tensor, has no way to bind at an offset short of a second buffer or an index uniform |
+| ~~`ComputePass` binds whole buffers only~~ **filled** | `Frame/ComputePass.h:51` took a `Buffer` and never the `BufferRange` that exists (`Buffer/Buffer.h:138`) and that `RenderPass::setVertexBuffer` already took. The encoder got away with it because `embed_positions` is read as a prefix from offset 0; a KV cache has no way to bind at an offset short of a second buffer or an index uniform. eacp `develop` from `0db26a3` adds `setInputBuffer`/`setOutputBuffer` over a range and the three `Uniform<...Buffer>` assignments, with `Tests/GPU/ComputeBufferRangeTests.cpp` pinning both directions, the atomic forwarding, the four-byte stride the alignment rests on, and that an invalid or out-of-range bind binds nothing. The decoder's k and v projections write straight into the cache row through it |
 | no stated contract for aliasing an input and an output | nothing says whether a hoisted read survives a store through a differently declared pointer to the same allocation, so every 1:1 elementwise stage (`Gelu`, `Add`) writes to a separate buffer: 12 extra allocations, 108 MB of them the score and probability pair at the full window |
 | GPU timing is `Frame`-only | `Timing/FrameTimer.h:15` is driven by `Frame`, and `CommandBuffer` has no timestamp hook, so an off-screen compute pass is timed by wall clock around `commit()` |
 | no device-side zero fill | `Device::makeBuffer(int)` (`Device/Device.h:57`) allocates uninitialised, so k_proj's zero bias is a host vector uploaded once. Minor |
+
+### What assembling the decoder surfaced
+
+The third round, against eacp `develop` at `0db26a3`, which this project
+fetches. The `BufferRange` bind above is the one gap the decoder could not do
+without; the rest is what filling it and writing the two new kernels turned up.
+None is worked around silently.
+
+| finding | where, and what it means |
+| --- | --- |
+| no integer input buffer | `InputBuffer::operator[]` yields only `Float` (`Codegen/ShaderValue.h:582`), and a read binding is emitted as `device const float*` / `StructuredBuffer<float>` (`Codegen/ShaderEmitter.cpp:1432`, `:1447`). The only uint-element buffer is `AtomicBuffer` (`ShaderValue.h:729`), which binds as an output (`Codegen/ComputeProgram.h:79`) — a read-write binding for what is an input. `Embed` uploads uint32 ids and reads them back through the `asUInt` bitcast (`ShaderValue.h:2415`), which is exact by construction; every Whisper id below 2^23 is a subnormal float pattern, so a test gathers ids 0, 1, 220, 50256, 50257 and 51863 and gets each back exact on Metal |
+| `write()` takes a `UInt` only into an `AtomicBuffer` | `Codegen/ComputeProgram.h:337`; the `OutputBuffer` overloads are `Float`/`Float2`/`Float3`/`Float4`. So `Argmax` writes its index through `atomic_store_explicit` on a `device atomic_uint*` — an atomic for a store no two threads contend. The same gap as the row above from the write side: eacp has a float storage buffer and an atomic uint buffer, and no plain integer one |
+| `select` is float-only | constrained through `SameShaderShape` → `detail::baseOf`, declared for the four float shapes only (`ShaderValue.h:869`, `select` at `:1898`), while `min`/`max` *are* defined on `UInt` (`:2649`). `Argmax` keeps its running best in `Var<UInt>` under `ifThen`, which is the right tool for it anyway; the causal mask selects on `Float` and is unaffected |
+| a hoisted name does not cross a branch | the emitter names a repeated subexpression as a `tN` local but does not carry it into an `ifThen` body, so `Argmax`'s `logits[base + index]` is loaded once in the condition and once in the body. Two loads per element in a one-thread-per-row scan; left as written to match `Softmax` next door |
+| `RenderPass::setVertexBuffer(const BufferRange&)` guards differ by backend | `Frame/RenderPass-Windows.cpp:168` rejects an offset at or past the end; `RenderPass-Apple.mm:232` has no offset guard at all, so a negative or past-end offset reaches Metal. The new compute binds guard on both, so they agree with each other and not with the render path |
+| no ranged render-side storage bind | `RenderPass::setVertexStorageBuffer` / `setFragmentStorageBuffer` (`Frame/RenderPass.h:192`) take only a `Buffer`, so a `Uniform<InputBuffer>` on a `ShaderProgram` binds whole; rather than drop an offset silently, `ShaderBufferBindVisitor::onInputBuffer` now asserts `offset == 0` in Debug. The obvious next range gap, not needed here |
+| `dispatchIndirect` does not bound its offset | `ComputePass-Apple.mm:156` and `ComputePass-Windows.cpp:215` both reject only `offsetInBytes < 0`, never one at or past `arguments.size()`, unlike the binds beside them |
+
+Checked and not a gap: an unassigned `Uniform<UInt>` is zero — `Uniform<T>` holds
+`Cpu value {}` (`Codegen/ShaderProgram.h:245`) and `CpuValueOf<UInt>` is
+`std::uint32_t` — so the encoder's `AttentionScores` would have masked nothing
+without the explicit `causal = 0u` it sets anyway.
+
+The alignment the ranged bind documents is four bytes on both backends, from
+what the emitter declares: `device float*` and `device atomic_uint*` on Metal,
+`StructuredBuffer<float>` / `RWStructuredBuffer<float>` / `RWStructuredBuffer<uint>`
+on HLSL, never a `ByteAddressBuffer` with its sixteen-byte rule — and an eacp
+test asserts the emitted declarations that number rests on. `range.bytes` is
+enforced by neither backend, which the header says outright.
 
 ### Miro
 
@@ -273,22 +476,36 @@ private 1585-entry table.
 file through it. What that turned up is the `Span::size()` pairing in the table
 above.
 
-## After the encoder
+## After the transcript
 
-The decoder, out of the same kernels: the token and positional embeddings are
-row gathers, the self-attention runs `AttentionScores` and `AttentionApply`
-with one query against the keys cached so far (which is why `queryCount` and
-`keyCount` are separate uniforms), the cross-attention runs them against the
-encoder's 1500 rows, and the logits are a `Linear` against the tied
-`embed_tokens` matrix. What it needs that is not here yet: a gather kernel, an
-argmax with Whisper's suppressed tokens masked, and the KV cache — which is
-where `ComputePass` binding whole buffers only (above) bites first, since
-appending a row means writing at an offset.
+The pipeline runs end to end: 30 seconds of audio in, a string out, checked
+against a double-precision reference at every layer and against whisper.cpp at
+the mel, the logits and the transcript. What is above it now:
 
-Then greedy sampling read back through `Tokenizer/`, whisper.cpp as the
-stage-level oracle, and the streaming path through MakeASound. One thing to
-know about the oracle before wiring it: whisper.cpp's public API takes a mel in
-(`whisper_set_mel`) and gives logits out (`whisper_get_logits`), and does not
-expose the encoder's output, so an encoder-level comparison against it goes
-either through its internal state or through a decoder of ours. The front-end
-and the tokenizer compare directly.
+- **Chunking.** More than 30 s is an error today. Whisper's own answer is to
+  decode a window, take the last timestamp as the seek point, and continue —
+  which means decoding *with* timestamps, so the timestamp tokens the search
+  leaves unmasked start to matter, and the `<|startofprev|>` prompt carries the
+  previous window's text across.
+- **Streaming through MakeASound.** `Audio/` captures; nothing feeds the
+  capture into a window yet. The encoder is 60 ms and a step 14 ms, so a
+  window re-decoded as it fills is affordable, but the step's host round trip
+  is the thing to remove first: a device-side token buffer between steps is
+  exactly the integer buffer eacp does not have (the gaps table).
+- **Multilingual prompts.** The language and task tokens between
+  `<|startoftranscript|>` and `<|notimestamps|>`, and language detection from
+  the first step's logits over the language ids. `SpecialTokens` already names
+  them; `Whisper` does not emit them.
+- **Resampling** in the WAV reader and the capture path, since 16 kHz mono is
+  the model's contract and not the microphone's.
+- **Kernels.** Every kernel is still the naive per-thread version the scalar
+  references were written against. Tiling the two matmul shapes is where the
+  time is.
+
+Two things ours surfaced on the way, recorded here rather than in the
+dependency tables: `SafeTensors::makeBuffer` and `PreprocessorConfig`'s
+filterbank upload take no `Device` and use the shared one, so
+`Whisper::prepare(device)` compiles on the given device and uploads on the
+shared one; and `EA::Span`'s deleted rvalue-container constructor
+(`Structures/Span.h:158`) makes `f(g())` a compile error whenever `g` returns
+a `Vector`, which is deliberate and costs a named local at every such call.

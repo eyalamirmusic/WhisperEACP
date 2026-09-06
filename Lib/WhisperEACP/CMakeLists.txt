@@ -22,6 +22,15 @@ add_subdirectory(Tokenizer)
 # means once there is something to assemble.
 add_subdirectory(Encoder)
 
+# Beside the encoder rather than above it: the encoder's output reaches the
+# decoder as a buffer, so neither includes a header from the other.
+add_subdirectory(Decoder)
+
+# The top of the tree, and the only module that includes a header from every
+# other one: samples in, a transcript out, with the greedy search the decoder
+# deliberately left to a layer that could hold the generation config.
+add_subdirectory(Whisper)
+
 # The whole library, for consumers that don't want to name the modules they use.
 add_library(WhisperEACP INTERFACE)
 target_link_libraries(WhisperEACP INTERFACE
@@ -31,4 +40,6 @@ target_link_libraries(WhisperEACP INTERFACE
         whisper-mel
         whisper-model
         whisper-tokenizer
-        whisper-encoder)
+        whisper-encoder
+        whisper-decoder
+        whisper-runtime)

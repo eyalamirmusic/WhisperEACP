@@ -94,18 +94,45 @@ const Tokenizer& fixtureTokenizer()
 // The real vocabulary is a download, so every test that wants one returns
 // early when none was pointed at, exactly as the GPU tests do without a
 // device.
+//
+// Four places, most specific first. The two tokenizer-only ones came first and
+// are kept because they name a file rather than a directory, which is what a
+// checkout that is not a whole HF repo has. The two model-directory ones were
+// added once tokenizer.json joined the fetch: the file is downloaded beside the
+// other three now, so a build configured with -DWHISPER_EACP_FETCH_MODEL=ON runs
+// these without being told where anything is.
 std::filesystem::path realTokenizerPath()
 {
+    const auto exists = [](const std::filesystem::path& path)
+    {
+        auto error = std::error_code {};
+        return !path.empty() && std::filesystem::is_regular_file(path, error);
+    };
+
     if (const auto* fromEnvironment = std::getenv("WHISPER_TOKENIZER_JSON"))
         return fromEnvironment;
 
-    return WHISPER_TOKENIZER_JSON_PATH;
+    if (exists(WHISPER_TOKENIZER_JSON_PATH))
+        return WHISPER_TOKENIZER_JSON_PATH;
+
+    if (const auto* fromModelDirectory = std::getenv("WHISPER_MODEL_DIR"))
+    {
+        const auto inDirectory =
+            std::filesystem::path {fromModelDirectory} / "tokenizer.json";
+
+        if (exists(inDirectory))
+            return inDirectory;
+    }
+
+    return std::filesystem::path {WHISPER_EACP_MODEL_DIR} / "tokenizer.json";
 }
 
 bool hasRealTokenizer()
 {
     const auto path = realTokenizerPath();
-    return !path.empty() && std::filesystem::exists(path);
+
+    auto error = std::error_code {};
+    return !path.empty() && std::filesystem::is_regular_file(path, error);
 }
 
 const Tokenizer& realTokenizer()

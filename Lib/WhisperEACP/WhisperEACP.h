@@ -9,3 +9,4 @@
 
 #include "Core/Core.h"
 #include "Audio/Audio.h"
+#include "Whisper/Whisper.h"

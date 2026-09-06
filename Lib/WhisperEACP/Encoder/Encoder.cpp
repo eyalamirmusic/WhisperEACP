@@ -271,6 +271,7 @@ void Encoder::encodeAttention(CommandBuffer& commands,
     scores.headWidth = (std::uint32_t) encoderShape.headWidth();
     scores.queryCount = (std::uint32_t) positions;
     scores.keyCount = (std::uint32_t) positions;
+    scores.causal = 0u;
     scores.scale = encoderShape.attentionScale();
 
     {

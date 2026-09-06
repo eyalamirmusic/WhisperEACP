@@ -1,7 +1,9 @@
 set(kernel_test_sources
         AddTests.cpp
+        ArgmaxTests.cpp
         AttentionTests.cpp
         Conv1dTests.cpp
+        EmbedTests.cpp
         GeluTests.cpp
         LayerNormTests.cpp
         LinearTests.cpp
