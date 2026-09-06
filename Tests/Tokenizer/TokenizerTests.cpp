@@ -1,6 +1,7 @@
 #include <WhisperEACP/Tokenizer/Tokenizer.h>
 
 #include <Miro/Json.h>
+#include <Miro/Unicode.h>
 #include <NanoTest/NanoTest.h>
 
 #include <algorithm>
@@ -60,6 +61,22 @@ bool splitsInto(std::string_view text,
     const auto preTokens = PreTokenizer::split(text);
     return std::equal(
         preTokens.begin(), preTokens.end(), expected.begin(), expected.end());
+}
+
+// The mapping Unicode.cpp is written to be: our three classes are Miro's
+// general categories restated, and nothing else.
+Unicode::Category miroCategoryOf(char32_t codePoint)
+{
+    if (Miro::Unicode::isWhitespace(codePoint))
+        return Unicode::Category::whitespace;
+
+    if (Miro::Unicode::isLetter(codePoint))
+        return Unicode::Category::letter;
+
+    if (Miro::Unicode::isNumber(codePoint))
+        return Unicode::Category::number;
+
+    return Unicode::Category::other;
 }
 
 std::filesystem::path fixturePath()
@@ -188,6 +205,48 @@ auto tInvalidUtf8ReadsAsOneByte = test("Tokenizer/invalidUtf8ReadsAsOneByte") = 
     check(Unicode::readCodePoint(niHaoShiJie, 0).value == 0x4F60);
     check(Unicode::readCodePoint(grinningFace, 0).byteLength == 4);
     check(Unicode::readCodePoint(grinningFace, 0).value == 0x1F600);
+};
+
+// A sweep rather than a sample, because the thing that can go wrong is a
+// whole run of code points changing class when Miro moves to a later Unicode
+// version. Dense below U+30000, where every script a tokenizer meets lives,
+// and every 17th code point above, which is enough to notice a plane move.
+auto tUnicodeAgreesWithMiro = test("Tokenizer/unicodeAgreesWithMiro") = []
+{
+    constexpr auto denselySwept = char32_t {0x30000};
+    constexpr auto strideAbove = char32_t {17};
+    constexpr auto lastCodePoint = char32_t {0x10FFFF};
+
+    auto mismatches = 0;
+
+    for (auto codePoint = char32_t {0}; codePoint < denselySwept; ++codePoint)
+        if (Unicode::categoryOf(codePoint) != miroCategoryOf(codePoint))
+            ++mismatches;
+
+    for (auto codePoint = denselySwept; codePoint <= lastCodePoint;
+         codePoint += strideAbove)
+        if (Unicode::categoryOf(codePoint) != miroCategoryOf(codePoint))
+            ++mismatches;
+
+    check(mismatches == 0);
+};
+
+// A rejected sequence reports its lead byte, and that byte is a byte: 0xC3
+// alone must not come back as the letter U+00C3, or the byte-level layer
+// would classify half of a two-byte sequence as a word character.
+auto tUtf8DecodeEdges = test("Tokenizer/utf8DecodeEdges") = []
+{
+    const auto loneLeadByte = Unicode::readCodePoint("\xc3", 0);
+    check(loneLeadByte.byteLength == 1);
+    check(loneLeadByte.category == Unicode::Category::other);
+
+    check(Unicode::readCodePoint("\xed\xa0\x80", 0).byteLength == 1);
+    check(Unicode::readCodePoint("\xf4\x90\x80\x80", 0).byteLength == 1);
+
+    const auto inside = Unicode::readCodePoint(joined({"ab", niHaoShiJie, "z"}), 2);
+    check(inside.value == 0x4F60);
+    check(inside.byteLength == 3);
+    check(inside.category == Unicode::Category::letter);
 };
 
 // --- The pre-tokenizer --------------------------------------------------

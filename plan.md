@@ -115,13 +115,28 @@ small quantity needs ~1e-4 rather than 1e-6.
 
 ### Miro
 
-| gap | evidence |
+All five gaps below are fixed upstream, on Miro `main` from commit `948b34e`, which
+eacp fetches. Each was proven by a failing test in Miro's own suite before the fix.
+
+| gap | what Miro does now |
 | --- | --- |
-| `Json` mis-decodes surrogate pairs | `parseUnicodeEscape` reads four hex digits with no pairing, and `appendUtf8` has no 4-byte branch. `"😀"` parses to `ED A0 BD ED B8 80` — CESU-8 — instead of `F0 9F 98 80`. Any `tokenizer.json` written with Python's default `ensure_ascii=True` decodes astral characters wrongly; the HF file is raw UTF-8, which is the only reason it does not bite |
-| `Json::Value::operator[]` uses `std::map::at` | a missing key throws `std::out_of_range` rather than a JSON error, so `Miro::Json::find` is the only safe accessor |
-| `Json::Object` is `std::map<std::string, Value>` | 152 ms to parse `tokenizer.json`'s 50k-key vocabulary in Debug. The safetensors header has the same shape |
-| `Json` numbers are all `double` | no integer preservation, so 64-bit safetensors offsets need an explicit whole-number and 2^53 range check |
-| no Unicode general-category API | the GPT-2 pre-tokenizer's `\p{L}` / `\p{N}` classes forced a generated 1585-entry table into `Tokenizer/Unicode.cpp`. Text layout or IME handling would need the same data |
+| `Json` mis-decoded surrogate pairs | `parseUnicodeEscape` pairs `\uD8xx\uDCxx` into one code point and emits 4-byte UTF-8. A lone or mismatched surrogate, or a non-hex digit in a `\u` escape, is a `ParseError` |
+| `Json::Value::operator[]` threw `std::out_of_range` | `Miro::Json::Error` is the base of `ParseError` and the new `AccessError`, which the `as*()` accessors and implicit conversions throw on a type mismatch, naming both types. `operator[]` itself is deliberately left unchecked, by decision: a missing key or bad index stays the caller's error, and `find` remains the accessor for an optional key |
+| `Json::Object` cost 152 ms for a 50k-key parse in Debug | Measured, not assumed. 83 to 90 percent of that parse is inside `std::map::emplace`, in key comparison during the tree descent rather than allocation, so nothing inside the parser can move it. `Object` gained a transparent comparator so `find` takes a `string_view` without allocating (Debug lookups 19 percent faster). Swapping the container would parse 2.4 to 2.6x faster and look up 5 to 6x faster, at the cost of sorted iteration order in `print()`. Left as the maintainer's call |
+| `Json` numbers were all `double` | An `std::int64_t` alternative. A literal with no fraction or exponent parses exactly, `isInteger()` / `asInteger()` expose it, `isNumber()` / `asNumber()` still answer for both kinds, equality is numeric across them, and the reflection layer carries `int64` through typed and raw fields. Doubles print shortest-round-trip instead of six significant digits |
+| no Unicode general-category API | `<Miro/Unicode.h>`: all 30 general categories, the `\p{..}` class predicates, the `White_Space` property, and strict UTF-8 `decodeUtf8` / `appendUtf8`, from a table generated out of Unicode 16.0 and checked against Python's `unicodedata` for every code point |
+
+Two things surfaced on the way that belong on the record. Miro's first push used the
+floating-point `std::to_chars`, which libc++ marks unavailable below macOS 13.3; this
+project targets 11.0, so the fetch failed to compile until `948b34e` printed doubles
+through a shortest-round-trip `snprintf` loop instead. And `EA::Vector::operator[]`
+is unchecked and `noexcept`, so an out-of-range JSON array index was undefined
+behaviour before and still is.
+
+Downstream, the two workarounds these gaps had forced here are gone: `Model/`'s
+integer reads go through `asInteger()` instead of a 2^53 range check on a double, and
+`Tokenizer/Unicode.cpp` is a thin three-class view over `Miro::Unicode` instead of a
+private 1585-entry table.
 
 ### Checked and discarded
 

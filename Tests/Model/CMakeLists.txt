@@ -11,6 +11,7 @@ nano_add_executable(ModelTests
         NO_MAIN
         SOURCES
         ConfigTests.cpp
+        ModelIOTests.cpp
         SafeTensorsTests.cpp
         TinyEnTests.cpp
         ${WHISPER_GPU_TEST_MAIN}

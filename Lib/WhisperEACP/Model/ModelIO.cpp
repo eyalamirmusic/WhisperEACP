@@ -1,6 +1,5 @@
 #include "ModelIO.h"
 
-#include <cmath>
 #include <fstream>
 #include <limits>
 
@@ -80,17 +79,17 @@ const Miro::Json::Value& field(const Miro::Json::Object& object,
 
 std::int64_t asInteger(const Miro::Json::Value& value, std::string_view what)
 {
-    const auto number = asDouble(value, what);
+    if (!value.isNumber())
+        throw ModelError {std::string {what} + " is not a number"};
 
-    if (std::trunc(number) != number)
-        throw ModelError {std::string {what} + " is not a whole number"};
-
-    constexpr auto exactlyRepresentable = 9007199254740992.0;
-
-    if (std::abs(number) > exactlyRepresentable)
-        throw ModelError {std::string {what} + " is out of integer range"};
-
-    return static_cast<std::int64_t>(number);
+    try
+    {
+        return value.asInteger();
+    }
+    catch (const Miro::Json::AccessError&)
+    {
+        throw ModelError {std::string {what} + " is not a whole 64-bit integer"};
+    }
 }
 
 double asDouble(const Miro::Json::Value& value, std::string_view what)
