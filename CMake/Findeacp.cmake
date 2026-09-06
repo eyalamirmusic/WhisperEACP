@@ -10,7 +10,7 @@ include(CPM)
 CPMAddPackage(
         NAME eacp
         GITHUB_REPOSITORY eyalamirmusic/eacp
-        GIT_TAG main
+        GIT_TAG develop
         OPTIONS
         "EACP_BUILD_WEBVIEW OFF")
 
@@ -35,12 +35,20 @@ if (APPLE AND eacp_SOURCE_DIR)
     endif ()
 endif ()
 
-# To develop against a local eacp checkout instead of the GitHub fetch — which
-# is the normal setup here, since this project drives changes to eacp's compute
-# layer — pass CPM's per-package source override at configure time:
+# develop rather than main: main trails it, and the compute layer this project
+# is written against moves on develop first. The fetch is the default and the
+# configuration CI and every ordinary build use — nothing here points at a
+# checkout on the machine.
+#
+# A local checkout is available for the case it is actually for: changing eacp
+# itself, alongside a change here that needs it. It is a deliberate override
+# for that session, not a standing setup, and the build goes back to the fetch
+# once the eacp change is pushed.
 #
 #   cmake -B build -DCPM_eacp_SOURCE=$HOME/Code/eacp
 #
 # Use $HOME, not ~ — CMake does not expand a tilde, and the shell will not
 # expand one inside quotes, so the path silently resolves to nothing and the
-# failure surfaces much later as a missing eacp-gpu target.
+# failure surfaces much later as a missing eacp-gpu target. A local tree also
+# brings whatever is uncommitted in it into this build, which is its own
+# hazard: an unrelated refactor in progress there breaks every target here.

@@ -49,15 +49,26 @@ ctest --test-dir build --output-on-failure
 - `WHISPER_EACP_CI_BUILD` (default `OFF`): turns on the unity builds CI uses,
   here and in eacp, MakeASound and Miro.
 
-### Local dependency checkouts
+### Dependencies are fetched, not taken from the machine
 
-eacp and MakeASound are fetched via CPM from GitHub by default. To work against
-local checkouts — the normal setup here, since this project drives changes to
-eacp's compute layer — pass CPM's per-package source override:
+eacp comes from CPM at **`develop`**, MakeASound and NanoTest at `main`. That is
+the default and the only configuration Claude should use: the plain configure
+line above is the whole story, and no build here points at a checkout on this
+machine.
+
+Claude must **not** pass `-DCPM_eacp_SOURCE` or `-DCPM_MakeASound_SOURCE` unless
+the user asks for it in the current conversation. A local tree drags whatever is
+uncommitted in it into this build, so an unrelated refactor in progress over
+there breaks every target here, with the error surfacing inside the dependency
+where it reads as ours.
+
+The override exists for the case it is actually for — changing eacp itself
+alongside a change here that needs it — and the build returns to the fetch as
+soon as that eacp change is pushed:
 
 ```bash
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DWHISPER_EACP_UNITY_BUILD=OFF \
-      -DCPM_eacp_SOURCE=$HOME/Code/eacp -DCPM_MakeASound_SOURCE=$HOME/Code/makeasound
+      -DCPM_eacp_SOURCE=$HOME/Code/eacp
 ```
 
 Use `$HOME` (not `~`). CMake does not expand `~`, and shell tilde expansion is
@@ -105,8 +116,18 @@ rather than `eacp-core`, since every layer above it holds GPU buffers.
 Those constants are the model's, not choices; they are pinned by value in
 `Tests/Audio` the way a wire format would be.
 
-The remaining layers — the mel front-end, the model weights, the encoder and
-decoder kernels — are not written yet.
+**Kernels/** — layernorm, GELU, softmax and matmul as `ComputeProgram`
+subclasses, shapes as uniforms so the encoder and decoder can be written out of
+them.
+
+**Mel/** — the front-end: Hann, a reflect-padded STFT, the 80 x 201 filterbank,
+log10 and Whisper's clamp-and-scale.
+
+**Model/** — safetensors and the two config files. **Tokenizer/** — byte-level
+BPE and Whisper's special tokens.
+
+The encoder and decoder are not written yet. `plan.md` carries the order they
+come in, and the gaps this has surfaced in eacp and Miro.
 
 ### Model format
 
@@ -118,7 +139,7 @@ A HF Whisper repo carries everything the runtime needs, in four files:
 
 | file | what it holds |
 | --- | --- |
-| `model.safetensors` | the weights (151 MB for `tiny.en`) |
+| `model.safetensors` | the weights (151 MB for `tiny.en`, F32 — see below) |
 | `config.json` | layer counts, widths, head counts |
 | `tokenizer.json` | the BPE vocabulary and merges |
 | `preprocessor_config.json` | the **mel filterbank**, as an 80 x 201 matrix |
@@ -130,6 +151,17 @@ is in the file, already built. It also carries `sampling_rate`, `n_fft`,
 which agree value for value with the constants in `Audio/Format.h`. Those
 constants stay as constants — a shape the code is compiled against, not
 something read at runtime — but the file is what to check them against.
+
+Both claims above are checked in `Tests/Model`, and both hold: `mel_filters` is
+in the file at 80 x 201, and every constant agrees.
+
+**`tiny.en` ships F32, not F16** — `"torch_dtype": "float32"`, and all 167
+tensors in its `model.safetensors` are `F32` (19104-byte header, 151,041,024-byte
+blob). F16 is what the larger repos ship. The loader reads both and widens on the
+way in, because eacp's EDSL has no half type — `ValueType` is
+`Float/Float2/.../UInt/Int/Bool` and `InputBuffer` yields a `Float` — so packed
+halves cannot be read by a kernel at all, and keeping them packed would only move
+the conversion into every kernel that touches a weight.
 
 ### Fetching the model
 
