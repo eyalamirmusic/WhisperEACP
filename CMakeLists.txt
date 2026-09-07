@@ -30,6 +30,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 if (APPLE)
+    # Objective-C as well as Objective-C++, and first. With only OBJCXX enabled
+    # CMake hands every .m file to it — the extension is in both tables, and
+    # enabling OBJC is what takes it away — so ggml-metal's Objective-C, which
+    # the benchmark's whisper.cpp builds, would be compiled as C++ and fail on
+    # its first void* conversion. Nothing else in the tree has a .m file.
+    enable_language(OBJC)
     enable_language(OBJCXX)
 
     # CMake already puts -lobjc on the link line of everything that pulls in
@@ -88,6 +94,47 @@ set(WHISPER_EACP_SAMPLE_DIR "${PROJECT_SOURCE_DIR}/Samples"
 
 add_subdirectory(Lib)
 
+# whisper.cpp, for the two things here that compare against it: the oracle
+# tests in Tests/Oracle and the benchmark in Benchmark/. Both off by default —
+# it is a second inference stack to fetch and build, and a 75 MB model beside
+# it. One fetch serves both, here rather than in either consumer, because its
+# targets (ggml, whisper) are named globally and cannot exist twice in a tree.
+#
+# Which build of it the tree gets is therefore the one decision the two cannot
+# make separately. The oracle wants every backend off, so the reference computes
+# exactly what it documents: ggml's own CPU path. The benchmark wants
+# whisper.cpp's own defaults for the machine — Metal, Accelerate and BLAS on a
+# Mac — since a benchmark against a handicapped whisper.cpp measures nothing.
+# The benchmark wins when both are on: the oracle tests then run against that
+# build with its GPU off at runtime, which is ggml's CPU backend plus the BLAS
+# one the defaults compiled in. Every tolerance in Tests/Oracle is measured
+# against the reference's own resolution rather than assumed, which is what
+# lets them hold either way, and the tests print which build they loaded.
+option(WHISPER_EACP_ENABLE_WHISPER_CPP
+        "Fetch whisper.cpp and build the tests that compare against it" ON)
+option(WHISPER_EACP_ENABLE_BENCHMARK
+        "Fetch whisper.cpp with its backends on, and build Benchmark, which \
+times the runtime against it" ON)
+
+if (WHISPER_EACP_ENABLE_WHISPER_CPP OR WHISPER_EACP_ENABLE_BENCHMARK)
+    include(WhisperCpp)
+
+    if (WHISPER_EACP_ENABLE_BENCHMARK)
+        whisper_add_whisper_cpp()
+    else ()
+        # GGML_BLAS is its own switch and is not implied by GGML_ACCELERATE
+        # OFF: without it the configure still finds Accelerate and links BLAS
+        # into the reference.
+        whisper_add_whisper_cpp(OPTIONS
+                "GGML_METAL OFF"
+                "GGML_OPENMP OFF"
+                "GGML_ACCELERATE OFF"
+                "GGML_BLAS OFF")
+    endif ()
+
+    whisper_fetch_ggml_tiny_en()
+endif ()
+
 option(WHISPER_EACP_ENABLE_APPS "Build the WhisperEACP apps"
         ${PROJECT_IS_TOP_LEVEL})
 
@@ -101,4 +148,8 @@ option(WHISPER_EACP_ENABLE_TESTS "Enable tests for WhisperEACP"
 if (WHISPER_EACP_ENABLE_TESTS)
     enable_testing()
     add_subdirectory(Tests)
+endif ()
+
+if (WHISPER_EACP_ENABLE_BENCHMARK)
+    add_subdirectory(Benchmark)
 endif ()

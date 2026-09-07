@@ -23,6 +23,7 @@
 #include <WhisperEACP/Model/PreprocessorConfig.h>
 #include <WhisperEACP/Tokenizer/Tokenizer.h>
 
+#include <ggml-backend.h>
 #include <whisper.h>
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
@@ -80,9 +82,34 @@ inline void silenceOracleLogging()
     whisper_log_set([](ggml_log_level, const char*, void*) {}, nullptr);
 }
 
+// Which whisper.cpp this is, printed once. The root CMakeLists builds it with
+// every backend off unless Benchmark/ is in the tree, in which case the
+// reference's CPU path goes through whatever the defaults compiled in beside
+// it — Accelerate, on a Mac — and a number below should be read knowing which.
+inline void announceOracleBuild()
+{
+    static const auto announced = []
+    {
+        std::cout << "  whisper.cpp " << whisper_version() << ", backends";
+
+        for (auto index = std::size_t {}; index < ggml_backend_dev_count(); ++index)
+        {
+            const auto device = ggml_backend_dev_get(index);
+            std::cout << (index == 0 ? " " : ", ")
+                      << ggml_backend_reg_name(ggml_backend_dev_backend_reg(device));
+        }
+
+        std::cout << "\n";
+        return true;
+    }();
+
+    (void) announced;
+}
+
 inline Oracle loadOracle()
 {
     silenceOracleLogging();
+    announceOracleBuild();
 
     auto parameters = whisper_context_default_params();
     parameters.use_gpu = false;

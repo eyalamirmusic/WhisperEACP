@@ -59,6 +59,48 @@ ctest --test-dir build --output-on-failure
   `OFF`: reconfigure with `-U WHISPER_EACP_FETCH_MODEL`, or pass `ON`
   explicitly, to get the default behaviour there.
 
+- `WHISPER_EACP_ENABLE_WHISPER_CPP` (default `OFF`): fetches whisper.cpp and
+  its GGML `tiny.en`, and builds `Tests/Oracle` against it.
+
+- `WHISPER_EACP_ENABLE_BENCHMARK` (default `OFF`): the same fetch with
+  whisper.cpp's backends on, and the `Benchmark` target. See the benchmark
+  section below for what that does to the oracle when both are on.
+
+### The benchmark, and which whisper.cpp a tree gets
+
+`Benchmark/` times the runtime against whisper.cpp — on Metal and on the CPU —
+in one process, behind `WHISPER_EACP_ENABLE_BENCHMARK`. A benchmark of a Debug
+build measures the Debug build, so the numbers come from a Release tree of
+their own:
+
+```bash
+cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
+      -DWHISPER_EACP_ENABLE_BENCHMARK=ON
+cmake --build build-release --target Benchmark
+./build-release/Benchmark/Benchmark                 # jfk.wav, 10 timed runs
+./build-release/Benchmark/Benchmark 30 recording.wav
+```
+
+whisper.cpp is fetched once, in the root `CMakeLists.txt`, through
+`CMake/WhisperCpp.cmake`, because its targets (`ggml`, `whisper`) are named
+globally and a tree holds one build of it. That build is CPU-only, every
+backend off, when only `WHISPER_EACP_ENABLE_WHISPER_CPP` is on — the oracle
+wants a reference that computes exactly ggml's own CPU path — and whisper.cpp's
+own defaults for the machine, Metal and Accelerate on a Mac, whenever
+`WHISPER_EACP_ENABLE_BENCHMARK` is on, since a benchmark against a handicapped
+whisper.cpp measures nothing. With both on, the oracle tests run against the
+benchmark's build with the GPU off at runtime, which is ggml's CPU backend plus
+Accelerate through BLAS; their tolerances are measured against the reference's
+own resolution, so they hold, and `loadOracle()` prints which build it loaded.
+
+Two things that build taught the tree: enable Objective-C as well as
+Objective-C++, since with only OBJCXX on CMake compiles ggml-metal's `.m` files
+as C++; and the fetch clears `_LIBCPP_REMOVE_TRANSITIVE_INCLUDES` around
+whisper.cpp's subtree, since ggml's `gguf.cpp` does not compile with it on.
+`Benchmark/README.md` says what each row measures and what it does not;
+`Benchmark/backends.py` covers the Python backends that cannot be in the
+process.
+
 ### Dependencies are fetched, not taken from the machine
 
 eacp comes from CPM at **`develop`**, MakeASound and NanoTest at `main`. That is

@@ -597,6 +597,43 @@ the mel, the logits and the transcript. What is above it now:
   references were written against. Tiling the two matmul shapes is where the
   time is.
 
+### Where it stands against whisper.cpp
+
+`Benchmark/` is the baseline the kernel work is measured against: our runtime
+and whisper.cpp v1.9.3 in one Release process, on the same 480000 samples,
+the same greedy policy, one warm-up and the median of ten timed runs. Behind
+`WHISPER_EACP_ENABLE_BENCHMARK`, which is also what decides which whisper.cpp
+a tree gets — its targets are global, so there is one — and the benchmark's
+wins: whisper.cpp at its own defaults, Metal, Accelerate and BLAS on, where the
+oracle alone builds it with every backend off. It runs once on Metal and once
+without it, at its default four threads. The three transcripts agree token for
+token.
+
+Apple M4 Max, `tiny.en`, `jfk.wav` zero-filled to the window:
+
+| | WhisperEACP | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- |
+| transcribe, median | 0.393 s | 0.040 s | 0.124 s |
+| x real time, over the 30 s window | 76 | 756 | 242 |
+| encode, median | 0.046 s (mel + encoder) | 0.008 s (encoder only) | 0.087 s |
+| decode, median, 25 steps | 0.345 s | 0.016 s | 0.021 s |
+| decode per step | 13.8 ms | 0.6 ms | 0.8 ms |
+
+Two readings. The encoder is six times whisper.cpp's on the same GPU, and
+that gap is the naive kernels: the two matmul shapes are the whole of it. The
+decoder is twenty times, and a Release build moved the step from the 14 ms the
+Debug tests recorded to 13.8 ms — so the step is not host code but the GPU
+side of the loop: four layers of kernels dispatched over a single token, the
+51864 x 384 vocabulary projection read in full every step, and a commit and a
+readback between one token and the next. The device-side token buffer in the
+gaps table is what removes the round trip; the per-step kernel cost is the
+same tiling work as the encoder's.
+
+`Benchmark/backends.py` runs mlx-whisper, faster-whisper and openai-whisper on
+the same protocol for the runtimes that cannot be in the process. Written
+against their documented APIs and not yet exercised: none of the three is
+installed on this machine.
+
 Two things ours surfaced on the way, recorded here rather than in the
 dependency tables: `SafeTensors::makeBuffer` and `PreprocessorConfig`'s
 filterbank upload take no `Device` and use the shared one, so

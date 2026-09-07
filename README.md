@@ -56,6 +56,7 @@ the second half of the point.
 | `Apps/Console/Transcribe` | A WAV file in, the transcript and what it cost out |
 | `Samples` | `jfk.wav`, the recording the end-to-end tests run on |
 | `Tests` | NanoTest, one executable per module |
+| `Benchmark` | Our runtime against whisper.cpp, in one process, behind `WHISPER_EACP_ENABLE_BENCHMARK` |
 
 Headers are spelled `<WhisperEACP/...>`, beside eacp's own `<eacp/...>`.
 
@@ -105,6 +106,31 @@ above still works, and `Whisper::hasBundledModel()` answers `false`.
 `samples/jfk.wav`, which is OpenAI whisper's own `tests/jfk.flac`. The recording
 is a US government work held by the JFK Library and is
 [public domain](https://archive.org/details/JohnF.KennedyInauguralAddress).
+
+## Benchmarking
+
+`Benchmark/` times the runtime against whisper.cpp v1.9.3 in one process — on
+its Metal backend and on the CPU — over the same samples, the same greedy
+policy, one warm-up and the median of the timed runs. It sits behind
+`WHISPER_EACP_ENABLE_BENCHMARK`, and since a benchmark of a Debug build
+measures the Debug build, the numbers come from a Release tree of their own:
+
+```bash
+cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
+      -DWHISPER_EACP_ENABLE_BENCHMARK=ON
+cmake --build build-release --target Benchmark
+./build-release/Benchmark/Benchmark            # jfk.wav, 10 timed runs
+./build-release/Benchmark/Benchmark 30 recording.wav
+```
+
+The option builds whisper.cpp at its own defaults for the machine, backends
+on, where the oracle in `Tests/Oracle` alone builds it with every backend off
+to be a reference; whisper.cpp's targets are global, so a tree holds one build
+and the benchmark's wins when both are on. `Benchmark/README.md` says what
+that means for the oracle, what each row of the table measures and, as
+importantly, what it does not. `Benchmark/backends.py` runs mlx-whisper,
+faster-whisper and openai-whisper — whichever are installed — on the same
+protocol, for the backends that cannot be in the process.
 
 eacp is fetched at `develop`, MakeASound and NanoTest at `main`. The configure
 line above is the whole story — no build here points at a checkout on the
