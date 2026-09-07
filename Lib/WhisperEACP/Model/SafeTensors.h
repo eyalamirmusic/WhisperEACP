@@ -78,10 +78,10 @@ public:
     // outlive this SafeTensors and every Span it hands out** — rawBytes(),
     // readFloats() and makeBuffer() all read straight out of them.
     //
-    // For weights that already live as long as the process, which is what a
-    // model embedded in the binary is, and for a buffer the caller keeps. A
-    // buffer the caller is done with belongs in fromBytes instead, which takes
-    // ownership of it and costs nothing extra to do so.
+    // For weights the caller keeps alive itself — a buffer it holds for the
+    // run, or bytes a host process owns. A buffer the caller is done with
+    // belongs in fromBytes instead, which takes ownership of it and costs
+    // nothing extra to do so.
     static SafeTensors fromView(Span<const std::uint8_t> bytes);
 
     // Sorted by name, since the header is read out of an ordered map.

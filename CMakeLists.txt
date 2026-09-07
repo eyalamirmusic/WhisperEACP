@@ -56,6 +56,7 @@ if (WHISPER_EACP_CI_BUILD)
 endif ()
 
 include(WhisperTargetSetup)
+include(WhisperResources)
 
 if (PROJECT_IS_TOP_LEVEL)
     whisper_default_setup()

@@ -1,11 +1,12 @@
 #include "Whisper.h"
 
-#include <WhisperEACP/Model/ModelIO.h>
+#include "ResourcesDirectory.h"
 
-#include <ResEmbed/ResEmbed.h>
+#include <WhisperEACP/Model/ModelIO.h>
 
 #include <chrono>
 #include <string>
+#include <system_error>
 
 namespace WSP
 {
@@ -27,42 +28,26 @@ constexpr int floatBytes(int elementCount)
     return elementCount * (int) sizeof(float);
 }
 
+bool hasFile(const std::filesystem::path& directory, std::string_view name)
+{
+    auto error = std::error_code {};
+    return std::filesystem::is_regular_file(directory / name, error);
+}
+
 std::filesystem::path requireFile(const std::filesystem::path& directory,
                                   std::string_view name)
 {
-    auto path = directory / name;
-    auto error = std::error_code {};
-
-    if (!std::filesystem::is_regular_file(path, error))
+    if (!hasFile(directory, name))
         throw ModelError {"the model directory " + directory.string() + " has no "
                           + std::string {name}};
 
-    return path;
+    return directory / name;
 }
 
-ResEmbed::DataView embeddedFile(std::string_view name)
+bool isDirectory(const std::filesystem::path& path)
 {
-    return ResEmbed::get(std::string {name}, Whisper::embeddedModelCategory);
-}
-
-Span<const std::uint8_t> bytesOf(const ResEmbed::DataView& file)
-{
-    return {file.data(), file.getSize()};
-}
-
-ResEmbed::DataView requireEmbeddedFile(std::string_view name)
-{
-    auto file = embeddedFile(name);
-
-    if (!file)
-        throw ModelError {"this binary embeds no " + std::string {name}
-                          + " under the "
-                          + std::string {Whisper::embeddedModelCategory}
-                          + " category; a model is embedded by configuring with "
-                            "-DWHISPER_EACP_EMBED_MODEL=ON and linking "
-                            "whisper-embedded-model"};
-
-    return file;
+    auto error = std::error_code {};
+    return std::filesystem::is_directory(path, error);
 }
 
 double commitSeconds(CommandBuffer& commands)
@@ -102,26 +87,36 @@ void Whisper::load(const ModelFiles& files)
     buildGenerationConfig();
 }
 
-// Embedded data is static for the life of the process, so borrowing it is
-// exactly right: nothing is copied, and the 151 MB the binary already carries
-// is never duplicated on the heap to be read once.
-void Whisper::loadEmbedded()
+std::filesystem::path Whisper::bundledModelDirectory()
 {
-    const auto config = requireEmbeddedFile(configFile);
-    const auto preprocessorConfig = requireEmbeddedFile(preprocessorFile);
-    const auto tokenizer = requireEmbeddedFile(tokenizerFile);
-    const auto weights = requireEmbeddedFile(weightsFileName);
-
-    load(ModelFiles {bytesOf(config),
-                     bytesOf(preprocessorConfig),
-                     bytesOf(tokenizer),
-                     bytesOf(weights)});
+    return resourcesDirectory() / bundledModelDirectoryName;
 }
 
-bool Whisper::hasEmbeddedModel()
+bool Whisper::hasBundledModel()
 {
-    return embeddedFile(configFile) && embeddedFile(preprocessorFile)
-           && embeddedFile(tokenizerFile) && embeddedFile(weightsFileName);
+    const auto directory = bundledModelDirectory();
+
+    return hasFile(directory, configFile) && hasFile(directory, preprocessorFile)
+           && hasFile(directory, tokenizerFile)
+           && hasFile(directory, weightsFileName);
+}
+
+// No directory at all is a build that never asked for the copy, and the message
+// says how to ask. One that is there but short a file is a copy that did not
+// finish, and load() names the file the way it would for any directory.
+void Whisper::loadBundled()
+{
+    const auto directory = bundledModelDirectory();
+
+    if (!isDirectory(directory))
+        throw ModelError {"this binary ships no model: there is no "
+                          + directory.string()
+                          + "; a model is copied there by calling "
+                            "whisper_bundle_model(<target>) in the target's "
+                            "CMakeLists, in a build configured with "
+                            "-DWHISPER_EACP_FETCH_MODEL=ON"};
+
+    load(directory);
 }
 
 void Whisper::buildGenerationConfig()

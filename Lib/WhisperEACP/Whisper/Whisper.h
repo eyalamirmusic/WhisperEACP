@@ -93,20 +93,29 @@ public:
     // buffer prepare() uploads, comes out of them.
     void load(const ModelFiles& files);
 
-    // The model this binary embeds, if it embeds one: the four files looked up
-    // in ResEmbed under embeddedModelCategory by their HF names. A ModelError
-    // names the first file the binary does not carry, since a build that meant
-    // to embed a model and linked the wrong target should not read as a corrupt
-    // one.
+    // The model the build copied beside this binary, if it copied one: the
+    // four files under bundledModelDirectoryName, in the bundle's Resources on
+    // macOS and next to the executable otherwise. A ModelError names the
+    // directory it looked for when there is none, since a build that meant to
+    // ship a model and never asked for the copy should not read as a corrupt
+    // one; a directory that is there but short a file fails the way load(path)
+    // does, naming the file.
     //
-    // A binary gets one by configuring with -DWHISPER_EACP_EMBED_MODEL=ON and
-    // linking whisper-embedded-model. Nothing here embeds a model on its own:
-    // 151 MB in every executable is a decision the build makes, not the runtime.
-    void loadEmbedded();
+    // A binary gets one by calling whisper_bundle_model(<target>) in its
+    // CMakeLists, in a build configured with -DWHISPER_EACP_FETCH_MODEL=ON.
+    // Nothing here copies a model on its own: 151 MB beside every executable is
+    // a decision the build makes, not the runtime.
+    void loadBundled();
 
-    static bool hasEmbeddedModel();
+    static bool hasBundledModel();
 
-    static constexpr auto embeddedModelCategory = "WhisperModel";
+    // resourcesDirectory() / bundledModelDirectoryName, whether or not anything
+    // is there.
+    static std::filesystem::path bundledModelDirectory();
+
+    // The directory whisper_bundle_model copies into. Spelled here and in
+    // Model/CMakeLists.txt, and nowhere else.
+    static constexpr auto bundledModelDirectoryName = "WhisperModel";
 
     bool isLoaded() const { return weightsFile.has_value(); }
 

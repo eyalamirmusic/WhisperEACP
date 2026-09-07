@@ -49,19 +49,15 @@ ctest --test-dir build --output-on-failure
 - `WHISPER_EACP_CI_BUILD` (default `OFF`): turns on the unity builds CI uses,
   here and in eacp, MakeASound and Miro.
 
-- `WHISPER_EACP_FETCH_MODEL` (default `OFF`) / `WHISPER_EACP_EMBED_MODEL`
-  (default `ON`): the four `tiny.en` files on disk, and the same four inside
-  every binary that links `whisper-embedded-model`. Embedding needs the files,
-  so the fetch runs when **either** is on — which means a default configure
-  downloads 151 MB even though the fetch switch itself is off.
+- `WHISPER_EACP_FETCH_MODEL` (default `ON`): the four `tiny.en` files on disk,
+  and — through `whisper_bundle_model(<target>)` — copied beside every binary
+  that asks for them, after each link. A default configure therefore downloads
+  151 MB. Off, the function is a no-op, `Whisper::hasBundledModel()` answers
+  `false` at runtime, and the tests that need a file skip.
 
-  Embedding is not free. ResEmbed emits bytes as a decimal brace initializer,
-  so `model.safetensors` becomes a 657 MB `.c` that takes 42 s and a **16 GiB
-  peak RSS** to compile here, and puts 151 MB into `Transcribe` and
-  `EmbeddedTests`. A machine short of memory, or a build that only wants the
-  library, configures with `-DWHISPER_EACP_EMBED_MODEL=OFF`; the target is
-  still there as an empty `INTERFACE` library, and `Whisper::hasEmbeddedModel()`
-  answers `false` at runtime.
+  A build directory configured before the switch flipped keeps its cached
+  `OFF`: reconfigure with `-U WHISPER_EACP_FETCH_MODEL`, or pass `ON`
+  explicitly, to get the default behaviour there.
 
 ### Dependencies are fetched, not taken from the machine
 
@@ -204,28 +200,45 @@ Pin `URL_HASH` on each once the model choice settles.
 
 Do not use `CPM_SOURCE_CACHE`.
 
-The fetch runs behind `WHISPER_EACP_FETCH_MODEL OR WHISPER_EACP_EMBED_MODEL`,
-and the second of those is on by default, so an ordinary configure downloads
-the four files whether or not it asked for them by name. `WHISPER_EACP_MODEL_DIR`
-points at the directory they are linked into either way, so a test compiles
-against a real path and skips on a file's absence rather than on an `#ifdef`.
+The fetch runs behind `WHISPER_EACP_FETCH_MODEL`, on by default, so an ordinary
+configure downloads the four files. `WHISPER_EACP_MODEL_DIR` points at the
+directory they are linked into either way, so a test compiles against a real
+path and skips on a file's absence rather than on an `#ifdef`.
+`WHISPER_EACP_MODEL_FILES` lists the four paths, and is empty when the fetch is
+off.
 
-### Embedding the model
+### Bundling the model
 
-`whisper-embedded-model`, defined in `Model/CMakeLists.txt` beside the fetch,
-runs the same four files through ResEmbed under category `WhisperModel`. ResEmbed
-keys a resource by its basename, which is exactly the HF file name
-`Whisper::loadEmbedded()` looks up, so the fetched names are the runtime keys.
-The target is `STATIC` when the option is on and `INTERFACE` when it is off, so
-a consumer links it unconditionally.
+The model is **not** compiled into any binary. It used to be, through ResEmbed,
+and 151 MB as a decimal brace initializer was a 657 MB `.c`, a 42 s compile and
+a 16 GiB peak RSS; `plan.md` keeps the numbers. The build copies it instead.
 
-It gets neither `whisper_set_default_target_setting` nor
-`whisper_enable_unity_build`: it is data, and neither LTO nor a jumbo TU has
-anything to do to a 657 MB brace initializer.
+`whisper_copy_resources(<target> FILES ... [DESTINATION <dir>])`, in
+`CMake/WhisperResources.cmake`, is a `POST_BUILD` copy to where the binary can
+find files at runtime: `Contents/Resources` of a `MACOSX_BUNDLE` target, and
+the executable's own directory otherwise — a Windows build, or a macOS
+executable that is not a bundle, which is what the console apps and every test
+here are. `copy_if_different`, so a rebuild that changed nothing copies nothing.
 
-`SafeTensors::fromView` is what makes an embedded model cost nothing at
-runtime — the 151 MB the binary already carries is borrowed, never copied to
-the heap.
+`whisper_bundle_model(<target>)`, defined in `Model/CMakeLists.txt` beside the
+fetch, applies that to the four fetched files under `DESTINATION WhisperModel`.
+It exists whether or not the fetch is on and does nothing when it is off, so a
+consumer calls it unconditionally and `Whisper::hasBundledModel()` answers at
+runtime.
+
+The runtime half is `WSP::resourcesDirectory()` in
+`Whisper/ResourcesDirectory.h`, one source per platform: CoreFoundation's
+`CFBundleCopyResourcesDirectoryURL` on Apple, which answers `Contents/Resources`
+for a bundle and the executable's directory for anything else, and
+`GetModuleFileNameW` on Windows. `Whisper::bundledModelDirectory()` is that plus
+`WhisperModel`, `hasBundledModel()` checks the four files are in it, and
+`loadBundled()` is `load()` on it, so the weights are mapped as for any
+directory. The directory name is spelled in `Model/CMakeLists.txt` and in
+`Whisper::bundledModelDirectoryName`, and nowhere else.
+
+`Whisper::load(const ModelFiles&)` and `SafeTensors::fromView` stay: they are
+the path for a model somebody already holds in memory, and `Tests/Whisper`
+exercises them.
 
 ### The sample
 
@@ -249,8 +262,8 @@ Three forms, and the app says which one it took before printing the transcript:
 ./build/Apps/Console/Transcribe/Transcribe path/to/model recording.wav
 ```
 
-A form that needs the embedded model in a build with none prints how to get one
-and returns 2.
+A form that needs the bundled model in a build that copied none prints how to
+get one and returns 2.
 
 ## Correctness validation
 

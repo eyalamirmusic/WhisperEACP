@@ -258,24 +258,26 @@ auto tLoadFromMemoryMatchesTheDirectory =
     check(whisper.laterStepMask() == directory.laterStepMask());
 };
 
-// No test binary embeds a model — 151 MB in an executable is a decision the
-// build makes — so this is the shape every one of them is in: hasEmbeddedModel()
-// says no, and loadEmbedded() names the first file that is missing rather than
-// reporting a model it did find as corrupt.
-auto tEmbeddedModelIsAbsentHere = test("Whisper/embeddedModelIsAbsentHere") = []
+// This binary's CMakeLists never calls whisper_bundle_model — 151 MB beside an
+// executable is a decision the build makes, and Tests/Bundled is the one that
+// makes it — so this is the shape of a binary that ships nothing:
+// hasBundledModel() says no, and loadBundled() names the directory it looked
+// for and how to get one there, rather than reporting a model it did find as
+// corrupt.
+auto tBundledModelIsAbsentHere = test("Whisper/bundledModelIsAbsentHere") = []
 {
-    check(!Whisper::hasEmbeddedModel());
+    check(!Whisper::hasBundledModel());
 
     const auto message = modelErrorFrom(
         []
         {
             auto whisper = Whisper {};
-            whisper.loadEmbedded();
+            whisper.loadBundled();
         });
 
-    check(namesFile(message, "config.json"));
-    check(mentions(message, Whisper::embeddedModelCategory));
-    check(mentions(message, "WHISPER_EACP_EMBED_MODEL"));
+    check(mentions(message, Whisper::bundledModelDirectoryName));
+    check(mentions(message, "whisper_bundle_model"));
+    check(mentions(message, "WHISPER_EACP_FETCH_MODEL"));
 };
 
 // The weights are the one of the four that is not JSON, and bytes that are not a

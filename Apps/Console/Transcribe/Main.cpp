@@ -12,9 +12,10 @@
 #include <string>
 
 // The whole runtime as a binary, in three forms: with no arguments it runs the
-// model and the recording it carries inside itself, with one it runs that model
-// on a WAV of yours, and with two it takes a HuggingFace directory as well.
-// Either way it prints the transcript and what each half of the run cost.
+// model the build copied beside it on the recording it carries inside itself,
+// with one it runs that model on a WAV of yours, and with two it takes a
+// HuggingFace directory as well. Either way it prints the transcript and what
+// each half of the run cost.
 //
 // Inside eacp::Apps::run for the reason every GPU-touching thing here is — the
 // Metal backend is written against the run loop and autorelease pool that owns,
@@ -25,9 +26,9 @@ using namespace eacp;
 namespace
 {
 constexpr auto usage =
-    "usage: Transcribe                                  built-in model, "
+    "usage: Transcribe                                  bundled model, "
     "built-in sample\n"
-    "       Transcribe <wav file>                       built-in model\n"
+    "       Transcribe <wav file>                       bundled model\n"
     "       Transcribe <model directory> <wav file>\n"
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
@@ -35,14 +36,14 @@ constexpr auto usage =
     "                   tokenizer.json\n"
     "  wav file         16 kHz mono, at most 30 seconds\n"
     "\n"
-    "The built-in sample is 11 s of Kennedy's inaugural address. The built-in\n"
-    "model is whisper-tiny.en, in a build configured with\n"
-    "-DWHISPER_EACP_EMBED_MODEL=ON.\n";
+    "The built-in sample is 11 s of Kennedy's inaugural address. The bundled\n"
+    "model is whisper-tiny.en, copied beside this binary by a build configured\n"
+    "with -DWHISPER_EACP_FETCH_MODEL=ON.\n";
 
-constexpr auto missingEmbeddedModel =
-    "this build embeds no model, so there is nothing to run without a model\n"
-    "directory. Configure with -DWHISPER_EACP_EMBED_MODEL=ON to get one, or\n"
-    "name a HuggingFace Whisper repo on the command line.\n\n";
+constexpr auto missingBundledModel =
+    "this build copied no model beside the binary, so there is nothing to run\n"
+    "without a model directory. Configure with -DWHISPER_EACP_FETCH_MODEL=ON to\n"
+    "get one, or name a HuggingFace Whisper repo on the command line.\n\n";
 
 constexpr auto embeddedSample = "jfk.wav";
 constexpr auto embeddedSampleCategory = "TranscribeSamples";
@@ -85,14 +86,18 @@ struct Request
     std::string modelDirectory;
     std::string wavFile;
 
-    bool usesEmbeddedModel() const { return modelDirectory.empty(); }
+    bool usesBundledModel() const { return modelDirectory.empty(); }
     bool usesEmbeddedSample() const { return wavFile.empty(); }
+
+    std::string modelPath() const
+    {
+        return usesBundledModel() ? WSP::Whisper::bundledModelDirectory().string()
+                                  : modelDirectory;
+    }
 
     void announce() const
     {
-        std::printf("model: %s\n",
-                    usesEmbeddedModel() ? "built-in whisper-tiny.en"
-                                        : modelDirectory.c_str());
+        std::printf("model: %s\n", modelPath().c_str());
         std::printf("audio: %s\n\n",
                     usesEmbeddedSample() ? "built-in jfk.wav" : wavFile.c_str());
     }
@@ -115,8 +120,8 @@ void run(const Request& request)
 
     auto whisper = WSP::Whisper {};
 
-    if (request.usesEmbeddedModel())
-        whisper.loadEmbedded();
+    if (request.usesBundledModel())
+        whisper.loadBundled();
     else
         whisper.load(request.modelDirectory);
 
@@ -146,9 +151,9 @@ void transcribe()
 
     const auto request = requestFor(arguments);
 
-    if (request.usesEmbeddedModel() && !WSP::Whisper::hasEmbeddedModel())
+    if (request.usesBundledModel() && !WSP::Whisper::hasBundledModel())
     {
-        std::printf("%s%s", missingEmbeddedModel, usage);
+        std::printf("%s%s", missingBundledModel, usage);
         Apps::setReturnValue(2);
         return;
     }

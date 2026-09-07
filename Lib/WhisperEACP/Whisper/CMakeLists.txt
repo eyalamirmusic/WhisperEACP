@@ -15,15 +15,23 @@ target_link_libraries(whisper-runtime PUBLIC
         whisper-model
         whisper-tokenizer)
 
-# ResEmbed comes from eacp, which fetches it and whose CMake/ carries the find
-# module — reachable here because CMake/Findeacp.cmake re-appends that directory
-# to CMAKE_MODULE_PATH. PRIVATE, because loadEmbedded() looks the four files up
-# inside the .cpp and no header of ours mentions ResEmbed.
-find_package(ResEmbed REQUIRED)
-target_link_libraries(whisper-runtime PRIVATE ResEmbed)
-
 target_sources(whisper-runtime PRIVATE
         Whisper.cpp)
+
+# Where the build's post-build copy put what this binary ships — see
+# whisper_copy_resources in CMake/WhisperResources.cmake. One answer per
+# platform: CoreFoundation's on Apple, which is the bundle's Resources for a
+# bundle and the executable's directory for anything else, and the executable's
+# directory on Windows.
+if (APPLE)
+    target_sources(whisper-runtime PRIVATE
+            ResourcesDirectory-Apple.cpp)
+
+    target_link_libraries(whisper-runtime PRIVATE "-framework CoreFoundation")
+elseif (WIN32)
+    target_sources(whisper-runtime PRIVATE
+            ResourcesDirectory-Windows.cpp)
+endif ()
 
 whisper_set_default_target_setting(whisper-runtime)
 whisper_enable_unity_build(whisper-runtime)

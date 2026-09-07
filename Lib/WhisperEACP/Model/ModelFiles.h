@@ -8,8 +8,8 @@ namespace WSP
 {
 // The four files of a HuggingFace Whisper repo as bytes already in memory: the
 // same set Whisper::load reads out of a directory, for a caller that has them
-// without a filesystem to read them from — a model embedded in the binary, or
-// one downloaded into a buffer.
+// without a filesystem to read them from — one downloaded into a buffer, or
+// handed over by a host that has already read it.
 //
 // Views, not buffers. Nothing here owns a byte, and the weights in particular
 // are borrowed rather than copied all the way down (SafeTensors::fromView), so

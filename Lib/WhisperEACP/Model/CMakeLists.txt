@@ -17,19 +17,14 @@ whisper_enable_unity_build(whisper-model)
 whisper_add_ide_sources(whisper-model)
 
 # The model is a download, never a commit — 151 MB of weights has no business
-# in git. This switch is off by default so a build that only wants the fetched
-# files on disk asks for them; on, CPM fetches the four files this module reads
-# and the directory they are assembled into reaches Tests/Model as a compile
-# definition.
+# in git. On, CPM fetches the four files this module reads, and the directory
+# they are assembled into reaches Tests/Model as a compile definition; it is
+# also what whisper_bundle_model() below copies beside a binary. On by default
+# because Transcribe's no-argument form and Tests/Bundled both need it, and off
+# is for a build that only wants the library or has a checkout of its own.
 option(WHISPER_EACP_FETCH_MODEL
-        "Download the HuggingFace openai/whisper-tiny.en model files" OFF)
-
-# Embedding needs the same four files, so it turns the fetch on below rather
-# than duplicating it — which is why a default configure downloads them even
-# though the switch above is off.
-option(WHISPER_EACP_EMBED_MODEL
-        "Embed the whisper-tiny.en model files into the binaries that link \
-whisper-embedded-model" ON)
+        "Download the HuggingFace openai/whisper-tiny.en model files, and copy \
+them beside every binary that calls whisper_bundle_model()" ON)
 
 # Set even when the fetch is off, so Tests/Model always compiles against a real
 # path and the tests that need a file skip on its absence rather than on an
@@ -61,9 +56,14 @@ function(whisper_fetch_model_file package_name file_name file_hash)
             "${${package_name}_SOURCE_DIR}/${file_name}"
             "${WHISPER_EACP_MODEL_DIR}/${file_name}"
             COPY_ON_ERROR SYMBOLIC)
+
+    list(APPEND WHISPER_EACP_MODEL_FILES "${WHISPER_EACP_MODEL_DIR}/${file_name}")
+    set(WHISPER_EACP_MODEL_FILES "${WHISPER_EACP_MODEL_FILES}" PARENT_SCOPE)
 endfunction()
 
-if (WHISPER_EACP_FETCH_MODEL OR WHISPER_EACP_EMBED_MODEL)
+set(WHISPER_EACP_MODEL_FILES "")
+
+if (WHISPER_EACP_FETCH_MODEL)
     file(MAKE_DIRECTORY "${WHISPER_EACP_MODEL_DIR}")
 
     whisper_fetch_model_file(whisper-tiny-en-config config.json
@@ -83,34 +83,34 @@ if (WHISPER_EACP_FETCH_MODEL OR WHISPER_EACP_EMBED_MODEL)
             5eb60cec1e77aeeb6869a2bb5a8e01a84c3fe5d072d75369343021fe6f5310d0)
 endif ()
 
-# The same four files again, as bytes inside whatever links this — which is why
-# it lives here rather than beside Whisper::loadEmbedded that reads them: this
-# target is about the fetch above, and nothing but the file list connects the
-# two.
-#
-# The name is load-bearing twice over. ResEmbed keys a resource by its basename,
-# so the keys are exactly the HF file names loadEmbedded() looks up; and
-# Whisper.cpp's error message tells the caller to link `whisper-embedded-model`.
-#
-# INTERFACE when the option is off rather than no target at all, so a consumer
-# links it unconditionally and Whisper::hasEmbeddedModel() is what answers —
-# the same shape as a test skipping on a missing file rather than on an #ifdef.
-if (WHISPER_EACP_EMBED_MODEL)
-    add_library(whisper-embedded-model STATIC)
+# The four fetched files, as a list a directory processed after this one can
+# read. Empty when the fetch is off, which is what makes whisper_bundle_model()
+# a no-op in that build.
+set(WHISPER_EACP_MODEL_FILES "${WHISPER_EACP_MODEL_FILES}"
+        CACHE INTERNAL "The fetched whisper-tiny.en files, or empty")
 
-    find_package(ResEmbed REQUIRED)
-    res_embed_add(whisper-embedded-model
-            FILES
-            "${WHISPER_EACP_MODEL_DIR}/config.json"
-            "${WHISPER_EACP_MODEL_DIR}/preprocessor_config.json"
-            "${WHISPER_EACP_MODEL_DIR}/model.safetensors"
-            "${WHISPER_EACP_MODEL_DIR}/tokenizer.json"
-            NAMESPACE WhisperModel
-            CATEGORY WhisperModel)
+# The same four files again, copied beside whatever asks for them after every
+# link — into Contents/Resources of a bundle on macOS, next to the executable
+# otherwise — which is why it lives here rather than beside Whisper::loadBundled
+# that reads them: this function is about the fetch above, and nothing but the
+# file list connects the two.
+#
+# The directory name is load-bearing: WhisperModel is what
+# Whisper::bundledModelDirectoryName spells, so the runtime finds the copy by
+# the same name the build gave it, and Whisper.cpp's error message tells the
+# caller to call `whisper_bundle_model`.
+#
+# Defined whether or not the fetch is on, so a consumer calls it
+# unconditionally and Whisper::hasBundledModel() is what answers — the same
+# shape as a test skipping on a missing file rather than on an #ifdef. It used
+# to be a ResEmbed target instead, and plan.md records why it is a copy now:
+# 151 MB as a decimal brace initializer was a 657 MB .c and a 16 GiB compile.
+function(whisper_bundle_model target)
+    if (NOT WHISPER_EACP_MODEL_FILES)
+        return()
+    endif ()
 
-    # No warnings level, no LTO, no unity batch: this target is data. ResEmbed
-    # emits the weights as a 657 MB decimal brace initializer, and nothing an
-    # optimiser or a jumbo TU does to that is worth the compile.
-else ()
-    add_library(whisper-embedded-model INTERFACE)
-endif ()
+    whisper_copy_resources(${target}
+            DESTINATION WhisperModel
+            FILES ${WHISPER_EACP_MODEL_FILES})
+endfunction()

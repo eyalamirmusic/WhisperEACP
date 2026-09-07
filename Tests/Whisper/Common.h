@@ -60,9 +60,9 @@ constexpr auto jfkSample = "jfk.wav";
 // sequence whose first piece carries the word boundary; the trim below is what
 // makes this literal readable, and the leading space is asserted separately.
 //
-// Here rather than in TranscribeTests.cpp because Tests/Embedded transcribes
-// the same recording through the embedded model, and one pinned sentence read
-// by both is the point of pinning it.
+// Here rather than in TranscribeTests.cpp because Tests/Bundled transcribes
+// the same recording through the bundled model, and one pinned sentence read by
+// both is the point of pinning it.
 constexpr auto jfkTranscript =
     "And so my fellow Americans ask not what your country can do for you, "
     "ask what you can do for your country.";

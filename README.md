@@ -77,8 +77,8 @@ or D3D12 backend, so there is no Linux target.
 
 ## Transcribing
 
-`Transcribe` embeds the `tiny.en` weights and the sample, so the first form
-needs nothing on disk:
+The build copies the `tiny.en` weights beside `Transcribe` and embeds the
+sample in it, so the first form needs nothing but the build tree:
 
 ```bash
 ./build/Apps/Console/Transcribe/Transcribe
@@ -87,17 +87,18 @@ needs nothing on disk:
 ```
 
 ```
-model: built-in whisper-tiny.en
+model: /path/to/build/Apps/Console/Transcribe/WhisperModel
 audio: built-in jfk.wav
 
  And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
 ```
 
-The embedded model is what makes the default configure download 151 MB and the
-build want 16 GiB of RAM for one translation unit: ResEmbed emits the weights as
-a decimal brace initializer, and 151 MB of them is a 657 MB `.c`. Configure with
-`-DWHISPER_EACP_EMBED_MODEL=OFF` to skip all of that; the two-argument form
-above still works, and `Whisper::hasEmbeddedModel()` answers `false`.
+The model is what makes the default configure download 151 MB. It is copied
+beside the binary after every link rather than compiled into it — into
+`Contents/Resources` for a macOS bundle, next to the executable otherwise — so
+no translation unit ever holds it. Configure with
+`-DWHISPER_EACP_FETCH_MODEL=OFF` to skip the download; the two-argument form
+above still works, and `Whisper::hasBundledModel()` answers `false`.
 
 `Samples/jfk.wav` is 11 seconds of President Kennedy's inaugural address,
 20 January 1961, at 16 kHz mono PCM16 — byte-identical to whisper.cpp v1.9.3's

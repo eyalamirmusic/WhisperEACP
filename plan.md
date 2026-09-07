@@ -268,34 +268,58 @@ reversed, quieted and padded all come out word for word the same. A pure 440 Hz
 tone is the one that shows it, answering end-of-text at once and producing an
 empty transcript, so that is the test.
 
-## Embedding the model
+## Bundling the model
 
-`WHISPER_EACP_EMBED_MODEL` (default **on**) runs the four fetched files through
-ResEmbed into `whisper-embedded-model`, under category `WhisperModel` and keyed
-by their HF basenames, which are the names `loadEmbedded()` asks for. Embedding
-needs the files, so the fetch condition is `WHISPER_EACP_FETCH_MODEL OR
-WHISPER_EACP_EMBED_MODEL` — a default configure downloads 151 MB. Off, the
-target is still there as an empty `INTERFACE` library, so a consumer links it
-unconditionally and `Whisper::hasEmbeddedModel()` is what answers, the same
-shape as a test skipping on a missing file rather than on an `#ifdef`.
+The model reached the binaries in two steps, and the second undid the first.
 
-The API under it:
+**First, embedded.** `WHISPER_EACP_EMBED_MODEL` ran the four fetched files
+through ResEmbed into a `whisper-embedded-model` target, under category
+`WhisperModel` and keyed by their HF basenames, with `loadEmbedded()` and
+`hasEmbeddedModel()` reading the registry. It worked, and it is what surfaced
+the three ResEmbed findings below — the first of which is the whole cost of the
+approach: 151 MB as a decimal brace initializer is a 657 MB `.c`, a 42 s compile
+and a 16 GiB peak RSS, for every binary that wanted the model.
 
-- `SafeTensors` now has three constructions — mapped, owned, and **borrowed**
-  (`fromView`). The borrowed one is what makes an embedded model free: the
-  151 MB the binary already carries is read where it lies, never copied to the
-  heap.
-- `Whisper` has a second `load`, over a `ModelFiles` of four byte spans, plus
-  `loadEmbedded()` and `hasEmbeddedModel()`. Both loads run the same four
-  parses in the same order, so a set of bytes missing what a directory would
-  have been missing fails with the same message.
+**Then, copied.** The embedding is gone. `WHISPER_EACP_FETCH_MODEL` (default
+**on** now, and the only model switch) fetches the four files, and
+`whisper_bundle_model(<target>)` copies them beside a binary after every link,
+under a `WhisperModel` directory: into `Contents/Resources` of a `MACOSX_BUNDLE`
+target, and next to the executable otherwise — a Windows build, or a macOS
+executable that is not a bundle, which the console apps and every test are. The
+generic half is `whisper_copy_resources(<target> FILES ... [DESTINATION <dir>])`
+in `CMake/WhisperResources.cmake`, a `POST_BUILD` `copy_if_different`; the
+model-specific half is defined in `Model/CMakeLists.txt` beside the fetch,
+exists whether or not the fetch is on, and does nothing when it is off, so a
+consumer calls it unconditionally. Nothing is compiled and nothing is linked.
+
+The runtime resolves the same rule from inside the process.
+`WSP::resourcesDirectory()` (`Whisper/ResourcesDirectory.h`, one source per
+platform) is CoreFoundation's `CFBundleCopyResourcesDirectoryURL` on Apple —
+which answers the executable's own directory for a bundle-less binary, the
+detail that lets a console tool and an `.app` share one rule — and the parent of
+`GetModuleFileNameW` on Windows. `Whisper::bundledModelDirectory()` appends
+`WhisperModel`, `hasBundledModel()` checks the four files are in it, and
+`loadBundled()` is `load(path)` on it, so the weights are memory-mapped exactly
+as for a directory named on the command line. The directory name is spelled in
+`Model/CMakeLists.txt` and `Whisper::bundledModelDirectoryName`, and nowhere
+else.
+
+What the first step built and the second kept:
+
+- `SafeTensors` has three constructions — mapped, owned, and **borrowed**
+  (`fromView`). The borrowed one was what made an embedded model free, and it
+  stays as the path for weights a caller already holds in memory.
+- `Whisper::load(const ModelFiles&)`, over four byte spans, runs the same four
+  parses as `load(path)` in the same order, so a set of bytes missing what a
+  directory would have been missing fails with the same message.
+  `Tests/Whisper` loads through it.
 - `Audio/` decodes a WAV from a span — `readWavBytes(bytes, name)`, with
-  `readWavFile` written on top of it — so an embedded recording and a file on
-  disk report a refused sample rate identically.
-- `whisper-runtime` links ResEmbed **PRIVATE**, through eacp's own find module.
-  There is deliberately no `FindResEmbed.cmake` here: `CMAKE_MODULE_PATH` is
-  inherited by every subdirectory and ours is appended first, so a module of
-  that name would shadow eacp's.
+  `readWavFile` written on top of it. `Transcribe`'s sample is still embedded
+  through ResEmbed: 352 kB is what ResEmbed is for, and it is the one
+  `find_package(ResEmbed)` left in the tree. There is deliberately no
+  `FindResEmbed.cmake` here: `CMAKE_MODULE_PATH` is inherited by every
+  subdirectory and ours is appended first, so a module of that name would
+  shadow eacp's.
 
 The sample moved the other way. `Samples/jfk.wav` is committed — 352 kB, and
 the only recording the suite needs — so `whisper_fetch_sample_file` and the
@@ -304,15 +328,18 @@ the root `CMakeLists.txt`. It stays separate from the model directory for the
 reason it always was: `WHISPER_MODEL_DIR` may point at a HuggingFace checkout,
 and jfk.wav is not in one.
 
-`Apps/Console/Transcribe` takes three forms — no arguments (embedded model,
-embedded sample), one (embedded model, your WAV), two (a HF directory and your
-WAV) — and names the model and the audio it chose before the transcript, so a
-run says which form it took. `Tests/Embedded` asserts that
-`hasEmbeddedModel()` equals the build flag (the one test here that never skips:
-it is what catches ResEmbed's static-initializer registration being
-dead-stripped, which would otherwise turn every other test in the file into a
-silent skip), that each embedded view is byte-identical to the fetched file,
-and that a runtime loaded out of the binary produces the pinned transcript.
+`Apps/Console/Transcribe` takes three forms — no arguments (bundled model,
+embedded sample), one (bundled model, your WAV), two (a HF directory and your
+WAV) — and names the model directory and the audio it chose before the
+transcript, so a run says which form it took. `Tests/Bundled` (was
+`Tests/Embedded`) asserts that the resources directory the runtime resolves is
+real (never skipping, on both platforms), that the copy is there when the build
+made one, that each copied file is byte-identical to the fetched one, and that
+a runtime loaded out of the copy produces the pinned transcript. The one
+assertion the embedded version had that this one does not is "no model when
+the option is off": a `POST_BUILD` copy leaves its output behind when a build
+directory is reconfigured from on to off, and a test that read that as a
+failure would be reporting a stale build tree, not a bug.
 
 ## Validation, in the order a failure is diagnosed
 
@@ -490,6 +517,14 @@ on HLSL, never a `ByteAddressBuffer` with its sixteen-byte rule — and an eacp
 test asserts the emitted declarations that number rests on. `range.bytes` is
 enforced by neither backend, which the header says outright.
 
+### What bundling the model surfaced
+
+One, in eacp, and it is the reason `Whisper/` has platform sources at all:
+
+| finding | where, and what it means |
+| --- | --- |
+| `Files::getBundleResourcePath` is Apple-only, and there is no accessor for the directory itself | `Core/Utils/Files.mm` resolves a named resource through `CFBundleCopyResourceURL`; `Files-Windows.cpp` and `Files-Linux.cpp` return `{}` for every name. "Beside the executable" is the Windows analogue of a bundle resource — it is what `whisper_copy_resources` does there — so an app that ships a file with itself has no eacp call that finds it on both platforms. Nor is there a `resourcesDirectory()` returning the directory rather than a file in it, which is what a caller wants when the resource is a directory of four files and the error message should name where it looked. `Whisper/ResourcesDirectory-Apple.cpp` and `-Windows.cpp` are the two answers, written here; the Apple one is `CFBundleCopyResourcesDirectoryURL`, which already does the right thing for a bundle-less executable |
+
 ### Miro
 
 All five gaps below are fixed upstream, on Miro `main` from commit `948b34e`, which
@@ -517,9 +552,11 @@ private 1585-entry table.
 
 ### ResEmbed
 
-Embedding the model is the first thing here to hand ResEmbed (eacp fetches it;
+Embedding the model was the first thing here to hand ResEmbed (eacp fetches it;
 `0ea662c`) a resource that is not a font or an icon, and 151 MB is where its
 choices start to show. All three belong upstream; none is worked around here.
+The first row is why the model is no longer embedded at all — *Bundling the
+model* above — and the sample, at 352 kB, still is.
 
 | finding | where, and what it means |
 | --- | --- |
@@ -568,6 +605,6 @@ shared one; and `EA::Span`'s deleted rvalue-container constructor
 (`Structures/Span.h:158`) makes `f(g())` a compile error whenever `g` returns
 a `Vector`, which is deliberate and costs a named local at every such call —
 `readWavBytes(readWholeFile(path), name)` inside `Audio/WavFile.cpp` and
-`transcribe(readWavFile(...))` in `Tests/Embedded` are two more of them, and
+`transcribe(readWavFile(...))` in `Tests/Bundled` are two more of them, and
 each reads as a temporary that had to be given a name for no reason a call
 site can see.
