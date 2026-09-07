@@ -17,11 +17,19 @@ whisper_enable_unity_build(whisper-model)
 whisper_add_ide_sources(whisper-model)
 
 # The model is a download, never a commit — 151 MB of weights has no business
-# in git. Off by default so an ordinary build stays cheap; on, CPM fetches the
-# three files this module reads and the directory they are assembled into
-# reaches Tests/Model as a compile definition.
+# in git. This switch is off by default so a build that only wants the fetched
+# files on disk asks for them; on, CPM fetches the four files this module reads
+# and the directory they are assembled into reaches Tests/Model as a compile
+# definition.
 option(WHISPER_EACP_FETCH_MODEL
         "Download the HuggingFace openai/whisper-tiny.en model files" OFF)
+
+# Embedding needs the same four files, so it turns the fetch on below rather
+# than duplicating it — which is why a default configure downloads them even
+# though the switch above is off.
+option(WHISPER_EACP_EMBED_MODEL
+        "Embed the whisper-tiny.en model files into the binaries that link \
+whisper-embedded-model" ON)
 
 # Set even when the fetch is off, so Tests/Model always compiles against a real
 # path and the tests that need a file skip on its absence rather than on an
@@ -45,8 +53,8 @@ function(whisper_fetch_model_file package_name file_name file_hash)
             DOWNLOAD_NO_EXTRACT YES
             DOWNLOAD_ONLY YES)
 
-    # CPM leaves the three downloads in three separate _deps directories, so
-    # link them into one so a caller names a model directory rather than three
+    # CPM leaves the four downloads in four separate _deps directories, so
+    # link them into one so a caller names a model directory rather than four
     # unrelated paths. COPY_ON_ERROR covers a Windows account without the
     # privilege to make a symlink.
     file(CREATE_LINK
@@ -55,7 +63,7 @@ function(whisper_fetch_model_file package_name file_name file_hash)
             COPY_ON_ERROR SYMBOLIC)
 endfunction()
 
-if (WHISPER_EACP_FETCH_MODEL)
+if (WHISPER_EACP_FETCH_MODEL OR WHISPER_EACP_EMBED_MODEL)
     file(MAKE_DIRECTORY "${WHISPER_EACP_MODEL_DIR}")
 
     whisper_fetch_model_file(whisper-tiny-en-config config.json
@@ -75,41 +83,34 @@ if (WHISPER_EACP_FETCH_MODEL)
             5eb60cec1e77aeeb6869a2bb5a8e01a84c3fe5d072d75369343021fe6f5310d0)
 endif ()
 
-# The sample the end-to-end test transcribes, fetched the same way and behind
-# the same switch — the model and a recording to run it on are one decision, and
-# a test that needed the whisper.cpp oracle just to find a WAV would make the
-# cheapest tier of the suite depend on the most expensive one.
+# The same four files again, as bytes inside whatever links this — which is why
+# it lives here rather than beside Whisper::loadEmbedded that reads them: this
+# target is about the fetch above, and nothing but the file list connects the
+# two.
 #
-# Its own directory rather than the model's, and the reason is what
-# WHISPER_MODEL_DIR is for: that variable points at a HuggingFace repo, whether
-# fetched here or a checkout somebody already has, and jfk.wav is not in one. A
-# sample dropped in beside the four files would be missing from every such
-# checkout and present only in ours.
-set(WHISPER_EACP_SAMPLE_DIR "${CMAKE_BINARY_DIR}/whisper-samples"
-        CACHE INTERNAL "Where the fetched audio samples are assembled")
+# The name is load-bearing twice over. ResEmbed keys a resource by its basename,
+# so the keys are exactly the HF file names loadEmbedded() looks up; and
+# Whisper.cpp's error message tells the caller to link `whisper-embedded-model`.
+#
+# INTERFACE when the option is off rather than no target at all, so a consumer
+# links it unconditionally and Whisper::hasEmbeddedModel() is what answers —
+# the same shape as a test skipping on a missing file rather than on an #ifdef.
+if (WHISPER_EACP_EMBED_MODEL)
+    add_library(whisper-embedded-model STATIC)
 
-function(whisper_fetch_sample_file package_name url file_name file_hash)
-    CPMAddPackage(
-            NAME ${package_name}
-            URL ${url}
-            URL_HASH SHA256=${file_hash}
-            DOWNLOAD_NO_EXTRACT YES
-            DOWNLOAD_ONLY YES)
+    find_package(ResEmbed REQUIRED)
+    res_embed_add(whisper-embedded-model
+            FILES
+            "${WHISPER_EACP_MODEL_DIR}/config.json"
+            "${WHISPER_EACP_MODEL_DIR}/preprocessor_config.json"
+            "${WHISPER_EACP_MODEL_DIR}/model.safetensors"
+            "${WHISPER_EACP_MODEL_DIR}/tokenizer.json"
+            NAMESPACE WhisperModel
+            CATEGORY WhisperModel)
 
-    file(CREATE_LINK
-            "${${package_name}_SOURCE_DIR}/${file_name}"
-            "${WHISPER_EACP_SAMPLE_DIR}/${file_name}"
-            COPY_ON_ERROR SYMBOLIC)
-endfunction()
-
-if (WHISPER_EACP_FETCH_MODEL)
-    file(MAKE_DIRECTORY "${WHISPER_EACP_SAMPLE_DIR}")
-
-    # 11 seconds of Kennedy's inaugural at 16 kHz mono PCM16, from whisper.cpp's
-    # own samples directory at the tag Tests/Oracle builds. Pinned to a tag
-    # rather than to a branch so the bytes the hash covers cannot move.
-    whisper_fetch_sample_file(whisper-sample-jfk
-            https://github.com/ggerganov/whisper.cpp/raw/v1.9.3/samples/jfk.wav
-            jfk.wav
-            59dfb9a4acb36fe2a2affc14bacbee2920ff435cb13cc314a08c13f66ba7860e)
+    # No warnings level, no LTO, no unity batch: this target is data. ResEmbed
+    # emits the weights as a 657 MB decimal brace initializer, and nothing an
+    # optimiser or a jumbo TU does to that is worth the compile.
+else ()
+    add_library(whisper-embedded-model INTERFACE)
 endif ()

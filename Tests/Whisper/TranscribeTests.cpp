@@ -24,36 +24,10 @@ using namespace eacp::GPU;
 
 namespace
 {
-constexpr auto jfkSample = "jfk.wav";
-
-// What openai/whisper-tiny.en produces for jfk.wav, greedily, with
-// <|notimestamps|> and HF's two suppression lists — measured, then pinned.
-//
-// Two things about it are worth naming, because the obvious expectation is
-// wrong on both. There is **no comma after "Americans"** — the larger models put
-// one there and tiny.en does not — and there **is** one after "for you". And the
-// transcript opens with a space, since a Whisper transcript is a byte-level BPE
-// sequence whose first piece carries the word boundary; the trim below is what
-// makes this literal readable, and the leading space is asserted separately.
-constexpr auto jfkTranscript =
-    "And so my fellow Americans ask not what your country can do for you, "
-    "ask what you can do for your country.";
-
-constexpr auto jfkTokenCount = 24;
-
 bool canRun()
 {
     return Device::shared().isValid() && hasWhisperModel()
            && hasSampleFile(jfkSample);
-}
-
-std::string trimmed(const std::string& text)
-{
-    const auto first = text.find_first_not_of(" \t\n");
-    const auto last = text.find_last_not_of(" \t\n");
-
-    return first == std::string::npos ? std::string {}
-                                      : text.substr(first, last - first + 1);
 }
 
 // One prepared runtime for the whole module: loading maps 151 MB and preparing
@@ -212,6 +186,32 @@ auto tMaximumTokensStopsTheLoop = test("Whisper/maximumTokensStopsTheLoop") = []
 
     for (auto index = 0; index < clipped.size(); ++index)
         check(clipped[index] == whole[index]);
+};
+
+// The same recording through a runtime loaded from bytes rather than from a
+// directory. Every tensor it reads comes out of a borrowed view of a buffer the
+// test holds, so this is what says the weights reach the device intact that way
+// — which comparing what load() computed cannot, since none of that touches the
+// blob.
+auto tMemoryLoadedModelTranscribesTheSame =
+    test("Whisper/memoryLoadedModelTranscribesTheSame") = []
+{
+    if (!canRun())
+        return;
+
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto expected = preparedModel().transcribe(samples);
+
+    auto whisper = Whisper {};
+    whisper.load(modelFileBytes().files());
+    whisper.prepare();
+
+    const auto tokens = whisper.transcribe(samples);
+
+    check(tokens.size() == expected.size());
+
+    for (auto index = 0; index < tokens.size() && index < expected.size(); ++index)
+        check(tokens[index] == expected[index]);
 };
 
 // More than a window is refused rather than truncated: which thirty seconds of a

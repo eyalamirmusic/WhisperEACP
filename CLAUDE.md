@@ -49,6 +49,20 @@ ctest --test-dir build --output-on-failure
 - `WHISPER_EACP_CI_BUILD` (default `OFF`): turns on the unity builds CI uses,
   here and in eacp, MakeASound and Miro.
 
+- `WHISPER_EACP_FETCH_MODEL` (default `OFF`) / `WHISPER_EACP_EMBED_MODEL`
+  (default `ON`): the four `tiny.en` files on disk, and the same four inside
+  every binary that links `whisper-embedded-model`. Embedding needs the files,
+  so the fetch runs when **either** is on — which means a default configure
+  downloads 151 MB even though the fetch switch itself is off.
+
+  Embedding is not free. ResEmbed emits bytes as a decimal brace initializer,
+  so `model.safetensors` becomes a 657 MB `.c` that takes 42 s and a **16 GiB
+  peak RSS** to compile here, and puts 151 MB into `Transcribe` and
+  `EmbeddedTests`. A machine short of memory, or a build that only wants the
+  library, configures with `-DWHISPER_EACP_EMBED_MODEL=OFF`; the target is
+  still there as an empty `INTERFACE` library, and `Whisper::hasEmbeddedModel()`
+  answers `false` at runtime.
+
 ### Dependencies are fetched, not taken from the machine
 
 eacp comes from CPM at **`develop`**, MakeASound and NanoTest at `main`. That is
@@ -126,8 +140,14 @@ log10 and Whisper's clamp-and-scale.
 **Model/** — safetensors and the two config files. **Tokenizer/** — byte-level
 BPE and Whisper's special tokens.
 
-The encoder and decoder are not written yet. `plan.md` carries the order they
-come in, and the gaps this has surfaced in eacp and Miro.
+**Encoder/** and **Decoder/** — HF's two halves out of those kernels, the second
+over a KV cache. **Whisper/** — the whole runtime, and the greedy search the
+decoder leaves to a layer that can hold the generation config.
+
+The pipeline runs end to end: 30 seconds of audio in, a string out, checked
+against a double-precision reference at every layer and against whisper.cpp at
+the mel, the logits and the transcript. `plan.md` carries what came in which
+order, and the gaps this surfaced in eacp, Miro and ResEmbed.
 
 ### Model format
 
@@ -183,6 +203,54 @@ CPMAddPackage(
 Pin `URL_HASH` on each once the model choice settles.
 
 Do not use `CPM_SOURCE_CACHE`.
+
+The fetch runs behind `WHISPER_EACP_FETCH_MODEL OR WHISPER_EACP_EMBED_MODEL`,
+and the second of those is on by default, so an ordinary configure downloads
+the four files whether or not it asked for them by name. `WHISPER_EACP_MODEL_DIR`
+points at the directory they are linked into either way, so a test compiles
+against a real path and skips on a file's absence rather than on an `#ifdef`.
+
+### Embedding the model
+
+`whisper-embedded-model`, defined in `Model/CMakeLists.txt` beside the fetch,
+runs the same four files through ResEmbed under category `WhisperModel`. ResEmbed
+keys a resource by its basename, which is exactly the HF file name
+`Whisper::loadEmbedded()` looks up, so the fetched names are the runtime keys.
+The target is `STATIC` when the option is on and `INTERFACE` when it is off, so
+a consumer links it unconditionally.
+
+It gets neither `whisper_set_default_target_setting` nor
+`whisper_enable_unity_build`: it is data, and neither LTO nor a jumbo TU has
+anything to do to a 657 MB brace initializer.
+
+`SafeTensors::fromView` is what makes an embedded model cost nothing at
+runtime — the 151 MB the binary already carries is borrowed, never copied to
+the heap.
+
+### The sample
+
+`Samples/jfk.wav` **is** committed — 352 kB, unlike the model. 11 seconds of
+President Kennedy's inaugural address, 20 January 1961, 16 kHz mono PCM16,
+byte-identical to whisper.cpp v1.9.3's `samples/jfk.wav`, which is OpenAI
+whisper's own `tests/jfk.flac`. A US government work held by the JFK Library
+and in the public domain.
+
+`WHISPER_EACP_SAMPLE_DIR` (set in the root `CMakeLists.txt`) points at it. It
+stays separate from `WHISPER_EACP_MODEL_DIR` because that one may point at a
+HuggingFace checkout somebody already has, and jfk.wav is not in one.
+
+### `Apps/Console/Transcribe`
+
+Three forms, and the app says which one it took before printing the transcript:
+
+```bash
+./build/Apps/Console/Transcribe/Transcribe                          # built-in model, built-in sample
+./build/Apps/Console/Transcribe/Transcribe recording.wav            # built-in model
+./build/Apps/Console/Transcribe/Transcribe path/to/model recording.wav
+```
+
+A form that needs the embedded model in a build with none prints how to get one
+and returns 2.
 
 ## Correctness validation
 

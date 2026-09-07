@@ -278,6 +278,7 @@ SafeTensors SafeTensors::fromFile(const std::filesystem::path& path)
     try
     {
         auto file = SafeTensors {};
+        file.source = ByteSource::Mapped;
         file.mappedFile.emplace(eacp::FilePath {path});
 
         if (!file.mappedFile->isValid())
@@ -296,7 +297,18 @@ SafeTensors SafeTensors::fromFile(const std::filesystem::path& path)
 SafeTensors SafeTensors::fromBytes(Vector<std::uint8_t> fileBytes)
 {
     auto file = SafeTensors {};
+    file.source = ByteSource::Owned;
     file.ownedBytes = std::move(fileBytes);
+    file.readHeader();
+
+    return file;
+}
+
+SafeTensors SafeTensors::fromView(Span<const std::uint8_t> bytes)
+{
+    auto file = SafeTensors {};
+    file.source = ByteSource::Borrowed;
+    file.borrowedBytes = bytes;
     file.readHeader();
 
     return file;
@@ -304,8 +316,11 @@ SafeTensors SafeTensors::fromBytes(Vector<std::uint8_t> fileBytes)
 
 Span<const std::uint8_t> SafeTensors::fileBytes() const
 {
-    if (mappedFile.has_value())
+    if (source == ByteSource::Mapped)
         return mappedFile->bytes();
+
+    if (source == ByteSource::Borrowed)
+        return borrowedBytes;
 
     return ownedBytes;
 }

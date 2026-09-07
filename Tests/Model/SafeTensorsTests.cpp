@@ -4,6 +4,8 @@
 
 #include <cmath>
 #include <cstdint>
+#include <optional>
+#include <utility>
 
 using namespace nano;
 using namespace WSP;
@@ -18,6 +20,13 @@ Vector<std::uint8_t> singleTensorFile()
 {
     return assemble(singleTensorHeader,
                     toBytes<float>({1.0f, 2.0f, 3.0f, 4.0f, 5.0f, 6.0f}));
+}
+
+// Where the blob begins in that file: the eight-byte length prefix, then the
+// header the prefix counts.
+int singleTensorBlobStart()
+{
+    return 8 + static_cast<int>(singleTensorHeader.size());
 }
 
 // One tensor of each width the loader treats differently, plus metadata, so the
@@ -416,6 +425,85 @@ auto tMappedFileRejectsABadHeader =
         ScratchFile {"whisper-bad-header.safetensors", assemble("{not json")};
 
     check(throwsModelError([&] { return SafeTensors::fromFile(scratch.path()); }));
+};
+
+// fromView is the third construction, and the only one where the bytes belong
+// to the caller: the same buffer read through it has to give the same tensors,
+// byte range for byte range, as the copy fromBytes takes ownership of.
+auto tViewMatchesOwnedBytes = test("Model/SafeTensors/viewMatchesOwnedBytes") = []
+{
+    const auto bytes = mixedTensorFile();
+
+    const auto borrowed = SafeTensors::fromView(bytes);
+    const auto owned = SafeTensors::fromBytes(bytes);
+
+    check(borrowed.names() == owned.names());
+    check(borrowed.metadata() == owned.metadata());
+
+    for (const auto& tensor: owned.tensors())
+    {
+        const auto& same = borrowed.info(tensor.name);
+
+        check(same.type == tensor.type);
+        check(same.shape == tensor.shape);
+        check(same.blobOffset == tensor.blobOffset);
+        check(same.byteCount == tensor.byteCount);
+        check(borrowed.rawBytes(same) == owned.rawBytes(tensor));
+        check(borrowed.readFloats(tensor.name) == owned.readFloats(tensor.name));
+    }
+
+    // Borrowed rather than copied, which is the whole point: what comes back out
+    // is a view into the caller's own buffer.
+    const auto* blob = borrowed.rawBytes("bias").data();
+
+    check(blob >= bytes.data() && blob < bytes.data() + bytes.size());
+    check(owned.rawBytes("bias").data() != blob);
+};
+
+// Whisper::load builds one of these and emplaces it into an optional, so a
+// borrowed view that only reads correctly before the move would be a loader that
+// works here and not in the runtime.
+auto tViewSurvivesAMove = test("Model/SafeTensors/viewSurvivesAMove") = []
+{
+    const auto bytes = singleTensorFile();
+
+    auto held = std::optional<SafeTensors> {};
+    held.emplace(SafeTensors::fromView(bytes));
+
+    check(held->tensors().size() == 1);
+    check(nearlyEqual(held->readFloats("weight")[5], 6.0f));
+
+    const auto moved = std::move(*held);
+
+    check(moved.rawBytes("weight").size() == 24);
+    check(moved.rawBytes("weight").data() == bytes.data() + singleTensorBlobStart());
+    check(nearlyEqual(moved.readFloats("weight")[0], 1.0f));
+};
+
+// Every construction runs through the same readHeader, so nothing a file can be
+// wrong about is checked in one of the three and not the others.
+auto tViewValidatesLikeTheRest =
+    test("Model/SafeTensors/viewValidatesLikeTheRest") = []
+{
+    auto truncated = Vector<std::uint8_t> {};
+    truncated.resize(7);
+
+    check(throwsModelError([&] { return SafeTensors::fromView(truncated); }));
+
+    const auto header = std::string {R"({})"};
+    const auto pastTheEnd = assembleWithLength(header.size() + 1, header, {});
+
+    check(throwsModelError([&] { return SafeTensors::fromView(pastTheEnd); }));
+
+    const auto notJson = assemble("{not json");
+
+    check(throwsModelError([&] { return SafeTensors::fromView(notJson); }));
+
+    const auto pastTheBlob =
+        assemble(R"({"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}})",
+                 toBytes<float>({1.0f, 2.0f}));
+
+    check(throwsModelError([&] { return SafeTensors::fromView(pastTheBlob); }));
 };
 
 namespace

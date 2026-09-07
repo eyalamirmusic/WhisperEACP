@@ -268,6 +268,52 @@ reversed, quieted and padded all come out word for word the same. A pure 440 Hz
 tone is the one that shows it, answering end-of-text at once and producing an
 empty transcript, so that is the test.
 
+## Embedding the model
+
+`WHISPER_EACP_EMBED_MODEL` (default **on**) runs the four fetched files through
+ResEmbed into `whisper-embedded-model`, under category `WhisperModel` and keyed
+by their HF basenames, which are the names `loadEmbedded()` asks for. Embedding
+needs the files, so the fetch condition is `WHISPER_EACP_FETCH_MODEL OR
+WHISPER_EACP_EMBED_MODEL` — a default configure downloads 151 MB. Off, the
+target is still there as an empty `INTERFACE` library, so a consumer links it
+unconditionally and `Whisper::hasEmbeddedModel()` is what answers, the same
+shape as a test skipping on a missing file rather than on an `#ifdef`.
+
+The API under it:
+
+- `SafeTensors` now has three constructions — mapped, owned, and **borrowed**
+  (`fromView`). The borrowed one is what makes an embedded model free: the
+  151 MB the binary already carries is read where it lies, never copied to the
+  heap.
+- `Whisper` has a second `load`, over a `ModelFiles` of four byte spans, plus
+  `loadEmbedded()` and `hasEmbeddedModel()`. Both loads run the same four
+  parses in the same order, so a set of bytes missing what a directory would
+  have been missing fails with the same message.
+- `Audio/` decodes a WAV from a span — `readWavBytes(bytes, name)`, with
+  `readWavFile` written on top of it — so an embedded recording and a file on
+  disk report a refused sample rate identically.
+- `whisper-runtime` links ResEmbed **PRIVATE**, through eacp's own find module.
+  There is deliberately no `FindResEmbed.cmake` here: `CMAKE_MODULE_PATH` is
+  inherited by every subdirectory and ours is appended first, so a module of
+  that name would shadow eacp's.
+
+The sample moved the other way. `Samples/jfk.wav` is committed — 352 kB, and
+the only recording the suite needs — so `whisper_fetch_sample_file` and the
+`whisper-sample-jfk` package are gone and `WHISPER_EACP_SAMPLE_DIR` is set in
+the root `CMakeLists.txt`. It stays separate from the model directory for the
+reason it always was: `WHISPER_MODEL_DIR` may point at a HuggingFace checkout,
+and jfk.wav is not in one.
+
+`Apps/Console/Transcribe` takes three forms — no arguments (embedded model,
+embedded sample), one (embedded model, your WAV), two (a HF directory and your
+WAV) — and names the model and the audio it chose before the transcript, so a
+run says which form it took. `Tests/Embedded` asserts that
+`hasEmbeddedModel()` equals the build flag (the one test here that never skips:
+it is what catches ResEmbed's static-initializer registration being
+dead-stripped, which would otherwise turn every other test in the file into a
+silent skip), that each embedded view is byte-identical to the fetched file,
+and that a runtime loaded out of the binary produces the pinned transcript.
+
 ## Validation, in the order a failure is diagnosed
 
 1. **A scalar CPU reference inside the test itself**, for every kernel. No
@@ -341,7 +387,7 @@ over a `std::regex` whose `[[:alpha:]]` is ASCII where GPT-2's pattern is
 `\p{L}`. Both segmentations decode back to the input, which is what the test
 asserts unconditionally; exact agreement is measured and printed.
 
-## Gaps found in eacp and Miro
+## Gaps found in eacp, Miro and ResEmbed
 
 The second goal, in CLAUDE.md's terms: writing a real net against eacp's compute
 layer is what surfaces what that layer is missing, and a gap belongs there
@@ -469,6 +515,18 @@ integer reads go through `asInteger()` instead of a 2^53 range check on a double
 `Tokenizer/Unicode.cpp` is a thin three-class view over `Miro::Unicode` instead of a
 private 1585-entry table.
 
+### ResEmbed
+
+Embedding the model is the first thing here to hand ResEmbed (eacp fetches it;
+`0ea662c`) a resource that is not a font or an icon, and 151 MB is where its
+choices start to show. All three belong upstream; none is worked around here.
+
+| finding | where, and what it means |
+| --- | --- |
+| bytes are emitted as a decimal brace initializer | `Generator/ResourceGenerator.cpp:83`, `generateDataFile` — `out << static_cast<unsigned int>(data[i])` with a comma between, 16 per line. `model.safetensors` at 151,041,024 bytes becomes a **656,571,546-byte `.c`**, which clang compiles in **41.6 s** at a **16.2 GiB peak RSS**, for a 151 MB `.o`. That is 4.3 bytes of source per byte of data and roughly 115 bytes of compiler memory per byte of data, and it is the whole cost of the option. A string literal with hex escapes would cost about the same source and far less memory; `.incbin` on the assemblers that have it, or C23 `#embed`, would cost neither. The README already argues the C front end over C++ for exactly this reason, so the direction is agreed and only the encoding is the gap |
+| `ResEmbed::get` default-inserts on a miss | `Lib/ResEmbed/ResEmbed.cpp:72` is `Detail::getMap()[category][name]` — `std::map::operator[]`, so a lookup that finds nothing *writes* an empty `DataView` and, if the category is new, a whole `ResourceMap` under it. `Whisper::hasEmbeddedModel()` on a binary that embeds nothing therefore grows the registry by a category and four entries, under the mutex, every time it is asked. It answers correctly — an inserted `DataView` is empty and `operator bool` is `!empty()` — so nothing here is wrong, but a query is not a mutation. A `find`-based lookup, or a `contains(name, category)` beside `get`, is the API this wanted. `getCategory` (`:78`) is the same call |
+| `DataView` has no `std::span` accessor | `Lib/ResEmbed/ResEmbed.h:36` stores a `View`, which is `std::span<const unsigned char>` (`Common.h:8`), and exposes it only as `data()` (`:22`) plus `size()`/`getSize()` (`:29`, `:30`). So converting one to `Span<const std::uint8_t>` reassembles the pointer and the length the object is already holding, and leans on `std::uint8_t` being `unsigned char` — true everywhere this builds, and not something the type says. A `view()` returning the member would make the conversion exact rather than merely correct |
+
 ### Checked and discarded
 
 `eacp::MemoryMappedFile` **does** exist — commit `3081829`, compiled into
@@ -508,4 +566,8 @@ filterbank upload take no `Device` and use the shared one, so
 `Whisper::prepare(device)` compiles on the given device and uploads on the
 shared one; and `EA::Span`'s deleted rvalue-container constructor
 (`Structures/Span.h:158`) makes `f(g())` a compile error whenever `g` returns
-a `Vector`, which is deliberate and costs a named local at every such call.
+a `Vector`, which is deliberate and costs a named local at every such call —
+`readWavBytes(readWholeFile(path), name)` inside `Audio/WavFile.cpp` and
+`transcribe(readWavFile(...))` in `Tests/Embedded` are two more of them, and
+each reads as a temporary that had to be given a name for no reason a call
+site can see.

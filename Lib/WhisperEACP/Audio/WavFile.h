@@ -2,8 +2,10 @@
 
 #include <WhisperEACP/Core/Core.h>
 
+#include <cstdint>
 #include <filesystem>
 #include <stdexcept>
+#include <string_view>
 
 namespace WSP
 {
@@ -44,4 +46,14 @@ public:
 // carries a LIST/INFO between `fmt ` and `data`, so a reader that took the
 // third chunk to be the samples would read metadata as audio.
 Vector<float> readWavFile(const std::filesystem::path& path);
+
+// The same decode over bytes already in memory — a recording embedded in the
+// binary, or one a caller holds for its own reasons — which is what readWavFile
+// is written on top of.
+//
+// `name` is what a WavError calls the source: the path for a file, the resource
+// name for an embedded one. Every message is otherwise the same, so a refused
+// sample rate reads the same whether the bytes came off a disk or out of the
+// binary.
+Vector<float> readWavBytes(Span<const std::uint8_t> bytes, std::string_view name);
 } // namespace WSP

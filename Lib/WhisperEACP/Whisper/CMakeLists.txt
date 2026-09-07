@@ -15,6 +15,13 @@ target_link_libraries(whisper-runtime PUBLIC
         whisper-model
         whisper-tokenizer)
 
+# ResEmbed comes from eacp, which fetches it and whose CMake/ carries the find
+# module — reachable here because CMake/Findeacp.cmake re-appends that directory
+# to CMAKE_MODULE_PATH. PRIVATE, because loadEmbedded() looks the four files up
+# inside the .cpp and no header of ours mentions ResEmbed.
+find_package(ResEmbed REQUIRED)
+target_link_libraries(whisper-runtime PRIVATE ResEmbed)
+
 target_sources(whisper-runtime PRIVATE
         Whisper.cpp)
 

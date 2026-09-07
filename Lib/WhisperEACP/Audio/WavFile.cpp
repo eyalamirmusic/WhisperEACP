@@ -32,22 +32,23 @@ struct WaveFormat
     int bitsPerSample = 0;
 };
 
-[[noreturn]] void fail(const std::filesystem::path& path, std::string_view what)
+[[noreturn]] void fail(std::string_view name, std::string_view what)
 {
-    throw WavError {path.string() + ": " + std::string {what}};
+    throw WavError {std::string {name} + ": " + std::string {what}};
 }
 
 Vector<std::uint8_t> readWholeFile(const std::filesystem::path& path)
 {
+    const auto name = path.string();
     auto file = std::ifstream {path, std::ios::binary | std::ios::ate};
 
     if (!file)
-        fail(path, "cannot be opened");
+        fail(name, "cannot be opened");
 
     const auto byteCount = file.tellg();
 
     if (byteCount < 0)
-        fail(path, "cannot be sized");
+        fail(name, "cannot be sized");
 
     auto bytes = Vector<std::uint8_t> {};
     bytes.resize((int) byteCount);
@@ -56,12 +57,12 @@ Vector<std::uint8_t> readWholeFile(const std::filesystem::path& path)
     file.read(reinterpret_cast<char*>(bytes.data()), (std::streamsize) byteCount);
 
     if (!file)
-        fail(path, "ended before the size it reported");
+        fail(name, "ended before the size it reported");
 
     return bytes;
 }
 
-std::string_view textAt(const Vector<std::uint8_t>& bytes, int offset, int length)
+std::string_view textAt(Span<const std::uint8_t> bytes, int offset, int length)
 {
     return {reinterpret_cast<const char*>(bytes.data()) + offset,
             (std::size_t) length};
@@ -70,8 +71,7 @@ std::string_view textAt(const Vector<std::uint8_t>& bytes, int offset, int lengt
 // Little-endian throughout, read a byte at a time rather than by memcpy into a
 // wider type: RIFF is defined little-endian and this way says so on a big
 // endian host as well.
-std::uint32_t
-    littleEndianAt(const Vector<std::uint8_t>& bytes, int offset, int width)
+std::uint32_t littleEndianAt(Span<const std::uint8_t> bytes, int offset, int width)
 {
     auto value = std::uint32_t {};
 
@@ -81,18 +81,18 @@ std::uint32_t
     return value;
 }
 
-int intAt(const Vector<std::uint8_t>& bytes, int offset, int width)
+int intAt(Span<const std::uint8_t> bytes, int offset, int width)
 {
     return (int) littleEndianAt(bytes, offset, width);
 }
 
-WaveFormat readFormatChunk(const std::filesystem::path& path,
-                           const Vector<std::uint8_t>& bytes,
+WaveFormat readFormatChunk(std::string_view name,
+                           Span<const std::uint8_t> bytes,
                            int offset,
                            int length)
 {
     if (length < formatChunkBytes)
-        fail(path, "has a fmt chunk shorter than the 16 bytes it must hold");
+        fail(name, "has a fmt chunk shorter than the 16 bytes it must hold");
 
     auto format = WaveFormat {};
     format.encoding = intAt(bytes, offset, 2);
@@ -103,7 +103,7 @@ WaveFormat readFormatChunk(const std::filesystem::path& path,
     if (format.encoding == extensibleFormat)
     {
         if (length < extensibleSubFormatOffset + 2)
-            fail(path, "declares WAVE_FORMAT_EXTENSIBLE with no SubFormat");
+            fail(name, "declares WAVE_FORMAT_EXTENSIBLE with no SubFormat");
 
         format.encoding = intAt(bytes, offset + extensibleSubFormatOffset, 2);
     }
@@ -111,13 +111,13 @@ WaveFormat readFormatChunk(const std::filesystem::path& path,
     return format;
 }
 
-void requireSupported(const std::filesystem::path& path, const WaveFormat& format)
+void requireSupported(std::string_view name, const WaveFormat& format)
 {
     if (format.channels <= 0)
-        fail(path, "declares no channels");
+        fail(name, "declares no channels");
 
     if (format.sampleRate != sampleRate)
-        fail(path,
+        fail(name,
              "is at " + std::to_string(format.sampleRate)
                  + " Hz, and this reader does not resample: Whisper's front-end "
                    "is written against "
@@ -128,7 +128,7 @@ void requireSupported(const std::filesystem::path& path, const WaveFormat& forma
         format.encoding == floatFormat && format.bitsPerSample == 32;
 
     if (!isPcm16 && !isFloat32)
-        fail(path,
+        fail(name,
              "holds encoding " + std::to_string(format.encoding) + " at "
                  + std::to_string(format.bitsPerSample)
                  + " bits, and this reader decodes only 16-bit PCM and 32-bit "
@@ -137,13 +137,13 @@ void requireSupported(const std::filesystem::path& path, const WaveFormat& forma
 
 // 32768 rather than 32767, so that the mapping is the exact power of two every
 // other implementation uses and -32768 lands on -1 rather than just past it.
-float pcm16Sample(const Vector<std::uint8_t>& bytes, int offset)
+float pcm16Sample(Span<const std::uint8_t> bytes, int offset)
 {
     const auto raw = (std::int16_t) littleEndianAt(bytes, offset, 2);
     return (float) raw / 32768.0f;
 }
 
-float floatSample(const Vector<std::uint8_t>& bytes, int offset)
+float floatSample(Span<const std::uint8_t> bytes, int offset)
 {
     const auto raw = littleEndianAt(bytes, offset, 4);
 
@@ -153,7 +153,7 @@ float floatSample(const Vector<std::uint8_t>& bytes, int offset)
     return value;
 }
 
-Vector<float> firstChannelOf(const Vector<std::uint8_t>& bytes,
+Vector<float> firstChannelOf(Span<const std::uint8_t> bytes,
                              int offset,
                              int length,
                              const WaveFormat& format)
@@ -177,13 +177,21 @@ Vector<float> firstChannelOf(const Vector<std::uint8_t>& bytes,
 }
 } // namespace
 
+// The bytes land in a named buffer rather than going straight into the call,
+// because EA::Span deletes its constructor from an rvalue container: a view over
+// a temporary would outlive what it views, so the library refuses to build one
+// at all.
 Vector<float> readWavFile(const std::filesystem::path& path)
 {
     const auto bytes = readWholeFile(path);
+    return readWavBytes(bytes, path.string());
+}
 
+Vector<float> readWavBytes(Span<const std::uint8_t> bytes, std::string_view name)
+{
     if (bytes.size() < riffHeaderBytes || textAt(bytes, 0, 4) != "RIFF"
         || textAt(bytes, 8, 4) != "WAVE")
-        fail(path, "is not a RIFF/WAVE file");
+        fail(name, "is not a RIFF/WAVE file");
 
     auto format = WaveFormat {};
     auto sawFormat = false;
@@ -198,27 +206,27 @@ Vector<float> readWavFile(const std::filesystem::path& path)
         const auto body = at + chunkHeaderBytes;
 
         if (declared > (std::uint32_t) (bytes.size() - body))
-            fail(path, "has a chunk running past the end of the file");
+            fail(name, "has a chunk running past the end of the file");
 
         const auto length = (int) declared;
 
         if (id == "fmt ")
         {
-            format = readFormatChunk(path, bytes, body, length);
+            format = readFormatChunk(name, bytes, body, length);
             sawFormat = true;
         }
         else if (id == "data")
         {
             if (!sawFormat)
-                fail(path, "puts its data chunk before its fmt chunk");
+                fail(name, "puts its data chunk before its fmt chunk");
 
-            requireSupported(path, format);
+            requireSupported(name, format);
             return firstChannelOf(bytes, body, length, format);
         }
 
         at = body + length + (length & 1);
     }
 
-    fail(path, "carries no data chunk");
+    fail(name, "carries no data chunk");
 }
 } // namespace WSP

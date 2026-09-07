@@ -45,6 +45,31 @@ int nonZeroCount(Span<const float> mask)
 
     return count;
 }
+
+// ModelConfig has no equality of its own, and giving it one for a test would be
+// putting a comparison in the library that only a test wants. Every field the
+// file carries is here, so a load that read one of them differently is caught.
+bool sameConfig(const ModelConfig& one, const ModelConfig& other)
+{
+    return one.melBins == other.melBins && one.modelWidth == other.modelWidth
+           && one.encoderLayers == other.encoderLayers
+           && one.decoderLayers == other.decoderLayers
+           && one.encoderHeads == other.encoderHeads
+           && one.decoderHeads == other.decoderHeads
+           && one.encoderFeedForwardWidth == other.encoderFeedForwardWidth
+           && one.decoderFeedForwardWidth == other.decoderFeedForwardWidth
+           && one.maxSourcePositions == other.maxSourcePositions
+           && one.maxTargetPositions == other.maxTargetPositions
+           && one.vocabularySize == other.vocabularySize
+           && one.activationFunction == other.activationFunction
+           && one.scaleEmbedding == other.scaleEmbedding
+           && one.beginningOfSequenceToken == other.beginningOfSequenceToken
+           && one.endOfSequenceToken == other.endOfSequenceToken
+           && one.padToken == other.padToken
+           && one.decoderStartToken == other.decoderStartToken
+           && one.suppressedTokens == other.suppressedTokens
+           && one.initiallySuppressedTokens == other.initiallySuppressedTokens;
+}
 } // namespace
 
 // The four files a HuggingFace repo is, checked in the order load() reads them:
@@ -206,6 +231,77 @@ auto tTimestampsAreNotSuppressed = test("Whisper/timestampsAreNotSuppressed") = 
         check(whisper.firstStepMask()[token] == 0.0f);
         check(whisper.laterStepMask()[token] == 0.0f);
     }
+};
+
+// The two loads are one load reached two ways: the directory reads the four
+// files, the other is handed the same bytes, and everything a load computes has
+// to come back identical. Otherwise an embedded model is a second
+// implementation rather than a second source for the same one.
+auto tLoadFromMemoryMatchesTheDirectory =
+    test("Whisper/loadFromMemoryMatchesTheDirectory") = []
+{
+    if (!hasWhisperModel())
+        return;
+
+    auto whisper = Whisper {};
+    whisper.load(modelFileBytes().files());
+
+    const auto& directory = loadedModel();
+
+    check(whisper.isLoaded());
+    check(!whisper.isPrepared());
+    check(sameConfig(whisper.config(), directory.config()));
+    check(whisper.prompt() == directory.prompt());
+    check(whisper.tokenizer().size() == directory.tokenizer().size());
+    check(whisper.maximumTokens() == directory.maximumTokens());
+    check(whisper.firstStepMask() == directory.firstStepMask());
+    check(whisper.laterStepMask() == directory.laterStepMask());
+};
+
+// No test binary embeds a model — 151 MB in an executable is a decision the
+// build makes — so this is the shape every one of them is in: hasEmbeddedModel()
+// says no, and loadEmbedded() names the first file that is missing rather than
+// reporting a model it did find as corrupt.
+auto tEmbeddedModelIsAbsentHere = test("Whisper/embeddedModelIsAbsentHere") = []
+{
+    check(!Whisper::hasEmbeddedModel());
+
+    const auto message = modelErrorFrom(
+        []
+        {
+            auto whisper = Whisper {};
+            whisper.loadEmbedded();
+        });
+
+    check(namesFile(message, "config.json"));
+    check(mentions(message, Whisper::embeddedModelCategory));
+    check(mentions(message, "WHISPER_EACP_EMBED_MODEL"));
+};
+
+// The weights are the one of the four that is not JSON, and bytes that are not a
+// safetensors file have to fail through the borrowed view the way a bad file
+// fails through the mapped one.
+auto tGarbageWeightsAreAModelError =
+    test("Whisper/garbageWeightsAreAModelError") = []
+{
+    if (!hasWhisperModel())
+        return;
+
+    auto garbage = Vector<std::uint8_t> {};
+    garbage.resize(64);
+
+    for (auto index = 0; index < garbage.size(); ++index)
+        garbage[index] = (std::uint8_t) index;
+
+    auto files = modelFileBytes().files();
+    files.weights = garbage;
+
+    check(throwsModelError(
+        [&]
+        {
+            auto whisper = Whisper {};
+            whisper.load(files);
+        }));
 };
 
 // Every call that needs a device or a model says so rather than dereferencing an

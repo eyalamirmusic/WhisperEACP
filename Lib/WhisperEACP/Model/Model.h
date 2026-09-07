@@ -11,6 +11,7 @@
 #include <WhisperEACP/Core/Core.h>
 #include <WhisperEACP/Model/ModelConfig.h>
 #include <WhisperEACP/Model/ModelError.h>
+#include <WhisperEACP/Model/ModelFiles.h>
 #include <WhisperEACP/Model/PreprocessorConfig.h>
 #include <WhisperEACP/Model/SafeTensors.h>
 #include <WhisperEACP/Model/TensorType.h>

@@ -180,6 +180,25 @@ std::string errorFrom(const std::filesystem::path& path)
     return "no failure at all";
 }
 
+std::string errorFromBytes(const std::vector<std::uint8_t>& bytes,
+                           std::string_view name)
+{
+    try
+    {
+        readWavBytes(bytes, name);
+    }
+    catch (const WavError& failure)
+    {
+        return failure.what();
+    }
+    catch (...)
+    {
+        return "a failure that was not a WavError";
+    }
+
+    return "no failure at all";
+}
+
 bool mentions(std::string_view message, std::string_view what)
 {
     return message.find(what) != std::string_view::npos;
@@ -334,4 +353,47 @@ auto tRefusesAFileWithNoData = test("Audio/wavRefusesAFileWithNoData") = []
         "whisper-no-data.wav", WavBuilder {}.format(1, 1, sampleRate, 16).build()};
 
     check(mentions(errorFrom(file.path()), "no data chunk"));
+};
+
+// readWavFile is readWavBytes over the file's bytes, so the two have to agree
+// sample for sample: reading a file is a way of getting to the decode rather
+// than a decode of its own.
+auto tReadsBytesLikeAFile = test("Audio/wavReadsBytesLikeAFile") = []
+{
+    const auto bytes = WavBuilder {}
+                           .format(1, 1, sampleRate, 16)
+                           .listChunk(5)
+                           .pcm16Data({0, 32767, -32768, 16384})
+                           .build();
+
+    const auto file = ScratchWav {"whisper-bytes.wav", bytes};
+
+    const auto fromFile = readWavFile(file.path());
+    const auto fromBytes = readWavBytes(bytes, "whisper-bytes.wav");
+
+    check(fromFile.size() == 4);
+    check(fromBytes.size() == fromFile.size());
+
+    for (auto index = 0; index < fromFile.size(); ++index)
+        check(fromBytes[index] == fromFile[index]);
+};
+
+// What `name` is for: a buffer has no path to put in front of the colon, so the
+// caller says what to call it and every message is otherwise the file's own.
+auto tBytesErrorsNameTheSource = test("Audio/wavBytesErrorsNameTheSource") = []
+{
+    const auto wrongRate =
+        WavBuilder {}.format(1, 1, 44100, 16).pcm16Data({0, 1, 2, 3}).build();
+
+    const auto message = errorFromBytes(wrongRate, "embedded/jfk.wav");
+
+    check(mentions(message, "embedded/jfk.wav"));
+    check(mentions(message, "44100"));
+    check(mentions(message, "resample"));
+
+    const auto nothing = std::vector<std::uint8_t> {};
+    const auto empty = errorFromBytes(nothing, "an-empty-resource");
+
+    check(mentions(empty, "an-empty-resource"));
+    check(mentions(empty, "not a RIFF/WAVE file"));
 };

@@ -58,7 +58,8 @@ struct TensorBuffer
 // resident before the first GPU copy and the pages a load touches arrive from
 // the page cache as it touches them; fromBytes takes a buffer already in
 // memory. Either way the bytes outlive every Span handed out, which is why this
-// is move-only.
+// is move-only. fromView is the third, and the one where that is the caller's
+// promise rather than this object's.
 //
 // Nothing here trusts the header. A file shorter than the length prefix, a
 // header length that runs past the end, JSON that does not parse or is not an
@@ -72,6 +73,16 @@ class SafeTensors
 public:
     static SafeTensors fromFile(const std::filesystem::path& path);
     static SafeTensors fromBytes(Vector<std::uint8_t> fileBytes);
+
+    // Bytes this does not own and does not copy. **The caller guarantees they
+    // outlive this SafeTensors and every Span it hands out** — rawBytes(),
+    // readFloats() and makeBuffer() all read straight out of them.
+    //
+    // For weights that already live as long as the process, which is what a
+    // model embedded in the binary is, and for a buffer the caller keeps. A
+    // buffer the caller is done with belongs in fromBytes instead, which takes
+    // ownership of it and costs nothing extra to do so.
+    static SafeTensors fromView(Span<const std::uint8_t> bytes);
 
     // Sorted by name, since the header is read out of an ordered map.
     const Vector<TensorInfo>& tensors() const;
@@ -104,12 +115,25 @@ public:
     TensorBuffer makeBuffer(std::string_view name) const;
 
 private:
+    // Which of the three constructions the bytes came from. Kept as a state
+    // rather than derived from a cached Span, because two of the three would
+    // have to be a Span into a member of this object and this object is moved:
+    // Whisper::load builds one and emplaces it into an optional.
+    enum class ByteSource
+    {
+        Owned,
+        Mapped,
+        Borrowed
+    };
+
     SafeTensors() = default;
 
     Span<const std::uint8_t> fileBytes() const;
     void readHeader();
 
+    ByteSource source = ByteSource::Owned;
     Vector<std::uint8_t> ownedBytes;
+    Span<const std::uint8_t> borrowedBytes;
     std::optional<eacp::MemoryMappedFile> mappedFile;
     std::uint64_t blobOffset = 0;
     Vector<TensorInfo> entries;

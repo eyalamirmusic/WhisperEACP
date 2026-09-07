@@ -87,6 +87,27 @@ public:
     // prepare()'s half.
     void load(const std::filesystem::path& modelDirectory);
 
+    // The same four files, from bytes already in memory. ModelFiles is a view:
+    // the weights are borrowed rather than copied (SafeTensors::fromView), so
+    // the bytes must outlive this object — every tensor this reads, and every
+    // buffer prepare() uploads, comes out of them.
+    void load(const ModelFiles& files);
+
+    // The model this binary embeds, if it embeds one: the four files looked up
+    // in ResEmbed under embeddedModelCategory by their HF names. A ModelError
+    // names the first file the binary does not carry, since a build that meant
+    // to embed a model and linked the wrong target should not read as a corrupt
+    // one.
+    //
+    // A binary gets one by configuring with -DWHISPER_EACP_EMBED_MODEL=ON and
+    // linking whisper-embedded-model. Nothing here embeds a model on its own:
+    // 151 MB in every executable is a decision the build makes, not the runtime.
+    void loadEmbedded();
+
+    static bool hasEmbeddedModel();
+
+    static constexpr auto embeddedModelCategory = "WhisperModel";
+
     bool isLoaded() const { return weightsFile.has_value(); }
 
     // Compiles every kernel, sizes every intermediate, and uploads the weights,
@@ -169,6 +190,10 @@ private:
 
     void buildPrompt();
     void buildSuppressionMasks();
+
+    // Everything a load computes once the four files are parsed, whichever of
+    // the two loads parsed them.
+    void buildGenerationConfig();
 
     void uploadSamples(Span<const float> samples);
     void uploadTokens(Span<const TokenId> tokens);

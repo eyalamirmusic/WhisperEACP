@@ -69,6 +69,22 @@ set(CMAKE_CXX_STANDARD 20)
 find_package(eacp REQUIRED)
 find_package(MakeASound REQUIRED)
 
+# The recording the end-to-end tests and Transcribe run on: 352 kB of committed
+# audio, unlike the model, which is a download.
+#
+# Its own directory rather than the model's, and the reason is what
+# WHISPER_MODEL_DIR is for: that variable points at a HuggingFace repo, whether
+# fetched by Model/ or a checkout somebody already has, and jfk.wav is not in
+# one. A sample dropped in beside the four files would be missing from every
+# such checkout and present only in ours.
+#
+# 11 seconds of President Kennedy's inaugural address, 20 January 1961, at
+# 16 kHz mono PCM16. Byte-identical to whisper.cpp v1.9.3's samples/jfk.wav,
+# which is OpenAI whisper's own tests/jfk.flac; the recording is a US government
+# work held by the JFK Library and is public domain.
+set(WHISPER_EACP_SAMPLE_DIR "${PROJECT_SOURCE_DIR}/Samples"
+        CACHE INTERNAL "Where the committed audio samples live")
+
 add_subdirectory(Lib)
 
 option(WHISPER_EACP_ENABLE_APPS "Build the WhisperEACP apps"

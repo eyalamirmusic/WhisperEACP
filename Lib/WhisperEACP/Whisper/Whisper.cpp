@@ -1,5 +1,9 @@
 #include "Whisper.h"
 
+#include <WhisperEACP/Model/ModelIO.h>
+
+#include <ResEmbed/ResEmbed.h>
+
 #include <chrono>
 #include <string>
 
@@ -36,6 +40,31 @@ std::filesystem::path requireFile(const std::filesystem::path& directory,
     return path;
 }
 
+ResEmbed::DataView embeddedFile(std::string_view name)
+{
+    return ResEmbed::get(std::string {name}, Whisper::embeddedModelCategory);
+}
+
+Span<const std::uint8_t> bytesOf(const ResEmbed::DataView& file)
+{
+    return {file.data(), file.getSize()};
+}
+
+ResEmbed::DataView requireEmbeddedFile(std::string_view name)
+{
+    auto file = embeddedFile(name);
+
+    if (!file)
+        throw ModelError {"this binary embeds no " + std::string {name}
+                          + " under the "
+                          + std::string {Whisper::embeddedModelCategory}
+                          + " category; a model is embedded by configuring with "
+                            "-DWHISPER_EACP_EMBED_MODEL=ON and linking "
+                            "whisper-embedded-model"};
+
+    return file;
+}
+
 double commitSeconds(CommandBuffer& commands)
 {
     const auto start = std::chrono::steady_clock::now();
@@ -56,6 +85,47 @@ void Whisper::load(const std::filesystem::path& modelDirectory)
     weightsFile.emplace(
         SafeTensors::fromFile(requireFile(modelDirectory, weightsFileName)));
 
+    buildGenerationConfig();
+}
+
+// The same four parses as above, in the same order, so a set of bytes missing
+// what a directory would have been missing fails the same way and says so with
+// the same message.
+void Whisper::load(const ModelFiles& files)
+{
+    modelConfig = ModelConfig::fromJson(ModelIO::textOf(files.config));
+    preprocessor =
+        PreprocessorConfig::fromJson(ModelIO::textOf(files.preprocessorConfig));
+    vocabulary.emplace(Tokenizer::fromJsonText(ModelIO::textOf(files.tokenizer)));
+    weightsFile.emplace(SafeTensors::fromView(files.weights));
+
+    buildGenerationConfig();
+}
+
+// Embedded data is static for the life of the process, so borrowing it is
+// exactly right: nothing is copied, and the 151 MB the binary already carries
+// is never duplicated on the heap to be read once.
+void Whisper::loadEmbedded()
+{
+    const auto config = requireEmbeddedFile(configFile);
+    const auto preprocessorConfig = requireEmbeddedFile(preprocessorFile);
+    const auto tokenizer = requireEmbeddedFile(tokenizerFile);
+    const auto weights = requireEmbeddedFile(weightsFileName);
+
+    load(ModelFiles {bytesOf(config),
+                     bytesOf(preprocessorConfig),
+                     bytesOf(tokenizer),
+                     bytesOf(weights)});
+}
+
+bool Whisper::hasEmbeddedModel()
+{
+    return embeddedFile(configFile) && embeddedFile(preprocessorFile)
+           && embeddedFile(tokenizerFile) && embeddedFile(weightsFileName);
+}
+
+void Whisper::buildGenerationConfig()
+{
     buildPrompt();
     buildSuppressionMasks();
 

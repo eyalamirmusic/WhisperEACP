@@ -1,5 +1,18 @@
 add_executable(Transcribe Main.cpp)
-target_link_libraries(Transcribe PRIVATE WhisperEACP)
+
+# whisper-embedded-model unconditionally: it is an empty INTERFACE target when
+# WHISPER_EACP_EMBED_MODEL is off, and Whisper::hasEmbeddedModel() is what tells
+# the run which of the three argument forms it can serve.
+target_link_libraries(Transcribe PRIVATE WhisperEACP whisper-embedded-model)
+
+# The recording the no-argument run transcribes, embedded so that form needs
+# nothing on disk at all. The ResEmbed runtime key is the file's basename, which
+# is the "jfk.wav" Main.cpp asks for.
+find_package(ResEmbed REQUIRED)
+res_embed_add(Transcribe
+        FILES     "${WHISPER_EACP_SAMPLE_DIR}/jfk.wav"
+        NAMESPACE TranscribeSamples
+        CATEGORY  TranscribeSamples)
 
 set(BUNDLE_ID "com.eacp.whisper.transcribe")
 

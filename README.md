@@ -32,9 +32,12 @@ The other half of the point is upstream: writing a real neural net against
 eacp's compute layer is what surfaces what that layer is still missing, and
 those gaps get closed in eacp rather than worked around here.
 
-The op set, the mel front-end, the weight loader and the tokenizer are in; the
-encoder and decoder are not. `plan.md` carries the order they come in, and the
-gaps this has surfaced in eacp and Miro — the second half of the point.
+The pipeline runs end to end: 30 seconds of audio in, a string out, through the
+mel front-end, the encoder, the decoder's KV-cached loop and the greedy search,
+checked against a double-precision reference at every layer and against
+whisper.cpp at the mel, the logits and the transcript. `plan.md` carries what
+came in which order, and the gaps this surfaced in eacp, Miro and ResEmbed —
+the second half of the point.
 
 ## Layout
 
@@ -46,7 +49,12 @@ gaps this has surfaced in eacp and Miro — the second half of the point.
 | `Lib/WhisperEACP/Mel` | Hann, STFT, the 80 x 201 filterbank, log10 and the scaling |
 | `Lib/WhisperEACP/Model` | safetensors weights, `config.json`, the filterbank |
 | `Lib/WhisperEACP/Tokenizer` | byte-level BPE and Whisper's special tokens |
+| `Lib/WhisperEACP/Encoder` | HF's `WhisperEncoder.forward`, recorded into one command buffer |
+| `Lib/WhisperEACP/Decoder` | The same for the text half, over a KV cache |
+| `Lib/WhisperEACP/Whisper` | The whole runtime — samples in, a transcript out |
 | `Apps/Console/DeviceInfo` | What this machine offers: GPU limits and input devices |
+| `Apps/Console/Transcribe` | A WAV file in, the transcript and what it cost out |
+| `Samples` | `jfk.wav`, the recording the end-to-end tests run on |
 | `Tests` | NanoTest, one executable per module |
 
 Headers are spelled `<WhisperEACP/...>`, beside eacp's own `<eacp/...>`.
@@ -66,6 +74,36 @@ ctest --test-dir build --output-on-failure
 
 macOS and Windows. eacp gates its whole GPU stack behind platforms with a Metal
 or D3D12 backend, so there is no Linux target.
+
+## Transcribing
+
+`Transcribe` embeds the `tiny.en` weights and the sample, so the first form
+needs nothing on disk:
+
+```bash
+./build/Apps/Console/Transcribe/Transcribe
+./build/Apps/Console/Transcribe/Transcribe recording.wav
+./build/Apps/Console/Transcribe/Transcribe path/to/whisper-tiny.en recording.wav
+```
+
+```
+model: built-in whisper-tiny.en
+audio: built-in jfk.wav
+
+ And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
+```
+
+The embedded model is what makes the default configure download 151 MB and the
+build want 16 GiB of RAM for one translation unit: ResEmbed emits the weights as
+a decimal brace initializer, and 151 MB of them is a 657 MB `.c`. Configure with
+`-DWHISPER_EACP_EMBED_MODEL=OFF` to skip all of that; the two-argument form
+above still works, and `Whisper::hasEmbeddedModel()` answers `false`.
+
+`Samples/jfk.wav` is 11 seconds of President Kennedy's inaugural address,
+20 January 1961, at 16 kHz mono PCM16 — byte-identical to whisper.cpp v1.9.3's
+`samples/jfk.wav`, which is OpenAI whisper's own `tests/jfk.flac`. The recording
+is a US government work held by the JFK Library and is
+[public domain](https://archive.org/details/JohnF.KennedyInauguralAddress).
 
 eacp is fetched at `develop`, MakeASound and NanoTest at `main`. The configure
 line above is the whole story — no build here points at a checkout on the
