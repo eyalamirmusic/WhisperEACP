@@ -951,3 +951,135 @@ findings above. In eacp, what the round did not attempt: `simdgroup_matrix`
 and its cousins, which is how ggml reaches the throughput this product cannot
 at 4 to 5 TFLOPS, and a movable `CommandBuffer`, so a pipelined loop's ring
 need not be a row of `std::optional`s.
+
+The third round below took two of those five, left two on the strength of a
+measurement that says they are now worth nothing, and found the largest win of
+the three somewhere the list did not mention.
+
+## The third performance round
+
+This one is on an **Apple M5 Max**, where the two rounds above were on an M4
+Max, so none of their absolute numbers carries over and the first thing this
+round did was re-measure the baseline. The order of what is worth doing changed
+with the machine, which is the round's main lesson.
+
+| | WhisperEACP before | WhisperEACP after | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- | --- |
+| transcribe, median | 0.0213 s | **0.0194 s** | 0.031 s | 0.104 s |
+| x real time, over the 30 s window | 1412 | **1550** | 964 | 288 |
+| encode, median | 0.00627 s | 0.00620 s | 0.005 s | 0.077 s |
+| decode, median, 25 steps | 0.0148 s | **0.0130 s** | 0.0143 s | 0.0147 s |
+| decode per step | 0.593 ms | **0.520 ms** | 0.572 ms | 0.586 ms |
+
+**8.8% off the run, 12.2% off the decode**, the transcript unchanged token for
+token and 269 tests green. The decode is now faster than whisper.cpp's on the
+same GPU rather than 3.5% behind it, and the whole run is 1.6x its.
+
+### How it was measured, which mattered more than usual
+
+The wins here are 0.1 to 1.5 ms on a 20 ms run, and two things had to be fixed
+before any of them could be read.
+
+The table prints three decimals, which cannot resolve 0.1 ms — but the
+`x real time` row is the window over the median at one decimal, so 1552.4 is
+the wall clock to five significant digits. That is the number every comparison
+below was actually read from. (The benchmark's own decimals were widened to
+five while the round ran and put back afterwards; nothing in the tree changed.)
+
+And a sequential A/B is biased: whichever binary runs first pays for a cold
+page cache and a GPU still ramping its clocks. Every comparison here is
+therefore **A B B A** per round, four rounds of 30 timed runs each, so the
+order effect cancels. Warm run-to-run spread within one binary is about
+±0.03%, and the paired difference is what is quoted.
+
+### What changed
+
+| change | what it is | effect |
+| --- | --- | --- |
+| an fp16 copy of `embed_tokens` for the logits projection | the vocabulary projection reads 40 MB a step instead of 80. `SafeTensors::makeExactHalfBuffer` narrows a tensor and keeps the result **only if every value round-trips**, so it is not a numerical trade; `DecoderWeights::LogitsWeight` asks for the copy and gets nothing when the file would lose something | **−1.52 ms**, the whole run's 7.2% |
+| `SingleQueryAttention` at 16 chunks a head | eight chunks over six heads is 48 groups, which does not fill this device. Only the cross attention over 1500 encoder rows still chunks at all | **−0.38 ms** |
+| a one-dispatch self attention for a short cache | a cache that fits in one chunk has no maximum to rescale and no sum to join, so the partial normalises its own row and the combine is not dispatched. A step's self attention is 2 to 26 keys on this recording, so this is every one of them; a sequence that runs past 256 tokens chunks again from there | **−0.09 ms**, 8 of 8 runs under the baseline median |
+
+The first is the round's whole story and it rests on a fact about the model
+rather than on a kernel.
+
+**tiny.en's F32 weights are fp16 values in an F32 container.** OpenAI ships
+Whisper's checkpoints in fp16; HuggingFace's conversion widens them, and
+widening is exact. All 167 tensors of `model.safetensors` — 37,760,256 values —
+narrow back to fp16 and widen again to the bits they started with, which
+`Tests/Model` now asserts over the whole file against a rule written in the
+test. So the packed vocabulary matrix is *the same matrix*, the same kernel
+sums the same products in the same order, and only the load width differs:
+`Tests/Decoder` asserts the logits are **bit identical**, not close, and the
+oracle's residual against whisper.cpp does not move in its sixth significant
+digit. That is why the switch defaults on. A repo genuinely trained and saved
+in fp32 gets no copy and the tied weight, silently and by construction.
+
+What it costs is 40 MB of device memory beside the float table, which stays
+because the embedding gather has no packed read — the reason `DecoderWeights`
+has always insisted `embed_tokens` be F32.
+
+Three assertions hold the claim up, in the three tiers CLAUDE.md asks for:
+`Model/SafeTensors/exactHalfBuffer*` pins the predicate on hand-written files
+either side of the line, `Model/TinyEn/weightsAreExactlyHalves` pins the fact
+about the real download, and `Decoder/TinyEn/packedLogitsWeightIsIdentical`
+pins the consequence as an equality rather than a tolerance. The narrowing
+itself was checked against ARM's own `__fp16` over 20 million random bit
+patterns and every representable half before it was committed to.
+
+`Kernels/singleQueryAttentionMatchesTheChain` grew two shapes on the far side
+of `singleChunkKeyLimit`, because the three it had were all under it and the
+one-dispatch path would otherwise have taken the kernel test's whole coverage
+with it. Both forms are mutation-checked: forcing every key count through one
+chunk fails the new shapes, and forcing every one through the chunked form
+still passes.
+
+The dispatch that this halves was measured before it was written, by recording
+it twice into the same buffer: the second one writes what the first did, so the
+transcript cannot move and the delta is the dispatch's own cost. **133 us of a
+593 us step, 23% of it**, moving 79.6 MB at about 600 GB/s — at the machine's
+bandwidth, so the only lever was fewer bytes.
+
+### The negative results
+
+**A dispatch costs two different things here, and that decided three of these.**
+Priced by duplicating all thirteen of a step's layernorms: chained behind a
+`pass.barrier()` they cost 0.65 ms over 25 steps, **2.0 us a chained dispatch**;
+left independent in the concurrent pass they cost 0.03 ms, **0.09 us**. The
+concurrent pass is doing exactly what the second round added it for, and the
+consequence is that plan.md's remaining dispatch-count candidates are worth far
+less than the M4's 5.5 us a dispatch made them look.
+
+| tried, or priced and not tried | result |
+| --- | --- |
+| `ifThen` instead of `select` on the store fold of `TiledMatMul` and `SplitLinear` | **0.4% slower**, consistently. The reason is that the second round's premise was wrong: eacp emits `select` as a **C ternary**, and a ternary short-circuits, so `exactGelu` and the `output[at]` load were never evaluated on the untaken side. The "54 MB of dead reads on the scores product" is true of the EDSL graph and false of the emitted MSL — the emitted line is `(u3 != 0u) ? ((0.5 * t4) * (1.0 + eacpErf(...))) : t4`. Reverted; the record above is corrected here |
+| a joined q/k/v tensor from the loader | **not attempted, and it should not be.** The three projections are already independent — no barrier between them, in a concurrent pass — so the eight dispatches it removes cost 0.09 us each. The second round valued this at 45 us a step on a machine whose pass was serial |
+| the layernorms folded into the projections they feed | **not attempted.** Thirteen chained dispatches is 0.65 ms, which is the ceiling; the fold would put two group reductions into every one of the 48 groups a 384-wide projection dispatches, where there is one group doing them now, and LN1 feeds three projections and would be computed three times. The arithmetic does not clear the ceiling |
+| 32 chunks a head | identical to 16, so the count stops where the device does |
+
+### What this round surfaced
+
+Nothing that needs a change in eacp — the two things it turned up are facts
+about what eacp already does, and both correct something written above.
+
+| finding | where, and what it means |
+| --- | --- |
+| `select` is a ternary, and ternaries short-circuit | `ShaderGraph::addSelect` emits `c ? a : b`, so neither side's loads or calls are evaluated unless taken. The second round recorded the opposite and costed an optimisation on it. Nothing in eacp is wrong; the note about it was |
+| the concurrent pass is worth an order of magnitude, not 2% | 0.09 us for an independent dispatch against 2.0 us for a chained one. The second round measured the concurrent pass at "about 2% of the run" because only eight of a step's sixty-five boundaries were unordered. The lever it gives is much larger than that number suggests, and the way to use it is to *create* independent dispatches rather than to remove dispatches |
+
+### What is still on the table after this
+
+The step is 520 us and the encode 6.2 ms. The vocabulary projection is now
+about 70 us of a step and still the largest single dispatch in it; there is no
+third halving of it. What is left, in the order this machine values it:
+
+- **The cross attention's KV cache in fp16.** 18.4 MB read a step, half of it
+  saved. Unlike the weight above this one is *not* free: the cache is projected
+  from the encoder's rows at run time, so its values are not fp16 to begin with
+  and storing them narrowed would be a real approximation.
+- **`simdgroup_matrix` in eacp**, still — the tiled product's 4 to 5 TFLOPS
+  against ggml's, and now the encoder is 32% of the run.
+- **The two unshipped `TiledMatMul` findings**, of which one is now known to be
+  a non-finding; the transposed A slab was not retried this round.
+- **A movable `CommandBuffer`** in eacp, so the pipelined loop's ring need not
+  be a row of `std::optional`s.

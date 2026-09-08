@@ -635,10 +635,11 @@ void Decoder::step(ComputePass& pass,
     // The logits projection is embed_tokens itself — there is no proj_out in a
     // Whisper safetensors file, and no bias either, so the zero buffer this
     // binds is the vocabulary-wide one rather than the width-wide one k_proj
-    // takes.
+    // takes. logitsWeight() is that matrix, or the fp16 copy of it the weights
+    // were asked to keep beside it.
     encodeLinear(pass,
                  *normalisedRows,
-                 weights.tokenEmbedding,
+                 weights.logitsWeight(),
                  *zeroLogitBias,
                  BufferRange::of(logits),
                  decoderShape.width,

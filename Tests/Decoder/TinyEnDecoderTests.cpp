@@ -251,6 +251,60 @@ auto tTinyEnDecoderMatchesReference =
               << "\n";
 };
 
+// The vocabulary projection reading a packed fp16 copy of embed_tokens instead
+// of the float matrix — 40 MB a step rather than 80, which is the largest read
+// a step makes and a quarter of its GPU time.
+//
+// What this asserts is that it costs nothing at all: **every logit is bit
+// identical**, not close. tiny.en's weights are fp16 values in an F32 container
+// (Model/TinyEn/weightsAreExactlyHalves says so over the whole file), so the
+// narrowed weight is the same number and the same products are summed in the
+// same order by the same kernel — only the load width differs. An equality
+// rather than a tolerance is therefore the honest assertion, and it is the one
+// that would catch a repo where the packing quietly lost something, since
+// DecoderWeights refuses to pack such a file at all and this would then be
+// comparing the tied weight with itself.
+auto tTinyEnDecoderPackedLogitsAreIdentical =
+    test("Decoder/TinyEn/packedLogitsWeightIsIdentical") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = DecoderShape::fromConfig(config, shortCrossPositions);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto encoderOutput = syntheticEncoderOutput(shape);
+    const auto tokens =
+        std::vector<int> {config.decoderStartToken, noTimestampsToken};
+
+    // Without this the equality below would hold vacuously for a file whose
+    // packing was refused rather than one whose packing was exact.
+    check(
+        file.makeExactHalfBuffer(decoderTensor("embed_tokens.weight")).has_value());
+
+    const auto logitsFrom = [&](DecoderWeights::LogitsWeight which)
+    {
+        auto run = DecoderRun {shape, file, which};
+        run.begin(encoderOutput);
+        return run.step(tokens).logits;
+    };
+
+    const auto tied = logitsFrom(DecoderWeights::LogitsWeight::Tied);
+    const auto packed = logitsFrom(DecoderWeights::LogitsWeight::PackedHalfCopy);
+
+    check(tied.size() == packed.size());
+    check(tied.size() == (int) tokens.size() * shape.vocabularySize);
+
+    auto differing = 0;
+
+    for (auto index = 0; index < tied.size(); ++index)
+        if (tied[index] != packed[index])
+            ++differing;
+
+    check(differing == 0);
+};
+
 // The shape a step is actually run at: a full 30 second window behind it, so
 // cross-attention reads 1500 encoder rows in every layer. No reference — a
 // scalar decoder over 1500 cross positions is minutes — so what this asserts is

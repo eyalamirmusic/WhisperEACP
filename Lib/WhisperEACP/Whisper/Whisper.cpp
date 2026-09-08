@@ -238,6 +238,11 @@ void Whisper::setMaximumTokens(int count)
     maximumTokenCount = count;
 }
 
+void Whisper::setPacksLogitsWeight(bool shouldPack)
+{
+    packedLogitsWeight = shouldPack;
+}
+
 void Whisper::prepare(Device& device)
 {
     requireLoaded();
@@ -256,7 +261,11 @@ void Whisper::prepare(Device& device)
     selection.prepare(device, 1, decoder->shape().logitElementCount());
 
     encoderWeights.emplace(*weightsFile, encoder->shape());
-    decoderWeights.emplace(*weightsFile, decoder->shape());
+    decoderWeights.emplace(*weightsFile,
+                           decoder->shape(),
+                           packedLogitsWeight
+                               ? DecoderWeights::LogitsWeight::PackedHalfCopy
+                               : DecoderWeights::LogitsWeight::Tied);
 
     filterBank.emplace(preprocessor.makeMelFilterBuffer());
 

@@ -522,9 +522,12 @@ struct StepResult
 class DecoderRun
 {
 public:
-    DecoderRun(const DecoderShape& shapeToUse, const SafeTensors& file)
+    DecoderRun(const DecoderShape& shapeToUse,
+               const SafeTensors& file,
+               DecoderWeights::LogitsWeight logitsWeight =
+                   DecoderWeights::LogitsWeight::Tied)
         : decoderShape(shapeToUse)
-        , weights(file, shapeToUse)
+        , weights(file, shapeToUse, logitsWeight)
         , decoder(shapeToUse)
     {
         decoder.prepare(eacp::GPU::Device::shared());

@@ -114,6 +114,19 @@ public:
     // read of their own and are widened here.
     TensorBuffer makeBuffer(std::string_view name) const;
 
+    // The same tensor as packed halves — but only when that is the same
+    // tensor, which is to say when every value narrows and widens back to the
+    // bits it started with. Empty otherwise, so a caller asking for half the
+    // bytes never silently gets a different matrix.
+    //
+    // Not the rare case it sounds. OpenAI's Whisper checkpoints are fp16, and
+    // HuggingFace's conversion widens them into an F32 container: all 167
+    // tensors of tiny.en's model.safetensors round-trip exactly, so the fp16
+    // copy of any of them is bit-identical arithmetic at half the bandwidth.
+    // A repo genuinely trained and saved in fp32 answers empty and keeps the
+    // float weight it shipped.
+    std::optional<TensorBuffer> makeExactHalfBuffer(std::string_view name) const;
+
 private:
     // Which of the three constructions the bytes came from. Kept as a state
     // rather than derived from a cached Span, because two of the three would

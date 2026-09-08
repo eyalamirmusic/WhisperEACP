@@ -234,6 +234,59 @@ eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
     return uploadBytes(padded);
 }
 
+// float32 to IEEE binary16, round to nearest even, overflowing to infinity —
+// the same rule Metal's own narrowing follows, so a value packed here is the
+// value a shader would have packed. Written out rather than taken from _Float16
+// because MSVC has no such type and this is the one place the project narrows.
+std::uint16_t packHalf(float value)
+{
+    auto bits = std::uint32_t {};
+    std::memcpy(&bits, &value, sizeof(bits));
+
+    const auto sign = static_cast<std::uint16_t>((bits >> 16) & 0x8000u);
+    const auto rawExponent = (bits >> 23) & 0xFFu;
+    const auto mantissa = bits & 0x7FFFFFu;
+
+    if (rawExponent == 0xFFu)
+        return static_cast<std::uint16_t>(sign | 0x7C00u
+                                          | (mantissa != 0u ? 0x200u : 0u));
+
+    const auto exponent = static_cast<std::int32_t>(rawExponent) - 127 + 15;
+
+    if (exponent >= 0x1F)
+        return static_cast<std::uint16_t>(sign | 0x7C00u);
+
+    // Below the smallest subnormal's halfway point nothing survives the shift.
+    if (exponent < -10)
+        return sign;
+
+    const auto roundUp = [](std::uint32_t result,
+                            std::uint32_t dropped,
+                            std::uint32_t half) -> std::uint32_t
+    {
+        const auto atLeastHalf = (dropped & half) != 0u;
+        const auto aboveHalf = (dropped & (half - 1u)) != 0u;
+
+        return result + (atLeastHalf && (aboveHalf || (result & 1u)) ? 1u : 0u);
+    };
+
+    if (exponent <= 0)
+    {
+        const auto shift = static_cast<std::uint32_t>(14 - exponent);
+        const auto full = mantissa | 0x800000u;
+        const auto dropped = full & ((1u << shift) - 1u);
+        const auto rounded = roundUp(full >> shift, dropped, 1u << (shift - 1u));
+
+        return static_cast<std::uint16_t>(sign | rounded);
+    }
+
+    const auto packed =
+        (static_cast<std::uint32_t>(exponent) << 10) | (mantissa >> 13);
+    const auto rounded = roundUp(packed, mantissa & 0x1FFFu, 0x1000u);
+
+    return static_cast<std::uint16_t>(sign | rounded);
+}
+
 std::map<std::string, std::string> parseMetadata(const Miro::Json::Value& value)
 {
     if (!value.isObject())
@@ -475,5 +528,42 @@ TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
                                                    static_cast<int>(byteCount),
                                                    eacp::GPU::BufferUsage::Storage),
             TensorType::F32};
+}
+
+std::optional<TensorBuffer>
+    SafeTensors::makeExactHalfBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    if (tensor.type == TensorType::F16)
+        return makeBuffer(name);
+
+    const auto values = readFloats(name);
+
+    auto halves = Vector<std::uint16_t> {};
+    halves.resize(values.size());
+
+    for (auto index = 0; index < values.size(); ++index)
+    {
+        halves[index] = packHalf(values[index]);
+
+        // A NaN weight compares unequal to itself and takes this exit, which
+        // is the right answer for a tensor nothing here should be packing.
+        if (!(halfToFloat(halves[index]) == values[index]))
+            return {};
+    }
+
+    const auto byteCount = static_cast<std::int64_t>(halves.size())
+                           * static_cast<std::int64_t>(sizeof(std::uint16_t));
+
+    if (byteCount > std::numeric_limits<int>::max())
+        throw ModelError {"tensor '" + tensor.name
+                          + "' is too large for a GPU buffer"};
+
+    const auto bytes = Span<const std::uint8_t> {
+        reinterpret_cast<const std::uint8_t*>(halves.data()),
+        static_cast<int>(byteCount)};
+
+    return TensorBuffer {uploadPackedHalves(bytes), TensorType::F16};
 }
 } // namespace WSP

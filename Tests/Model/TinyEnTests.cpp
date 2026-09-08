@@ -4,6 +4,10 @@
 
 #include <eacp/GPU/GPU.h>
 
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+
 // The real openai/whisper-tiny.en files, which are a download and never a
 // commit: configure with -DWHISPER_EACP_FETCH_MODEL=ON, or point
 // WHISPER_MODEL_DIR at a checkout that already has them. Every test here
@@ -154,6 +158,69 @@ auto tTinyEnWeightsHeader = test("Model/TinyEn/weightsHeader") = []
     check(weights.contains("model.encoder.layer_norm.weight"));
     check(weights.contains("model.decoder.layers.3.fc2.bias"));
     check(!weights.contains("model.encoder.layers.4.fc1.weight"));
+};
+
+// F32 is the container, not the precision. OpenAI's Whisper checkpoints are
+// fp16 and HuggingFace's conversion only widens them, so every one of the
+// 37.8 million values in this file is exactly an fp16 — which is what lets the
+// decoder read the vocabulary projection at half the bandwidth and get the
+// same logits to the last bit, rather than trading accuracy for it.
+//
+// The claim is the whole basis of DecoderWeights::LogitsWeight defaulting to a
+// packed copy, so it is asserted over the file rather than assumed from the
+// dtype, and by a rule written here rather than by the loader's own narrowing:
+// a finite value is an fp16 exactly when it is a whole multiple of that
+// exponent's fp16 ulp and inside the format's range. fp16 has eleven bits of
+// significand, so a value x = m * 2^e with |m| in [0.5, 1) sits on a grid of
+// 2^(e - 11), and the subnormals below 2^-14 share the grid of the smallest
+// normal — which is what the clamp on e says.
+auto tTinyEnWeightsAreExactlyHalves =
+    test("Model/TinyEn/weightsAreExactlyHalves") = []
+{
+    if (!hasModelFile(weightsFile))
+        return;
+
+    const auto isExactlyHalf = [](float value)
+    {
+        if (!std::isfinite(value))
+            return false;
+
+        if (value == 0.0f)
+            return true;
+
+        if (std::abs(value) > 65504.0f)
+            return false;
+
+        auto exponent = 0;
+        std::frexp(value, &exponent);
+
+        const auto ulp = std::ldexp(1.0f, std::max(exponent, -13) - 11);
+
+        return std::fmod(value, ulp) == 0.0f;
+    };
+
+    const auto weights = SafeTensors::fromFile(modelFile(weightsFile));
+
+    auto lossyTensors = 0;
+    auto checkedValues = std::int64_t {};
+
+    for (const auto& tensor: weights.tensors())
+    {
+        const auto values = weights.readFloats(tensor.name);
+        checkedValues += values.size();
+
+        for (auto value: values)
+        {
+            if (!isExactlyHalf(value))
+            {
+                ++lossyTensors;
+                break;
+            }
+        }
+    }
+
+    check(lossyTensors == 0);
+    check(checkedValues == 37760256);
 };
 
 // The shapes the header names are the shapes config.json describes, which is

@@ -768,6 +768,14 @@ auto tAttentionCausalMaskOutrunsVeryNegativeScores =
 // chunks hold none; at the model's own head width over more keys than a
 // chunk's lanes, so a lane takes several; and at a head one quad wide, so the
 // quads past it are the guarded ones.
+//
+// The last two shapes are the other side of singleChunkKeyLimit, which is
+// where the kernel stops being one dispatch and starts being two: everything
+// up to it is one group a head normalising its own row, and everything past it
+// is chunks rescaled and joined by the combine. Both forms are held to the
+// same reference here, since a decode step takes the first for its self
+// attention and the second for its cross attention and only the second is
+// reachable from the shapes above.
 auto tSingleQueryAttentionMatchesTheChain =
     test("Kernels/singleQueryAttentionMatchesTheChain") = []
 {
@@ -776,7 +784,9 @@ auto tSingleQueryAttentionMatchesTheChain =
 
     for (const auto& shape: {AttentionShape {4, 4, 1, 11},
                              AttentionShape {3, 64, 1, 203},
-                             AttentionShape {2, 8, 1, 130}})
+                             AttentionShape {2, 8, 1, 130},
+                             AttentionShape {4, 4, 1, 257},
+                             AttentionShape {3, 64, 1, 700}})
     {
         const auto scale = 0.37;
         auto queries = spreadValues(shape.queryElementCount(), 7100u, 1.f);

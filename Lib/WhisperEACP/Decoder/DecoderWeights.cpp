@@ -164,7 +164,8 @@ DecoderLayerWeights::DecoderLayerWeights(const SafeTensors& file,
 }
 
 DecoderWeights::DecoderWeights(const SafeTensors& file,
-                               const DecoderShape& shapeToUse)
+                               const DecoderShape& shapeToUse,
+                               LogitsWeight logitsWeightToUse)
     : shape(shapeToUse)
     , tokenEmbedding(loadTokenEmbedding(file, shapeToUse))
     , positionalEmbedding(loadPositionalEmbedding(file, shapeToUse))
@@ -173,6 +174,13 @@ DecoderWeights::DecoderWeights(const SafeTensors& file,
     , finalNormBias(decoderTensors(file).loadFloatTensor(
           decoderName("layer_norm.bias"), {shapeToUse.width}, "LayerNorm"))
 {
+    // The shape and the storage of the float table were checked above, so this
+    // narrows a tensor already known to be the matrix it claims to be — and
+    // keeps the result only if narrowing changed none of it.
+    if (logitsWeightToUse == LogitsWeight::PackedHalfCopy)
+        packedTokenEmbedding =
+            file.makeExactHalfBuffer(decoderName("embed_tokens.weight"));
+
     layers.reserve(shapeToUse.layers);
 
     for (auto index = 0; index < shapeToUse.layers; ++index)

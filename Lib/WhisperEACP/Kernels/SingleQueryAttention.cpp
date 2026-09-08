@@ -17,10 +17,17 @@ constexpr int floatBytes(int elementCount)
     return elementCount * (int) sizeof(float);
 }
 
+int chunkCountFor(int keyCount)
+{
+    return keyCount <= SingleQueryAttention::singleChunkKeyLimit
+               ? 1
+               : SingleQueryAttention::chunksPerHead;
+}
+
 int chunkLengthFor(int keyCount)
 {
-    return (keyCount + SingleQueryAttention::chunksPerHead - 1)
-           / SingleQueryAttention::chunksPerHead;
+    const auto chunks = chunkCountFor(keyCount);
+    return (keyCount + chunks - 1) / chunks;
 }
 } // namespace
 
@@ -77,20 +84,28 @@ void SingleQueryAttention::encode(ComputePass& pass,
             + " heads over " + std::to_string(keyCapacity) + " keys and asked for "
             + std::to_string(headCount) + " over " + std::to_string(keyCount)};
 
+    const auto chunks = chunkCountFor(keyCount);
+
     partialStage.queries = queries;
     partialStage.keys = keys;
     partialStage.values = values;
     partialStage.chunkMaxima = *chunkMaxima;
     partialStage.chunkSums = *chunkSums;
     partialStage.chunkRows = *chunkRows;
+    partialStage.output = output;
     partialStage.modelWidth = (std::uint32_t) modelWidth;
     partialStage.headWidth = (std::uint32_t) headWidth;
     partialStage.keyCount = (std::uint32_t) keyCount;
-    partialStage.chunkCount = (std::uint32_t) chunksPerHead;
+    partialStage.chunkCount = (std::uint32_t) chunks;
     partialStage.chunkLength = (std::uint32_t) chunkLengthFor(keyCount);
     partialStage.scale = scale;
 
-    partialStage.dispatchRows(pass, headCount * chunksPerHead);
+    partialStage.dispatchRows(pass, headCount * chunks);
+
+    // One chunk holds the whole row, so the partial has already normalised it
+    // and there is nothing left to join.
+    if (chunks == 1)
+        return;
 
     // The combine folds what the partials wrote.
     pass.barrier();
@@ -100,7 +115,7 @@ void SingleQueryAttention::encode(ComputePass& pass,
     combineStage.chunkRows = *chunkRows;
     combineStage.output = output;
     combineStage.headWidth = (std::uint32_t) headWidth;
-    combineStage.chunkCount = (std::uint32_t) chunksPerHead;
+    combineStage.chunkCount = (std::uint32_t) chunks;
 
     combineStage.dispatchRows(pass, headCount);
 }

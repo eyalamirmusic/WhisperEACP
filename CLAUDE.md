@@ -225,11 +225,21 @@ in the file at 80 x 201, and every constant agrees.
 
 **`tiny.en` ships F32, not F16** — `"torch_dtype": "float32"`, and all 167
 tensors in its `model.safetensors` are `F32` (19104-byte header, 151,041,024-byte
-blob). F16 is what the larger repos ship. The loader reads both and widens on the
-way in, because eacp's EDSL has no half type — `ValueType` is
-`Float/Float2/.../UInt/Int/Bool` and `InputBuffer` yields a `Float` — so packed
-halves cannot be read by a kernel at all, and keeping them packed would only move
-the conversion into every kernel that touches a weight.
+blob). F16 is what the larger repos ship. eacp's EDSL still has no half *type* —
+`ValueType` is `Float/Float2/.../UInt/Int/Bool` and `InputBuffer` yields a
+`Float` — but it does have half *storage*, `InputBuffer::readHalf`, so a weight
+may stay packed and be widened as it is read. `TensorBuffer` names which of the
+two a buffer holds and the projections pick the matching program.
+
+**And F32 is the container, not the precision.** OpenAI's checkpoints are fp16
+and HuggingFace's conversion only widens them, so every one of those 167 tensors
+round-trips through fp16 unchanged — asserted over all 37,760,256 values in
+`Tests/Model`. That is why `DecoderWeights::LogitsWeight` defaults to keeping an
+fp16 copy of `embed_tokens` for the logits projection: it halves the largest
+read a decode step makes and the logits come out bit identical.
+`SafeTensors::makeExactHalfBuffer` is what enforces the "bit identical" — it
+returns nothing when a file would lose something, so a repo genuinely saved in
+fp32 keeps its float weight.
 
 ### Fetching the model
 

@@ -39,6 +39,14 @@ namespace WSP
 // half a Metal group's 32 kB on them, so 128 is a pipeline the backend
 // refuses.
 //
+// A cache short enough to sit in one chunk takes one dispatch instead of two.
+// The chunk is then the whole row — its maximum is the row's maximum and its
+// sum the row's denominator — so the combine has nothing to rescale and the
+// partial writes the normalised row itself. That is what a step's self
+// attention is: it runs over the tokens decoded so far, two at the prompt and
+// a couple of dozen by the end of a sentence, where the two-stage form was
+// thirteen microseconds of pure latency whatever the key count.
+//
 // The query slice and each key and value row are read four channels at a
 // time, so a head is a whole number of quads wide, and the shared arrays are
 // sized for the widest head this is dispatched with and the longest chunk;
@@ -243,23 +251,46 @@ struct SingleQueryAttentionPartial final : ReducingProgram
 
         barrier();
 
-        ifThen(lane == 0u,
-               [&]
-               {
-                   write(chunkMaxima, group, chunkMaximum.get());
-                   write(chunkSums, group, chunkTotal.get());
-               });
+        ifThen(
+            chunkCount == 1u,
+            [&]
+            {
+                // The one chunk holds every key, so its maximum is the row's
+                // and its sum is the denominator: there is nothing for a
+                // combine to rescale, and the normalised row is written here.
+                ifThen(lane < headWidth,
+                       [&]
+                       {
+                           auto sum = var(0.f);
 
-        ifThen(lane < headWidth,
-               [&]
-               {
-                   auto sum = var(0.f);
+                           for (auto other = 0u; other < lanes; ++other)
+                               sum += partials[other * rowPitch + lane];
 
-                   for (auto other = 0u; other < lanes; ++other)
-                       sum += partials[other * rowPitch + lane];
+                           write(output,
+                                 head * headWidth + lane,
+                                 sum.get() / chunkTotal.get());
+                       });
+            },
+            [&]
+            {
+                ifThen(lane == 0u,
+                       [&]
+                       {
+                           write(chunkMaxima, group, chunkMaximum.get());
+                           write(chunkSums, group, chunkTotal.get());
+                       });
 
-                   write(chunkRows, group * rowPitch + lane, sum.get());
-               });
+                ifThen(lane < headWidth,
+                       [&]
+                       {
+                           auto sum = var(0.f);
+
+                           for (auto other = 0u; other < lanes; ++other)
+                               sum += partials[other * rowPitch + lane];
+
+                           write(chunkRows, group * rowPitch + lane, sum.get());
+                       });
+            });
     }
 
     Uniform<InputBuffer> queries;
@@ -268,6 +299,7 @@ struct SingleQueryAttentionPartial final : ReducingProgram
     Uniform<OutputBuffer> chunkMaxima;
     Uniform<OutputBuffer> chunkSums;
     Uniform<OutputBuffer> chunkRows;
+    Uniform<OutputBuffer> output;
     Uniform<UInt> modelWidth;
     Uniform<UInt> headWidth;
     Uniform<UInt> keyCount;
@@ -281,6 +313,7 @@ struct SingleQueryAttentionPartial final : ReducingProgram
                 chunkMaxima,
                 chunkSums,
                 chunkRows,
+                output,
                 modelWidth,
                 headWidth,
                 keyCount,
@@ -360,7 +393,23 @@ struct SingleQueryAttentionCombine final : ReducingProgram
 class SingleQueryAttention
 {
 public:
-    static constexpr auto chunksPerHead = 8;
+    // How many groups share a head's keys once there are too many for one.
+    // With the single-chunk path below taking everything up to 256 keys, this
+    // now only ever describes a decode step's cross attention over the
+    // encoder's 1500 rows, and it is an occupancy number rather than a work
+    // one: six heads at eight chunks is 48 groups, which does not fill this
+    // machine. Sixteen measured 0.38 ms off the run over eight, and
+    // thirty-two measured the same as sixteen, so the count stops where the
+    // device does.
+    static constexpr auto chunksPerHead = 16;
+
+    // Up to how many keys one group takes on its own, which is the longest
+    // chunk the partial's shared score array holds. A step's cross attention
+    // is always over it; its self attention is under it for the first 256
+    // tokens of a sequence and chunks like the cross attention past them,
+    // which a 448-position model reaches on a full window of dense speech.
+    static constexpr auto singleChunkKeyLimit =
+        SingleQueryAttentionPartial::maxChunk;
 
     void prepare(eacp::GPU::Device& device,
                  int headCount,
@@ -368,8 +417,9 @@ public:
                  int maxKeys);
     void prepare(int headCount, int headWidth, int maxKeys);
 
-    // Two dispatches into the caller's pass. queries is a [W] row, keys and
-    // values are [keyCount, W], output receives the [W] row.
+    // One dispatch into the caller's pass up to singleChunkKeyLimit keys and
+    // two beyond it. queries is a [W] row, keys and values are [keyCount, W],
+    // output receives the [W] row.
     void encode(eacp::GPU::ComputePass& pass,
                 const eacp::GPU::Buffer& queries,
                 const eacp::GPU::Buffer& keys,

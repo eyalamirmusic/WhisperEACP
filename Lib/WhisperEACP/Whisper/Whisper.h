@@ -162,6 +162,20 @@ public:
     int maximumTokens() const { return maximumTokenCount; }
     void setMaximumTokens(int count);
 
+    // Whether the logits projection may read an fp16 copy of embed_tokens
+    // rather than the float matrix the gather reads. It is the one dispatch of
+    // a step that moves real bandwidth — 80 MB of vocabulary a step, 133 us of
+    // the 590 a step takes — and halving the bytes nearly halves it.
+    //
+    // On by default, because it costs no accuracy: the copy is built only
+    // where narrowing is bit-exact, and a Whisper repo's weights are fp16
+    // values in an F32 container (DecoderWeights::LogitsWeight says why). A
+    // model that would lose something keeps the tied weight and this reads
+    // back true having changed nothing. Set it before prepare(), which is
+    // where the copy is built.
+    bool packsLogitsWeight() const { return packedLogitsWeight; }
+    void setPacksLogitsWeight(bool shouldPack);
+
     // 16 kHz mono samples, at most one 30 s window of them.
     //
     // Fewer are zero-filled to the window, which is what HF's feature extractor
@@ -256,6 +270,7 @@ private:
     Vector<float> firstStepSuppression;
     Vector<float> laterStepSuppression;
     int maximumTokenCount = 0;
+    bool packedLogitsWeight = true;
 
     MelSpectrogram frontEnd;
     std::optional<Encoder> encoder;

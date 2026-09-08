@@ -606,3 +606,55 @@ auto tBfloatBufferIsWidened = test("Model/SafeTensors/bfloatBufferIsWidened") = 
     check(readBack[1] == 1.0f);
     check(readBack[2] == -2.0f);
 };
+
+// makeExactHalfBuffer packs an F32 tensor only when packing changes none of
+// it, so a caller asking for half the bytes never quietly gets a different
+// matrix. These four values are each exactly an fp16.
+auto tExactHalfBufferPacks = test("Model/SafeTensors/exactHalfBufferPacks") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}})",
+                 toBytes<float>({1.0f, -2.0f, 0.25f, 0.5f})));
+
+    const auto packed = file.makeExactHalfBuffer("w");
+
+    check(packed.has_value());
+    check(packed->storage == TensorType::F16);
+    check(packed->isPackedHalf());
+    check(packed->buffer.size() == 8);
+};
+
+// 0.1f is not, so the whole tensor is refused rather than rounded.
+auto tExactHalfBufferRefusesLoss =
+    test("Model/SafeTensors/exactHalfBufferRefusesLoss") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"F32","shape":[4],"data_offsets":[0,16]}})",
+                 toBytes<float>({1.0f, -2.0f, 0.25f, 0.1f})));
+
+    check(!file.makeExactHalfBuffer("w").has_value());
+};
+
+// A tensor the file already ships packed is already the answer.
+auto tExactHalfBufferPassesHalvesThrough =
+    test("Model/SafeTensors/exactHalfBufferPassesHalvesThrough") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}})",
+                 toBytes<std::uint16_t>({0x3C00, 0xC000, 0x0000, 0x4000})));
+
+    const auto packed = file.makeExactHalfBuffer("w");
+
+    check(packed.has_value());
+    check(packed->isPackedHalf());
+    check(deviceBytesEqual(packed->buffer, file.rawBytes("w")));
+};

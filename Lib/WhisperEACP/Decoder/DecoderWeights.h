@@ -3,6 +3,8 @@
 #include <WhisperEACP/Decoder/DecoderShape.h>
 #include <WhisperEACP/Model/SafeTensors.h>
 
+#include <optional>
+
 namespace WSP
 {
 // One decoder block's tensors, under the names HuggingFace's WhisperDecoder
@@ -85,15 +87,51 @@ struct DecoderLayerWeights
 // widening path in SafeTensors rather than a second copy of the matrix, and it
 // keeps the tie between the embedding and the logits exact instead of exact
 // only up to a conversion.
+//
+// The one buffer that cannot be both is why LogitsWeight below is a *second*
+// copy rather than a choice of storage for the one tensor: the gather keeps
+// its floats and the projection gets the halves.
 struct DecoderWeights
 {
-    DecoderWeights(const SafeTensors& file, const DecoderShape& shapeToUse);
+    // What the logits projection reads. Tied is embed_tokens itself, the
+    // matrix the gather reads. PackedHalfCopy is a second, fp16 copy of it
+    // kept beside the float one, so the projection reads 40 MB a step instead
+    // of 80 — 133 us of a 590 us step down to about 70.
+    //
+    // **It is not a numerical trade.** The copy is made only where narrowing
+    // is bit-exact, which for a Whisper repo is everywhere: OpenAI's
+    // checkpoints are fp16 and HuggingFace's conversion only widens them, so
+    // every one of tiny.en's 167 tensors round-trips through fp16 unchanged
+    // and the logits are identical to the last bit. A repo genuinely saved in
+    // fp32 gets no copy and the tied weight, which is why this asks for a copy
+    // rather than promising one — packedTokenEmbedding is empty when the file
+    // would have lost something.
+    enum class LogitsWeight
+    {
+        Tied,
+        PackedHalfCopy
+    };
+
+    DecoderWeights(const SafeTensors& file,
+                   const DecoderShape& shapeToUse,
+                   LogitsWeight logitsWeightToUse = LogitsWeight::Tied);
 
     DecoderShape shape;
 
-    // [vocabularySize, width]. Both the gather's table and the logits
-    // projection's weight, which is what ties them.
+    // [vocabularySize, width]. Both the gather's table and, unless a packed
+    // copy was asked for, the logits projection's weight — which is what ties
+    // them.
     TensorBuffer tokenEmbedding;
+
+    // The fp16 copy of the above, present only under PackedHalfCopy.
+    std::optional<TensorBuffer> packedTokenEmbedding;
+
+    // What Decoder::step binds for the logits, which is the one place the
+    // choice above is read.
+    const TensorBuffer& logitsWeight() const
+    {
+        return packedTokenEmbedding ? *packedTokenEmbedding : tokenEmbedding;
+    }
 
     // [maxTargetPositions, width] in the file, of which row t is added to token
     // t. A model is allowed to carry more rows than a given run needs; fewer is
