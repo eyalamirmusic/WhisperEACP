@@ -94,27 +94,11 @@ set(WHISPER_EACP_SAMPLE_DIR "${PROJECT_SOURCE_DIR}/Samples"
 
 add_subdirectory(Lib)
 
-# whisper.cpp, for the two things here that compare against it: the oracle
-# tests in Tests/Oracle and the benchmark in Benchmark/. Both off by default —
-# it is a second inference stack to fetch and build, and a 75 MB model beside
-# it. One fetch serves both, here rather than in either consumer, because its
-# targets (ggml, whisper) are named globally and cannot exist twice in a tree.
-#
-# Which build of it the tree gets is therefore the one decision the two cannot
-# make separately. The oracle wants every backend off, so the reference computes
-# exactly what it documents: ggml's own CPU path. The benchmark wants
-# whisper.cpp's own defaults for the machine — Metal, Accelerate and BLAS on a
-# Mac — since a benchmark against a handicapped whisper.cpp measures nothing.
-# The benchmark wins when both are on: the oracle tests then run against that
-# build with its GPU off at runtime, which is ggml's CPU backend plus the BLAS
-# one the defaults compiled in. Every tolerance in Tests/Oracle is measured
-# against the reference's own resolution rather than assumed, which is what
-# lets them hold either way, and the tests print which build they loaded.
 option(WHISPER_EACP_ENABLE_WHISPER_CPP
-        "Fetch whisper.cpp and build the tests that compare against it" ON)
+        "Fetch whisper.cpp and build the tests that compare against it" OFF)
 option(WHISPER_EACP_ENABLE_BENCHMARK
         "Fetch whisper.cpp with its backends on, and build Benchmark, which \
-times the runtime against it" ON)
+times the runtime against it" OFF)
 
 if (WHISPER_EACP_ENABLE_WHISPER_CPP OR WHISPER_EACP_ENABLE_BENCHMARK)
     include(WhisperCpp)
