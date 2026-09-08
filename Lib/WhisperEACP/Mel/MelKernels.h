@@ -185,15 +185,28 @@ struct MelProjectKernel final : ComputeProgram
 // left. Whisper's floor is taken against that global maximum, and the end of a
 // dispatch is the only thing that orders one thread's write against another's
 // read.
+//
+// lanes is the group this is dispatched in and what the host divides its
+// element count by, so the two cannot drift; it is named here rather than
+// taken as ComputeProgram::groupWidth because this kernel's group is its own.
+//
+// 512 of them, which is the one lane count here that a wide group wins by
+// arithmetic rather than by occupancy: the 240000 cells of a 30 s spectrogram
+// come down in two rounds at 512 lanes where every count up to 256 takes
+// three, and 17 us of hand tree measured down to 10.5. Both backends that ship
+// allow 1024 threads to a group, so the ceiling is not near.
 struct MaxReduceKernel final : ComputeProgram
 {
-    MaxReduceKernel() { compile(); }
+    static constexpr auto lanes = 512;
+
+    MaxReduceKernel()
+        : ComputeProgram({lanes})
+    {
+        compile();
+    }
 
     void define() override
     {
-        auto lane = localId();
-        auto tile = shared<Float>(groupWidth);
-
         auto best = var(lowestFloat);
         auto index = var(threadId());
 
@@ -204,18 +217,9 @@ struct MaxReduceKernel final : ComputeProgram
                  index += stride;
              });
 
-        write(tile, lane, best.get());
-        barrier();
+        auto folded = groupMax(best.get());
 
-        for (auto span = (unsigned) groupWidth / 2u; span > 0u; span /= 2u)
-        {
-            ifThen(lane < span,
-                   [&] { write(tile, lane, max(tile[lane], tile[lane + span])); });
-
-            barrier();
-        }
-
-        ifThen(lane == 0u, [&] { write(partials, groupId(), tile[0u]); });
+        ifThen(localId() == 0u, [&] { write(partials, groupId(), folded); });
     }
 
     Uniform<InputBuffer> values;

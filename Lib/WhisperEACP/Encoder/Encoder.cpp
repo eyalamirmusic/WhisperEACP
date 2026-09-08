@@ -224,6 +224,8 @@ void Encoder::encodeFrontEnd(ComputePass& pass,
                  1,
                  convolutionFrames);
 
+    pass.barrier();
+
     encodeLinear(pass,
                  *columns,
                  weights.firstConvolutionWeight,
@@ -235,6 +237,8 @@ void Encoder::encodeFrontEnd(ComputePass& pass,
                  true,
                  false);
 
+    pass.barrier();
+
     encodeUnfold(pass,
                  *convolved,
                  width,
@@ -243,6 +247,8 @@ void Encoder::encodeFrontEnd(ComputePass& pass,
                  1,
                  width,
                  positions);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *columns,
@@ -254,6 +260,8 @@ void Encoder::encodeFrontEnd(ComputePass& pass,
                  positions,
                  true,
                  false);
+
+    pass.barrier();
 
     encodeSum(pass, *hidden, weights.positionalEmbedding.buffer);
 }
@@ -290,6 +298,12 @@ void Encoder::encodeAttention(ComputePass& pass, const EncoderLayerWeights& weig
                  width,
                  positions);
 
+    // The three projections above read the same normalised rows and write three
+    // buffers nothing else has touched, so they are the one place in a layer
+    // where a concurrent pass has anything to overlap. Everything from here on
+    // reads what the dispatch before it wrote.
+    pass.barrier();
+
     // The scores are a product of the queries against the keys, one batch per
     // head over the head's columns, through the same program as the
     // projections: a key row is contiguous along the head dimension exactly
@@ -309,10 +323,14 @@ void Encoder::encodeAttention(ComputePass& pass, const EncoderLayerWeights& weig
                                              encoderShape.attentionScale(),
                                              false));
 
+    pass.barrier();
+
     softmax.values = *attentionScores;
     softmax.rowLength = (std::uint32_t) positions;
 
     softmax.dispatchRows(pass, encoderShape.scoreRowCount());
+
+    pass.barrier();
 
     attention.a = *attentionScores;
     attention.b = *values;
@@ -342,7 +360,11 @@ void Encoder::encodeLayer(ComputePass& pass, const EncoderLayerWeights& weights)
                     weights.attentionNormBias,
                     *normalised);
 
+    pass.barrier();
+
     encodeAttention(pass, weights);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *attended,
@@ -355,8 +377,12 @@ void Encoder::encodeLayer(ComputePass& pass, const EncoderLayerWeights& weights)
                  false,
                  true);
 
+    pass.barrier();
+
     encodeLayerNorm(
         pass, *hidden, weights.finalNormWeight, weights.finalNormBias, *normalised);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *normalised,
@@ -368,6 +394,8 @@ void Encoder::encodeLayer(ComputePass& pass, const EncoderLayerWeights& weights)
                  positions,
                  true,
                  false);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *feedForward,
@@ -393,7 +421,12 @@ void Encoder::encode(ComputePass& pass,
     encodeFrontEnd(pass, mel, weights);
 
     for (auto index = 0; index < encoderShape.layers; ++index)
+    {
+        pass.barrier();
         encodeLayer(pass, weights.layers[index]);
+    }
+
+    pass.barrier();
 
     encodeLayerNorm(
         pass, *hidden, weights.finalNormWeight, weights.finalNormBias, output);

@@ -5,11 +5,11 @@ using namespace eacp::GPU;
 
 namespace
 {
-constexpr auto groupWidth = WSP::MaxReduceKernel::groupWidth;
+constexpr auto lanes = WSP::MaxReduceKernel::lanes;
 
 int groupsFor(int elementCount)
 {
-    return (elementCount + groupWidth - 1) / groupWidth;
+    return (elementCount + lanes - 1) / lanes;
 }
 
 // The rounds the front-end records, run on their own: each pass reduces its
@@ -37,11 +37,11 @@ float runMaxReduce(Device& device, const std::vector<float>& values)
         kernel.values = *input;
         kernel.partials = *output;
         kernel.count = (std::uint32_t) remaining;
-        kernel.stride = (std::uint32_t) (groups * groupWidth);
+        kernel.stride = (std::uint32_t) (groups * lanes);
 
         {
             auto pass = commands.beginCompute();
-            pass.dispatch(kernel, groups * groupWidth);
+            pass.dispatch(kernel, groups * lanes);
         }
 
         input = output;
@@ -94,9 +94,12 @@ std::vector<float>
 }
 } // namespace
 
-// Three rounds at this size, which is the point: the maximum of a spectrogram
-// is not something one dispatch can know, and a partial that never reaches the
-// last round is the way that goes wrong.
+// More than one round at either size, which is the point: the maximum of a
+// spectrogram is not something one dispatch can know, and a partial that never
+// reaches the last round is the way that goes wrong. The first size is a 30 s
+// spectrogram's own 240000 cells; the second is whatever takes three rounds at
+// this kernel's group, so a round that is neither the first nor the last is
+// exercised whatever that group is.
 auto tMaxReduceFindsTheGlobalMaximum =
     test("Mel/maxReduceFindsTheGlobalMaximum") = []
 {
@@ -105,11 +108,19 @@ auto tMaxReduceFindsTheGlobalMaximum =
     if (!device.isValid())
         return;
 
-    auto values = pseudoRandom(240000, 4242u);
-    values[(std::size_t) 199999] = 7.5f;
+    constexpr auto spectrogram = 240000;
+    constexpr auto threeRounds = 3 * lanes * lanes;
 
-    check(groupsFor(groupsFor((int) values.size())) > 1);
-    check(runMaxReduce(device, values) == 7.5f);
+    check(groupsFor(spectrogram) > 1);
+    check(groupsFor(groupsFor(threeRounds)) > 1);
+
+    for (const auto count: {spectrogram, threeRounds})
+    {
+        auto values = pseudoRandom(count, 4242u);
+        values[(std::size_t) (count / 2 + 1)] = 7.5f;
+
+        check(runMaxReduce(device, values) == 7.5f);
+    }
 };
 
 auto tMaxReduceHandlesAPartialGroup = test("Mel/maxReduceHandlesAPartialGroup") = []
@@ -119,7 +130,7 @@ auto tMaxReduceHandlesAPartialGroup = test("Mel/maxReduceHandlesAPartialGroup") 
     if (!device.isValid())
         return;
 
-    for (const auto count: {1, 7, groupWidth, groupWidth + 1, 3 * groupWidth - 5})
+    for (const auto count: {1, 7, lanes, lanes + 1, 3 * lanes - 5})
     {
         auto values = pseudoRandom(count, 99u);
         values[(std::size_t) (count / 2)] = 3.25f;

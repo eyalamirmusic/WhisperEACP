@@ -47,36 +47,34 @@ inline constexpr auto unchosenIndex = 0xFFFFFFFFu;
 
 struct CandidateFold : ReducingProgram
 {
+    using ReducingProgram::ReducingProgram;
+
 protected:
-    void foldCandidates(const Shared<Float>& values,
-                        const Shared<UInt>& indices,
-                        const UInt& lane)
+    // What a group's fold leaves: the largest value any of its lanes held, and
+    // the lowest index holding it.
+    struct Candidate
     {
-        for (auto span = lanes / 2u; span > 0u; span /= 2u)
-        {
-            ifThen(lane < span,
-                   [&]
-                   {
-                       auto value = values[lane];
-                       auto index = indices[lane];
-                       auto otherValue = values[lane + span];
-                       auto otherIndex = indices[lane + span];
+        Float value;
+        UInt index;
+    };
 
-                       auto larger = otherValue > value
-                                     || (otherValue == value && otherIndex < index);
-                       auto takeOther = otherIndex != unchosenIndex
-                                        && (index == unchosenIndex || larger);
+    // The pair fold as two group reductions rather than a tree over a pair of
+    // shared arrays: the largest value over the whole group, then the lowest
+    // index among the lanes holding exactly it. The equality is against the
+    // fold's own bits, so a lane that holds the maximum recognises itself.
+    //
+    // The sentinel needs no case of its own. A lane that met no allowed
+    // element carries the lowest float and unchosenIndex, so it never raises
+    // the maximum, and when a real value ties its lowest float it still offers
+    // unchosenIndex — the largest unsigned there is, and so the one groupMin
+    // discards against any lane that chose. A group whose every lane went
+    // unchosen is the one case it survives, which is exactly when the answer
+    // is that nothing was chosen.
+    Candidate foldCandidates(const Float& value, const UInt& index)
+    {
+        auto best = groupMax(value);
 
-                       ifThen(takeOther,
-                              [&]
-                              {
-                                  write(values, lane, otherValue);
-                                  write(indices, lane, otherIndex);
-                              });
-                   });
-
-            barrier();
-        }
+        return {best, groupMin(select(value == best, index, unchosenIndex))};
     }
 };
 
@@ -84,7 +82,11 @@ protected:
 // that many whole groups of threads.
 struct ArgmaxPartial final : CandidateFold
 {
-    ArgmaxPartial() { compile(); }
+    explicit ArgmaxPartial(int laneCount = groupWidth)
+        : CandidateFold(laneCount)
+    {
+        compile();
+    }
 
     void define() override
     {
@@ -94,9 +96,6 @@ struct ArgmaxPartial final : CandidateFold
         auto part = group % groupsPerRow;
         auto base = row * rowLength;
         auto stride = groupsPerRow * lanes;
-
-        auto values = shared<Float>(groupWidth);
-        auto indices = shared<UInt>(groupWidth);
 
         auto bestValue = var(std::numeric_limits<float>::lowest());
         auto bestIndex = var(unchosenIndex);
@@ -121,16 +120,13 @@ struct ArgmaxPartial final : CandidateFold
                  scanning += stride;
              });
 
-        write(values, lane, bestValue.get());
-        write(indices, lane, bestIndex.get());
-        barrier();
-        foldCandidates(values, indices, lane);
+        auto candidate = foldCandidates(bestValue.get(), bestIndex.get());
 
         ifThen(lane == 0u,
                [&]
                {
-                   write(partialValues, group, values[0u]);
-                   write(partialIndices, group, indices[0u]);
+                   write(partialValues, group, candidate.value);
+                   write(partialIndices, group, candidate.index);
                });
     }
 
@@ -148,16 +144,17 @@ struct ArgmaxPartial final : CandidateFold
 // rowCount).
 struct ArgmaxFinal final : CandidateFold
 {
-    ArgmaxFinal() { compile(); }
+    explicit ArgmaxFinal(int laneCount = groupWidth)
+        : CandidateFold(laneCount)
+    {
+        compile();
+    }
 
     void define() override
     {
         auto lane = localId();
         auto row = groupId();
         auto base = row * partialsPerRow;
-
-        auto values = shared<Float>(groupWidth);
-        auto indices = shared<UInt>(groupWidth);
 
         auto bestValue = var(std::numeric_limits<float>::lowest());
         auto bestIndex = var(unchosenIndex);
@@ -185,15 +182,12 @@ struct ArgmaxFinal final : CandidateFold
                  scanning += lanes;
              });
 
-        write(values, lane, bestValue.get());
-        write(indices, lane, bestIndex.get());
-        barrier();
-        foldCandidates(values, indices, lane);
+        auto candidate = foldCandidates(bestValue.get(), bestIndex.get());
 
         ifThen(lane == 0u,
                [&]
                {
-                   auto chosen = indices[0u];
+                   auto chosen = candidate.index;
                    write(result, row, select(chosen == unchosenIndex, 0u, chosen));
                });
     }
@@ -213,6 +207,17 @@ struct ArgmaxFinal final : CandidateFold
 class Argmax
 {
 public:
+    // The group both stages are dispatched in, and what groupsPerRow spreads a
+    // row over. One count serves both because there is only ever one shape
+    // here: the single row of 51864 logits a decode step ends on.
+    //
+    // The stock 64, which is what that shape measured at — a row this wide is
+    // already spread over a hundred groups, so it fills the machine at any
+    // lane count, and 128 and 256 only fold deeper for it. What the two
+    // reductions bought was the fold itself: 8.1 us of shared-memory pair tree
+    // down to 6.4.
+    static constexpr auto lanes = ComputeProgram::groupWidth;
+
     void prepare(eacp::GPU::Device& device, int rowCount, int rowLength);
     void prepare(int rowCount, int rowLength);
 
@@ -247,8 +252,8 @@ public:
     static int groupsPerRow(int rowLength);
 
 private:
-    ArgmaxPartial partialStage;
-    ArgmaxFinal finalStage;
+    ArgmaxPartial partialStage {lanes};
+    ArgmaxFinal finalStage {lanes};
 
     std::optional<eacp::GPU::Buffer> partialValues;
     std::optional<eacp::GPU::Buffer> partialIndices;

@@ -24,8 +24,12 @@ namespace WSP
 //
 // The shape of this mirrors MelSpectrogram: prepare() compiles every kernel and
 // sizes every intermediate once, and encode() only records, into the compute
-// pass the caller opened. eacp orders the dispatches of a pass, so every stage
-// below reads what the stage before it wrote.
+// pass the caller opened. The recording spells its own ordering out: a
+// pass.barrier() sits at every boundary where a stage reads what the stage
+// before it wrote, which is a no-op in a serial pass and the whole ordering in
+// a concurrent one. So the caller decides which the pass is, and the only
+// dispatches without a barrier between them are the three a layer's attention
+// opens with — see encodeAttention.
 //
 // One program of each kind serves every dispatch of that kind: the shapes are
 // uniforms, so the four layers, the two convolutions and the two feed-forward
@@ -104,7 +108,9 @@ private:
 
     Unfold unfold;
     Add sum;
-    LayerNorm normalisation;
+
+    // The many-row group: every layer norm here is 1500 rows at once.
+    LayerNorm normalisation {LayerNorm::manyRowLanes};
     TiledLinear projection;
     HalfWeightTiledLinear packedProjection;
     Softmax softmax;

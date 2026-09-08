@@ -26,15 +26,26 @@ namespace WSP
 // In place because the row is never needed unnormalised: an attention's score
 // buffer becomes its probability buffer, and the encoder's 54 MB of scores are
 // written once and read twice rather than copied.
+//
+// Unlike LayerNorm's, one lane count serves both halves here, because a row
+// this long has work for every lane whichever half is asking: 256 measured
+// best over the encoder's 9000 rows of 1500 (207 us at the stock 64, 176 at
+// 256) and best again over the twelve rows the decoder's prompt step
+// normalises (9.6 us to 5.1). 512 loses at both.
 struct Softmax final : ReducingProgram
 {
-    Softmax() { compile(); }
+    static constexpr auto preferredLanes = 256;
+
+    explicit Softmax(int laneCount = preferredLanes)
+        : ReducingProgram(laneCount)
+    {
+        compile();
+    }
 
     void define() override
     {
         auto lane = localId();
         auto base = groupId() * rowLength;
-        auto tile = shared<Float>(groupWidth);
 
         auto largest = var(std::numeric_limits<float>::lowest());
         auto scanning = var(lane);
@@ -46,12 +57,7 @@ struct Softmax final : ReducingProgram
                  scanning += lanes;
              });
 
-        write(tile, lane, largest.get());
-        barrier();
-        foldMax(tile, lane);
-
-        auto rowMaximum = var(tile[0u]);
-        barrier();
+        auto rowMaximum = var(groupMax(largest.get()));
 
         auto total = var(0.f);
         auto summing = var(lane);
@@ -67,11 +73,7 @@ struct Softmax final : ReducingProgram
                  summing += lanes;
              });
 
-        write(tile, lane, total.get());
-        barrier();
-        foldSum(tile, lane);
-
-        auto normaliser = var(1.f / tile[0u]);
+        auto normaliser = var(1.f / groupSum(total.get()));
         auto scaling = var(lane);
 
         loop(scaling.get() < rowLength,

@@ -92,6 +92,9 @@ void SingleQueryAttention::encode(ComputePass& pass,
 
     partialStage.dispatchRows(pass, headCount * chunksPerHead);
 
+    // The combine folds what the partials wrote.
+    pass.barrier();
+
     combineStage.chunkMaxima = *chunkMaxima;
     combineStage.chunkSums = *chunkSums;
     combineStage.chunkRows = *chunkRows;

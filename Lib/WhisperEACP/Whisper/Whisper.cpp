@@ -4,7 +4,10 @@
 
 #include <WhisperEACP/Model/ModelIO.h>
 
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <optional>
 #include <string>
 #include <system_error>
 
@@ -16,6 +19,7 @@ using eacp::GPU::BufferUsage;
 using eacp::GPU::CommandBuffer;
 using eacp::GPU::ComputePass;
 using eacp::GPU::Device;
+using eacp::GPU::DispatchOrder;
 
 namespace
 {
@@ -51,13 +55,11 @@ bool isDirectory(const std::filesystem::path& path)
     return std::filesystem::is_directory(path, error);
 }
 
-double commitSeconds(CommandBuffer& commands)
-{
-    const auto start = std::chrono::steady_clock::now();
-    commands.commit();
-    const auto elapsed = std::chrono::steady_clock::now() - start;
+using Clock = std::chrono::steady_clock;
 
-    return std::chrono::duration<double>(elapsed).count();
+double secondsSince(Clock::time_point start)
+{
+    return std::chrono::duration<double>(Clock::now() - start).count();
 }
 } // namespace
 
@@ -315,17 +317,29 @@ void Whisper::uploadPrompt()
                            (int) sizeof(std::uint32_t) * promptIds.size());
 }
 
+// The mel and the encoder, one command buffer and one pass. The pass is
+// concurrent, which for a chain this dependent buys exactly one thing: the
+// query, key and value projections of each layer read the same normalised rows
+// and write three buffers of their own, so those three overlap. Every other
+// boundary is a barrier the recording code spells out, and a barrier in a
+// concurrent pass costs a little more than a serial pass's own ordering — so
+// this is a win only because eight of some sixty boundaries disappear. On an
+// M4 Max over the 30 s window it is 9.9 ms against 9.6 ms.
 double Whisper::encodeAudio()
 {
     auto commands = gpu->makeCommandBuffer();
 
     {
-        auto pass = commands.beginCompute();
+        auto pass = commands.beginCompute({}, DispatchOrder::Concurrent);
         frontEnd.encode(pass, *sampleBuffer, *filterBank, *melBuffer);
+        pass.barrier();
         encoder->encode(pass, *melBuffer, *encoderWeights, *encodedBuffer);
     }
 
-    return commitSeconds(commands);
+    const auto start = Clock::now();
+    commands.commit();
+
+    return secondsSince(start);
 }
 
 BufferRange Whisper::sequenceSlots(int first, int count) const
@@ -363,11 +377,14 @@ void Whisper::encodeStep(ComputePass& pass, int step)
     if (step == 0)
     {
         decoder->beginSequence(pass, *encodedBuffer, *decoderWeights);
+        pass.barrier();
+
         decoder->step(pass,
                       sequenceSlots(0, promptLength),
                       promptLength,
                       *decoderWeights,
                       *logitBuffer);
+        pass.barrier();
         encodeSampling(pass, promptLength, *firstStepMaskBuffer, promptLength);
         return;
     }
@@ -377,14 +394,17 @@ void Whisper::encodeStep(ComputePass& pass, int step)
                   1,
                   *decoderWeights,
                   *logitBuffer);
+    pass.barrier();
     encodeSampling(pass, 1, *laterStepMaskBuffer, promptLength + step);
 }
 
-TokenId Whisper::sampledToken(int step) const
+TokenId Whisper::sampledToken(CommandBuffer& commands, int step) const
 {
     auto id = std::uint32_t {};
-    sequenceTokens->read(
-        &id, (int) sizeof(id), (int) sizeof(id) * (promptTokens.size() + step));
+    commands.read(*sequenceTokens,
+                  &id,
+                  (int) sizeof(id),
+                  (int) sizeof(id) * (promptTokens.size() + step));
 
     return (TokenId) id;
 }
@@ -396,12 +416,14 @@ TokenId Whisper::endOfTextToken() const
                : vocabulary->specials().endOfText;
 }
 
-// The search is HF's greedy generate, stepsPerCommit steps at a time: a batch
-// is recorded with each step embedding the slot the one before it sampled,
-// committed, and its slots read back in order until `<|endoftext|>`, the
-// token limit, or the window's end. A step is recorded only while there is a
-// position to embed at and a token the transcript could still take, so the
-// last batch is short rather than thrown over by Decoder::step.
+// The search is HF's greedy generate, one command buffer to a step and
+// stepsInFlight of them in the air: step k + 1 is recorded and submitted before
+// the host asks the GPU for step k, so the two overlap instead of taking turns.
+// Each step's token is read out of that step's own command buffer, which waits
+// for it alone — Buffer::read waits for the newest submission, and would
+// therefore wait for the step still running — and the run ends on
+// `<|endoftext|>`, the token limit or the window's end, with only the steps
+// already in the air computed past it.
 Vector<TokenId> Whisper::transcribe(Span<const float> samples)
 {
     requirePrepared();
@@ -421,50 +443,79 @@ Vector<TokenId> Whisper::transcribe(Span<const float> samples)
     encodeSeconds = encodeAudio();
 
     const auto endOfText = endOfTextToken();
-    const auto maxPositions = decoder->shape().maxPositions;
     const auto promptLength = promptTokens.size();
+
+    // How many steps there is room for: the transcript's own limit, and the
+    // window's — step j samples into slot promptLength + j, and the sequence
+    // buffer holds one slot per position and one more.
+    const auto stepLimit = std::min(
+        maximumTokenCount, decoder->shape().maxPositions - promptLength + 1);
+
+    // A CommandBuffer is neither copyable nor movable, so the ring holds them
+    // in place. Slot j % stepsInFlight belongs to step j, and is replaced only
+    // once that step's token has been read.
+    auto inFlight = std::array<std::optional<CommandBuffer>, stepsInFlight> {};
+
+    const auto startStep = [&](int step)
+    {
+        auto& commands = inFlight[step % stepsInFlight].emplace(*gpu);
+
+        // Concurrent for the encode pass's reason and with the same
+        // arithmetic: a step is some sixty dispatches and all but a few of its
+        // boundaries are barriers, and the few that are not are each layer's
+        // three self-attention projections. Those are small — one token's row
+        // against a 384-wide weight — which is why overlapping them is worth
+        // what the barriers around them cost: 21.8 ms to 21.0 ms for the 25
+        // steps of jfk.wav, and 0.87 ms a step to 0.84 ms.
+        //
+        // The eight cross-attention projections beginSequence opens with
+        // overlap here too, and they are the largest independent set there is
+        // — 1500 encoder rows each. Giving them a concurrent pass of their own
+        // against a serial pass for the steps was measured and changed
+        // nothing: at that size a single projection already fills the device,
+        // so there is nothing for a second one to overlap with.
+        {
+            auto pass = commands.beginCompute({}, DispatchOrder::Concurrent);
+            encodeStep(pass, step);
+        }
+
+        commands.submit();
+    };
+
+    const auto decodeStart = Clock::now();
 
     auto transcript = Vector<TokenId> {};
     auto nextStep = 0;
 
-    while (true)
+    while (nextStep < stepsInFlight && nextStep < stepLimit)
     {
-        const auto firstStep = nextStep;
-        auto commands = gpu->makeCommandBuffer();
+        startStep(nextStep);
+        ++nextStep;
+    }
 
+    for (auto step = 0; step < nextStep; ++step)
+    {
+        const auto sampled = sampledToken(*inFlight[step % stepsInFlight], step);
+        ++stepCount;
+
+        if (sampled == endOfText)
+            break;
+
+        transcript.add(sampled);
+
+        // The command buffer just read is the ring slot the next step records
+        // into, and exactly one step is started per step read, so the ring
+        // refills without ever overwriting one that is still running.
+        if (nextStep < stepLimit)
         {
-            auto pass = commands.beginCompute();
-
-            for (auto recorded = 0; recorded < stepsPerCommit; ++recorded)
-            {
-                const auto position = promptLength + nextStep;
-                const auto pending = transcript.size() + recorded;
-
-                if (position > maxPositions || pending >= maximumTokenCount)
-                    break;
-
-                encodeStep(pass, nextStep);
-                ++nextStep;
-            }
-        }
-
-        if (nextStep == firstStep)
-            return transcript;
-
-        decodeSeconds += commitSeconds(commands);
-
-        for (auto step = firstStep; step < nextStep; ++step)
-        {
-            ++stepCount;
-
-            const auto sampled = sampledToken(step);
-
-            if (sampled == endOfText)
-                return transcript;
-
-            transcript.add(sampled);
+            startStep(nextStep);
+            ++nextStep;
         }
     }
+
+    decodeSeconds = secondsSince(decodeStart);
+
+    return transcript;
 }
 
 std::string Whisper::transcribeText(Span<const float> samples)

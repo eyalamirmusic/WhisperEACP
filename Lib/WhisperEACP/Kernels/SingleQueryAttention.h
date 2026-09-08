@@ -22,14 +22,22 @@ namespace WSP
 //
 // Each group of SingleQueryAttentionPartial takes one head and one chunk of
 // its keys: the lanes score their keys against the query slice held in
-// registers, the group takes the chunk's maximum and the exponentials'
-// sum in shared memory, and each lane accumulates the exponentials over its
-// keys' value rows into a partial output row, the sixty-four rows folded to
-// one. A chunk leaves its maximum, its sum and its unnormalised row behind.
+// registers, groupMax and groupSum take the chunk's maximum and the
+// exponentials' sum, and each lane accumulates the exponentials over its keys'
+// value rows into a partial output row, one such row per lane folded to one. A
+// chunk leaves its maximum, its sum and its unnormalised row behind.
 // SingleQueryAttentionCombine, a group per head, joins the chunks the way a
 // softmax split in two joins: every chunk rescaled by exp of its maximum
 // less the largest, then the rows summed and divided by the sums. That is
 // exact, and it is what lets eight groups share a head's 1500 keys.
+//
+// That fold of the value rows is per column rather than group-wide — column c
+// wants the sum over lanes of each lane's row, which is as many reductions as
+// a head is wide — so it stays a walk over the shared rows. Those rows are
+// also what holds the lane count at the stock 64: a row per lane at the widest
+// head is lanes * 64 floats of threadgroup memory, and 64 lanes already spends
+// half a Metal group's 32 kB on them, so 128 is a pipeline the backend
+// refuses.
 //
 // The query slice and each key and value row are read four channels at a
 // time, so a head is a whole number of quads wide, and the shared arrays are
@@ -41,7 +49,11 @@ struct SingleQueryAttentionPartial final : ReducingProgram
     static constexpr auto maxChunk = 256;
     static constexpr auto maxHeadWidth = 64;
 
-    SingleQueryAttentionPartial() { compile(); }
+    explicit SingleQueryAttentionPartial(int laneCount = groupWidth)
+        : ReducingProgram(laneCount)
+    {
+        compile();
+    }
 
     void define() override
     {
@@ -58,8 +70,7 @@ struct SingleQueryAttentionPartial final : ReducingProgram
         auto lastKey = min(firstKey + chunkLength, keyCount);
 
         auto scores = shared<Float>(maxChunk);
-        auto partials = shared<Float>(groupWidth * maxHeadWidth);
-        auto tile = shared<Float>(groupWidth);
+        auto partials = shared<Float>((int) lanes * maxHeadWidth);
 
         auto zero = constant(0.f);
         auto zero4 = float4(zero, zero, zero, zero);
@@ -149,12 +160,7 @@ struct SingleQueryAttentionPartial final : ReducingProgram
                  scanning += lanes;
              });
 
-        write(tile, lane, largest.get());
-        barrier();
-        foldMax(tile, lane);
-
-        auto chunkMaximum = var(tile[0u]);
-        barrier();
+        auto chunkMaximum = var(groupMax(largest.get()));
 
         auto acc0 = var(zero4);
         auto acc1 = var(zero4);
@@ -222,7 +228,7 @@ struct SingleQueryAttentionPartial final : ReducingProgram
                  applying += lanes;
              });
 
-        write(tile, lane, total.get());
+        auto chunkTotal = var(groupSum(total.get()));
 
         for (auto quad = 0u; quad < (unsigned) quads; ++quad)
         {
@@ -236,13 +242,12 @@ struct SingleQueryAttentionPartial final : ReducingProgram
         }
 
         barrier();
-        foldSum(tile, lane);
 
         ifThen(lane == 0u,
                [&]
                {
                    write(chunkMaxima, group, chunkMaximum.get());
-                   write(chunkSums, group, tile[0u]);
+                   write(chunkSums, group, chunkTotal.get());
                });
 
         ifThen(lane < headWidth,
@@ -289,7 +294,11 @@ struct SingleQueryAttentionPartial final : ReducingProgram
 // and a zero sum, and exp of that less any real maximum is zero.
 struct SingleQueryAttentionCombine final : ReducingProgram
 {
-    SingleQueryAttentionCombine() { compile(); }
+    explicit SingleQueryAttentionCombine(int laneCount = groupWidth)
+        : ReducingProgram(laneCount)
+    {
+        compile();
+    }
 
     void define() override
     {

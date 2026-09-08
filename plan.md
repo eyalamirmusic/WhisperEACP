@@ -794,9 +794,9 @@ segment after the 12 s cut loses the "And so" that preceded it.
 so a segment boundary can only sit where the block classifier guessed rather
 than at a decoded silence. The two together are the fix for the row above.
 
-**No token callback.** `transcribe()` returns when it is done; `stepsPerCommit`
-is already 4, so the hook a partial-result callback would hang off exists
-internally.
+**No token callback.** `transcribe()` returns when it is done; the decode loop
+reads a token per step as it goes (see the second performance round below), so
+the hook a partial-result callback would hang off exists internally.
 
 The policy's own numbers, measured rather than picked: the longest internal
 silent run in jfk.wav at -40 dBFS is 9 blocks — 0.9 s, the pause after "can do
@@ -805,3 +805,149 @@ hold or a -35 dB threshold splits that sentence in two. A live run over the
 whole recording is 24 model runs over 130 chunks, 0.717 s of wall clock in a
 Debug build with the last run at 0.038 s, and the committed line comes out
 byte-identical to the pinned fixture.
+
+## The second performance round
+
+Where the first round rewrote kernels, this one measured what was left and
+then filled the eacp gaps it named, to see which of them were worth the
+filling. The runtime stood at 0.033 s on jfk.wav against whisper.cpp Metal's
+0.036 s; the decoder was the gap — 22 ms against 15, 0.9 ms a step against
+0.6 — and the encoder was within 25% of it.
+
+### Where the time went
+
+A throwaway profiler (the session's `KernelProfile.cpp`, a target of four
+lines that is not in the tree) timed every kernel shape a step and an encode
+use, as 200 back-to-back dispatches in one command buffer, and then a replica
+of the whole decode step — the real 65 dispatches, distinct weights per layer,
+so the pipeline switches and the weight traffic are the real ones.
+
+| decode step kernel | per dispatch | per step |
+| --- | --- | --- |
+| `SplitLinear` 384 → 51864, the logits | 174 us | 174 |
+| `SingleQueryAttention` over 1500 keys | 22 | ×4 = 89 |
+| `SplitLinear` 384 → 384 | 3.3 | ×24 = 80 |
+| `SingleQueryAttention` over 27 keys | 12.7 | ×4 = 51 |
+| `LayerNorm` [1, 384] | 3.9 | ×13 = 51 |
+| `SplitLinear` 1536 → 384 | 8.3 | ×4 = 33 |
+| `SplitLinear` 384 → 1536 | 3.5 | ×4 = 14 |
+| `Argmax`, `Embed` | 5.4, 1.2 | 7 |
+| **sum of the parts** | | **493 us** |
+| **the step as recorded** | | **697 us** |
+
+The parts sum to 493 us and the chain costs 697: **the marginal cost of a
+dispatch in the real chain is about 5.5 us**, against 1.7 us for the same
+trivial kernel dispatched back to back, and 65 of them are over half the
+step. Two ablations of the replica agree — fusing q/k/v took 8 dispatches
+and 45 us out, dropping the layernorms took 13 and 71 us — and the key count
+of the self-attention does not matter at all (27 keys 697 us, 200 keys 702),
+so that kernel is pure latency. An F16 token embedding took the logits row
+from 174 to 90 us, 64 us off the step.
+
+The encoder's 8.6 ms of layer kernels: attention apply 432 us, scores 346,
+softmax 207, fc2 404, fc1 321, the four 384-wide projections 104 each, over
+four layers; the products run at 4.0 to 5.5 TFLOPS against about 14 of FP32
+peak. Two things that do not help it, measured: F16 weights in the encoder
+products (105/330/404 us against 104/320/405 — they are not weight-bandwidth
+bound), and any wider block per thread at a 64-thread group (8×4, 4×8 and 8×8
+are all slower than 4×4; 8×8 twice as slow).
+
+### The eacp round
+
+Branch `whisper-performance-gaps` in eacp, from `develop` at `03893c1`, four
+changes each written by an agent in a worktree of its own and folded onto the
+branch — 37 files, the whole tree building and 1761 tests passing. WhisperEACP
+builds against it with `-DCPM_eacp_SOURCE=$HOME/Code/eacp` until it is on
+`develop`.
+
+| change | what it is | what eacp measured |
+| --- | --- | --- |
+| `CommandBuffer::submit()`, `wait()`, `isComplete()`, `read()` | a submission with nothing to settle, a wait scoped to that command buffer rather than to the newest one, and a read that trusts it; `GpuTimestamps::maxTimedPasses` 16 → 128 | a 100-step dependency chain of one small kernel, `commit` and read each step against record-ahead, `wait(k-1)`, `read(k-1)`: **0.100 → 0.044 ms a step** |
+| `DispatchOrder::Concurrent` on `beginCompute`, `ComputePass::barrier()` | `MTLDispatchTypeConcurrent`, a null UAV barrier on D3D12, a compute-to-compute pipeline barrier on Vulkan; the serial pass now promises its dispatches are ordered | 64 tiny dispatches: serial 2.80 us each, concurrent with no barrier 1.82, **concurrent with a barrier after every dispatch 3.46 — worse than serial** |
+| `groupSum`, `groupMax`, `groupMin` in the EDSL | `simd_*` plus a cross-simdgroup fold on Metal, an emitted shared-memory tree on HLSL (FXC at `cs_5_0` has no wave ops) and GLSL | a layernorm-shaped kernel over one 384-float row: 3.2 → 2.5 us |
+| `ComputeProgram({256})`, `({16, 16})` — a per-program threadgroup shape | flows builder → graph → `ShaderSource` → pipeline → dispatch, the stock 64 / 8×8 / 4×4×4 unchanged for a kernel that names none | a group-per-row sum over 1500-float rows: 256 lanes **1.74× slower** than 64 at 1500 rows (bandwidth-bound already), ~1.4× faster under ~100 rows |
+
+The two backends that cannot run here are written by symmetry against each
+file's existing calls and are unbuilt; the first Windows and Linux CI runs
+are what checks them.
+
+### What each bought the runtime
+
+Each adaptation was an agent in a WhisperEACP worktree built against the
+branch, measured on the benchmark before and after, and kept only if it won.
+
+**The pipelined loop** (`Whisper::transcribe`): one step per command buffer,
+`stepsInFlight = 2`, each recorded and submitted before the token of the step
+before it is read with `CommandBuffer::read`, so the loop stops at
+`<|endoftext|>` with one step in the air rather than up to three computed
+past it, and the GPU never idles across a commit. **0.033 → 0.029 s; decode
+22 → 19 ms; 0.9 → 0.7 ms a step.** Three and four in flight measured no
+better. Recording the prompt step behind the encoder's submit rather than
+after its wait was tried and not kept: recording a step is 0.046 ms of host
+time, so the overlap is worth at most that.
+
+**The reductions** (`Reduce.h` and everything on it): every hand fold became
+the intrinsic, and the lane count became a constructor argument measured per
+kernel at the shapes it is dispatched at.
+
+| kernel | tree at 64 | `group*` at 64 | chosen | at the chosen count |
+| --- | --- | --- | --- | --- |
+| `LayerNorm` [1, 384], the decoder's | 4.56 us | 3.81 | 192 | 3.14 |
+| `LayerNorm` [1500, 384], the encoder's | 9.98 | 9.15 | 64 | 9.15 |
+| `Softmax` [9000, 1500] | 206 | 205 | 256 | 176 |
+| `Softmax` [12, 1500], the prompt's | 10.7 | 9.6 | 256 | 5.1 |
+| `Argmax` over 51864 | 6.36 | 5.31 | 64 | 5.31 |
+| `SingleQueryAttention`, 1500 / 27 keys | 23.4 / 13.9 | 22.7 / 13.1 | 64 | 128 lanes needs 34 KB of shared memory and Metal refuses the pipeline at 32 |
+| `MaxReduceKernel`, 240000 cells | 17.0 | 15.6 | 512 | 10.5 — two rounds instead of three |
+
+**0.033 → 0.031 s; 0.9 → 0.8 ms a step**; the encoder's 135 us of wins are
+under the benchmark's resolution.
+
+**The tiled product at a wider group: nothing.** `TiledMatMul` at 16×16 with
+a 64×64 tile and the same 4×4 block is 5 to 23% slower on every encoder
+shape (fc1 334 → 404 us, scores 365 → 466); 16×8 and 8×16 are within noise of
+8×8; every rectangular group is 30 to 40% worse; a deeper slab wins fc2 and
+loses conv1, the STFT and the scores. A control instantiation of the
+parameterised kernel at 8×8 reproduced the shipping numbers, so the sweep
+measured the shape. The reason: a bigger tile cuts global traffic, and the
+product is served from cache already (fc1 moves 230 MB in 334 us); the
+shared-read-to-FMA ratio is set by the register block, which the group shape
+cannot change; and a 64×64 tile barriers eight simdgroups instead of two,
+twice a slab. Left in the tree as it was. Two things the sweep found on the
+way, unshipped: the A slab stored transposed so a thread's four rows are one
+`float4` read is 2 to 5% on nearly every shape, and the store fold evaluates
+both sides of its `select`s — `exactGelu` for all sixteen outputs with `gelu`
+off, and a global read of `output` with `residual` off, 54 MB of dead reads
+on the scores product — which an `ifThen` on the uniform is worth 7% on conv2.
+
+**The concurrent pass, which was expected to lose and did not.** The
+recording code now declares its own ordering — a `pass.barrier()` at every
+boundary where a dispatch reads what the one before it wrote, in the mel
+front-end, both halves of the model and the two-stage kernels, a no-op in a
+serial pass — and both passes open `DispatchOrder::Concurrent`, so the only
+dispatches left to overlap are a layer's three self-attention projections
+and `beginSequence`'s eight cross projections. Measured at four decimals over
+eleven interleaved rounds against a serial build: the encode pass concurrent
+is 3% off the encode, the decode pass concurrent 3% off the decode and the
+step (0.861 → 0.839 ms) — the eight boundaries a step loses pay for the
+fifty-seven barriers that remain — and giving the eight cross projections a
+concurrent pass of their own changes nothing, since a single 1500-row
+projection already fills the device. Together **about 2% of the run.** The
+per-layer tests open serial passes of their own, so a missing barrier would
+show as a wrong transcript rather than as a layer mismatch that bisects.
+
+**Together: 0.033 → 0.026 s** on jfk.wav, whisper.cpp Metal at 0.037 in the
+same runs; encode 0.010 s, decode 17 ms, 0.7 ms a step, the transcript
+unchanged and 264 tests green.
+
+### What is still on the table
+
+In this tree, from the profile above, in order of measured value: the F16
+token embedding (64 us a step, and 80 MB → 40 MB resident), the layernorms
+folded into the projections they feed (71 us), a joined q/k/v tensor from the
+loader (45 us), a one-dispatch self-attention for a short cache (the
+two-stage form is 13 us of latency for 27 keys), and the two `TiledMatMul`
+findings above. In eacp, what the round did not attempt: `simdgroup_matrix`
+and its cousins, which is how ggml reaches the throughput this product cannot
+at 4 to 5 TFLOPS, and a movable `CommandBuffer`, so a pipelined loop's ring
+need not be a row of `std::optional`s.

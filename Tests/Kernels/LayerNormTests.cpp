@@ -208,3 +208,44 @@ auto tLayerNormOneProgramTwoWidths =
     for (auto i = 0; i < wideResult.size(); ++i)
         check(isClose(wideResult[i], wideExpected[i], 1e-4));
 };
+
+// The group the decoder gives this — wider than the stock one, and wider than
+// some of the rows it is asked to normalise here, so the lanes past the row
+// contribute nothing to the mean but still have to reach the reduction. The
+// answer is the same scalar reference the stock group is held to; a lane count
+// that changed it would be a fold that only some threads arrived at.
+auto tLayerNormInAWideGroup = test("Kernels/layerNormInAWideGroup") = []
+{
+    auto& device = Device::shared();
+
+    if (!device.isValid())
+        return;
+
+    constexpr auto modelWidth = 384;
+
+    for (const auto length: {rowLength, modelWidth})
+    {
+        auto input = rowsWithDifferentStatistics(rowCount, length);
+        auto weight = spreadValues(length, 33u, 1.5f);
+        auto bias = spreadValues(length, 44u, 0.75f);
+
+        auto inputBuffer = storageOf(input);
+        auto weightBuffer = storageOf(weight);
+        auto biasBuffer = storageOf(bias);
+        auto output = outputFor(rowCount * length);
+
+        auto kernel = LayerNorm {LayerNorm::singleRowLanes};
+        kernel.input = inputBuffer;
+        kernel.weight = weightBuffer;
+        kernel.bias = biasBuffer;
+        kernel.output = output;
+        kernel.rowLength = (unsigned) length;
+
+        auto result = runGroupPerRow(kernel, output, rowCount, rowCount * length);
+        auto expected = layerNormReference(
+            input, weight, bias, rowCount, length, LayerNorm::whisperEpsilon);
+
+        for (auto i = 0; i < result.size(); ++i)
+            check(isClose(result[i], expected[i], 1e-4));
+    }
+};

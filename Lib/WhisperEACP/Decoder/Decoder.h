@@ -28,11 +28,17 @@ namespace WSP
 //
 // The shape of this is the Encoder's: prepare() compiles every kernel and sizes
 // every intermediate once, and the two recording calls only record, into the
-// one compute pass the caller opened. eacp orders the dispatches of a pass —
-// Metal's serial encoder, a UAV barrier after each on D3D12 — so every stage
-// below reads what the stage before it wrote, and the KV cache is read in the
-// same pass that appended to it. A step used to open a pass per dispatch,
-// and at a few microseconds of GPU each its ninety passes were half of it.
+// one compute pass the caller opened. A step used to open a pass per dispatch,
+// and at a few microseconds of GPU each its ninety passes were half of it; the
+// KV cache is now read in the same pass that appended to it.
+//
+// The ordering inside that pass is spelled out here rather than assumed: a
+// pass.barrier() sits at every boundary where a stage reads what the stage
+// before it wrote, which costs nothing in a serial pass and is the whole
+// ordering in a concurrent one. Three places have no barrier because they need
+// none — a layer's three self-attention projections, and the eight
+// cross-attention projections beginSequence opens with, both of which read one
+// buffer and write buffers of their own.
 //
 // One program of each kind serves every dispatch of that kind: the shapes are
 // uniforms, so the layers, the two attentions and the two feed-forward widths
@@ -160,7 +166,10 @@ private:
     int decodedPositions = 0;
 
     Embed embedding;
-    LayerNorm normalisation;
+
+    // The one-row group: every layer norm a step takes is a single row of 384,
+    // and the prompt step's is two.
+    LayerNorm normalisation {LayerNorm::singleRowLanes};
     TiledLinear projection;
     HalfWeightTiledLinear packedProjection;
     SplitLinear splitProjection;

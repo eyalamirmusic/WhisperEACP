@@ -19,7 +19,7 @@ constexpr int floatBytes(int elementCount)
 
 constexpr int groupsFor(int elementCount)
 {
-    constexpr auto width = MaxReduceKernel::groupWidth;
+    constexpr auto width = MaxReduceKernel::lanes;
     return elementCount <= 0 ? 1 : (elementCount + width - 1) / width;
 }
 } // namespace
@@ -87,7 +87,9 @@ void MelSpectrogram::prepare()
 
 // Frames, transform, power: the windowed frames gathered into rows, one
 // tiled product of them against the basis, and each bin squared out of its
-// real and imaginary parts.
+// real and imaginary parts. Each stage reads what the one before it wrote, so
+// each boundary is a barrier — one that costs nothing in a serial pass and is
+// the whole ordering in a concurrent one.
 void MelSpectrogram::encodeSpectrum(ComputePass& pass, const Buffer& samples)
 {
     framing.samples = samples;
@@ -99,6 +101,8 @@ void MelSpectrogram::encodeSpectrum(ComputePass& pass, const Buffer& samples)
 
     pass.dispatch(framing, melShape.fftLength, melShape.frameCount);
 
+    pass.barrier();
+
     transform.a = *frames;
     transform.b = *basis;
     transform.bias = *zeroBias;
@@ -108,6 +112,8 @@ void MelSpectrogram::encodeSpectrum(ComputePass& pass, const Buffer& samples)
                        TiledMatMulShape::forLinear(melShape.frameCount,
                                                    melShape.fftLength,
                                                    2 * melShape.binCount()));
+
+    pass.barrier();
 
     squaring.spectrum = *spectrum;
     squaring.power = *power;
@@ -130,24 +136,31 @@ void MelSpectrogram::encodeProjection(ComputePass& pass, const Buffer& filterBan
 // Rounds of a tree reduction, ping-ponging between the two partial buffers
 // until one value is left. Each round is its own dispatch: threads of a
 // dispatch are ordered against each other by the end of that dispatch and
-// nothing else.
+// nothing else. A round folds what the round before it wrote, so every round
+// after the first opens with a barrier; the first is ordered by the caller.
 const Buffer& MelSpectrogram::encodePeak(ComputePass& pass)
 {
     const auto* source = &logMel.value();
     auto remaining = melShape.melElementCount();
     auto intoPartials = true;
+    auto isFirstRound = true;
 
     while (remaining > 1)
     {
+        if (!isFirstRound)
+            pass.barrier();
+
+        isFirstRound = false;
+
         const auto groups = groupsFor(remaining);
         auto& target = intoPartials ? partials.value() : partialsOfPartials.value();
 
         reduction.values = *source;
         reduction.partials = target;
         reduction.count = (std::uint32_t) remaining;
-        reduction.stride = (std::uint32_t) (groups * MaxReduceKernel::groupWidth);
+        reduction.stride = (std::uint32_t) (groups * MaxReduceKernel::lanes);
 
-        pass.dispatch(reduction, groups * MaxReduceKernel::groupWidth);
+        pass.dispatch(reduction, groups * MaxReduceKernel::lanes);
 
         source = &target;
         remaining = groups;
@@ -163,9 +176,16 @@ void MelSpectrogram::encode(ComputePass& pass,
                             const Buffer& output)
 {
     encodeSpectrum(pass, samples);
+
+    pass.barrier();
+
     encodeProjection(pass, filterBank);
 
+    pass.barrier();
+
     const auto& peak = encodePeak(pass);
+
+    pass.barrier();
 
     normalisation.values = *logMel;
     normalisation.peak = peak;

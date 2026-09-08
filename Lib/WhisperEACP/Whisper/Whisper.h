@@ -22,21 +22,20 @@ namespace WSP
 // rather than inside `Decoder`, and the two masks below are the whole of that
 // config.
 //
-// A run is three phases, and they are three phases because of where the host
-// has to see a number:
+// A run is two phases:
 //
-//   1. one command buffer for the upload, the mel and the encoder, committed;
-//   2. one for `beginSequence` and the prompt step, ending in the argmax that
-//      picks the first sampled token;
-//   3. one command buffer per token after it.
+//   1. one command buffer for the upload, the mel and the encoder;
+//   2. one command buffer per decoder step — the first opening the sequence and
+//      decoding the prompt, every one after it embedding the token the step
+//      before sampled — with stepsInFlight of them in the air at a time.
 //
-// Phase 3 cannot be batched. The token a step samples is the token the next
-// step embeds, so the index has to come back to the host between them —
-// `commit()` blocks until the buffer is done, and `Buffer::read` is only valid
-// once it has. A decoder that could sample on the GPU and feed its own next
-// step would collapse the whole loop into one command buffer; nothing in eacp's
-// compute layer expresses that today (no indirect dispatch off a sampled index,
-// and no integer buffer a kernel could write a token into for `Embed` to read).
+// The token a step samples never reaches the host before the next step needs
+// it: `Argmax` writes it into a slot of the sequence buffer and the next step's
+// `Embed` reads that same slot on the device, so a step is recorded and
+// submitted without the host knowing what the one before it sampled. A slot is
+// read back for the stop condition alone, and `CommandBuffer::read` waits for
+// that one step rather than for the newest submission, so step k's token is
+// read while step k + 1 is already running.
 //
 // **The suppression rule, and where the two references differ.** Matched to
 // HuggingFace's greedy `generate`, since that is what every other stage here is
@@ -180,28 +179,33 @@ public:
 
     std::string textForTokens(Span<const TokenId> tokens) const;
 
-    // Wall clock around the commits of the last run, which is the only clock
+    // Wall clock around the last run's two halves, which is the only clock
     // available: eacp's FrameTimer is driven by Frame and a CommandBuffer has no
     // timestamp hook, so an off-screen compute pass is timed from the host.
+    //
+    // The encode is its own command buffer end to end, its commit. The decode
+    // is the first step's submit to the read of the last token, and stops at
+    // that read rather than waiting for the steps still in the air behind it —
+    // so the two hold the run between them and neither counts the other.
     double lastEncodeSeconds() const { return encodeSeconds; }
     double lastDecodeSeconds() const { return decodeSeconds; }
 
     // How many decoder steps the last run consumed, which is one for the
     // prompt and one per token after it — one more than the transcript holds
     // when the run ended on `<|endoftext|>`, since that token was sampled and
-    // then dropped. Steps are committed stepsPerCommit at a time, each
-    // embedding the token the one before it sampled on the device, so a run
-    // may have computed a few steps past the one it ended on; those are not
-    // counted, though the clock above includes them.
+    // then dropped. A step is counted when its token is read, so the steps
+    // still in the air when a run ends are not: they were computed past the
+    // end and never looked at, and the clock above stops at the last read
+    // rather than waiting for them.
     int lastStepCount() const { return stepCount; }
 
-    // How many steps go into one command buffer. A commit is a fixed cost —
-    // the submission, the wait and the wake — of a fifth of a step's work,
-    // and the GPU idles between one commit and the next; four steps a commit
-    // pays it a quarter as often and keeps the GPU fed, at the price of up to
-    // three steps computed past the end of a transcript, which a transcript
-    // of any length pays once.
-    static constexpr int stepsPerCommit = 4;
+    // How many decoder steps are in the air at a time. Each is a command buffer
+    // of its own, recorded and submitted before the host waits on the step
+    // before it, so the GPU takes the next one up the moment it finishes
+    // instead of idling across a commit; the price is that the last
+    // stepsInFlight - 1 steps of a run are computed past its end, which a
+    // transcript of any length pays once.
+    static constexpr int stepsInFlight = 2;
 
 private:
     void requireLoaded() const;
@@ -231,7 +235,10 @@ private:
                         int slot);
 
     eacp::GPU::BufferRange sequenceSlots(int first, int count) const;
-    TokenId sampledToken(int step) const;
+
+    // The token step j sampled, out of the command buffer that sampled it:
+    // that one waited for, and nothing submitted behind it.
+    TokenId sampledToken(eacp::GPU::CommandBuffer& commands, int step) const;
 
     TokenId endOfTextToken() const;
 

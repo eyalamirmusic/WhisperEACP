@@ -74,8 +74,8 @@ The rows:
 | `transcribe, median` / `best` | wall clock around the whole call, samples in to tokens out. The one number that is defined the same way on every side |
 | `x real time, 30 s window` | the window's length over the median. Every encoder here does the work of a full window whatever the clip's length, so the window is the honest denominator; an 11 s clip does not transcribe three times faster than a 30 s one |
 | `encode, median` | ours: the upload, the mel and the encoder, which are one command buffer. whisper.cpp: its encoder alone, since `whisper_get_timings` does not expose its mel. Read this row knowing it |
-| `decode, median` | the prompt pass and every token after it, on both sides |
-| `decode per step, median` | that over `steps`, which counts one for the prompt and one per sampled token on both sides |
+| `decode, median` | the prompt pass and every token after it, on both sides. Ours is the pipelined loop end to end — the first step's submit to the read of the last token — and stops at that read rather than waiting for the one step still in the air behind it |
+| `decode per step, median` | that over `steps`, which counts one for the prompt and one per sampled token on both sides. A step is counted when its token is read, so the step a run leaves running past its end is in neither number |
 
 whisper.cpp reports its stages as per-call averages without the call counts,
 so its decode total is put back from the shape of a temperature-0 greedy run:
@@ -106,6 +106,6 @@ same boundaries.
   model is the one the build fetches; another WAV is an argument.
 
 - **Kernel-level cost.** The step's GPU time is a chain of some sixty small
-  kernels run one after another; `plan.md`'s performance round says which
+  kernels run one after another; `plan.md`'s performance rounds say which
   ones and what each costs. Per-kernel numbers come from eacp's labelled
-  passes, sixteen to a command buffer, not from this table.
+  passes, 128 to a command buffer, not from this table.

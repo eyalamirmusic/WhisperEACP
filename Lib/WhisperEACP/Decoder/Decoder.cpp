@@ -338,10 +338,14 @@ void Decoder::encodeAttentionOverCache(ComputePass& pass,
 
     pass.dispatch(scores, keyCount, scoreRows);
 
+    pass.barrier();
+
     softmax.values = scoreBuffer;
     softmax.rowLength = (std::uint32_t) keyCount;
 
     softmax.dispatchRows(pass, scoreRows);
+
+    pass.barrier();
 
     attention.probabilities = scoreBuffer;
     attention.values = values;
@@ -395,6 +399,11 @@ void Decoder::encodeSelfAttention(ComputePass& pass,
                  width,
                  tokenCount);
 
+    // The three projections above read the same normalised rows and write three
+    // buffers nothing else has touched — the queries and this step's rows of the
+    // two caches — so they are free to overlap. The attention reads all three.
+    pass.barrier();
+
     encodeAttentionOverCache(pass,
                              selfKeyCache[layerIndex],
                              selfValueCache[layerIndex],
@@ -422,6 +431,8 @@ void Decoder::encodeCrossAttention(ComputePass& pass,
                  width,
                  width,
                  tokenCount);
+
+    pass.barrier();
 
     encodeAttentionOverCache(pass,
                              crossKeys[layerIndex],
@@ -451,7 +462,11 @@ void Decoder::encodeLayer(ComputePass& pass,
                     *normalised,
                     tokenCount);
 
+    pass.barrier();
+
     encodeSelfAttention(pass, weights, layerIndex, tokenCount);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *attended,
@@ -464,6 +479,8 @@ void Decoder::encodeLayer(ComputePass& pass,
                  false,
                  true);
 
+    pass.barrier();
+
     encodeLayerNorm(pass,
                     *hidden,
                     weights.crossAttentionNormWeight,
@@ -471,7 +488,11 @@ void Decoder::encodeLayer(ComputePass& pass,
                     *normalised,
                     tokenCount);
 
+    pass.barrier();
+
     encodeCrossAttention(pass, weights, layerIndex, tokenCount);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *attended,
@@ -484,12 +505,16 @@ void Decoder::encodeLayer(ComputePass& pass,
                  false,
                  true);
 
+    pass.barrier();
+
     encodeLayerNorm(pass,
                     *hidden,
                     weights.finalNormWeight,
                     weights.finalNormBias,
                     *normalised,
                     tokenCount);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *normalised,
@@ -501,6 +526,8 @@ void Decoder::encodeLayer(ComputePass& pass,
                  tokenCount,
                  true,
                  false);
+
+    pass.barrier();
 
     encodeLinear(pass,
                  *feedForward,
@@ -518,6 +545,11 @@ void Decoder::encodeLayer(ComputePass& pass,
 // once out of the encoder's rows. k_proj has no bias in either attention — that
 // is PyTorch's own bias=False on those two Linears — so it binds the zero
 // buffer where v_proj binds the model's.
+//
+// All eight projections read the encoder's output and write eight buffers of
+// their own, so nothing here is ordered against anything else here and there is
+// no barrier between them. What reads them is the cross-attention of a step,
+// which the caller orders.
 void Decoder::beginSequence(ComputePass& pass,
                             const Buffer& encoderOutput,
                             const DecoderWeights& weights)
@@ -584,7 +616,12 @@ void Decoder::step(ComputePass& pass,
     pass.dispatch(embedding, decoderShape.width, tokenCount);
 
     for (auto index = 0; index < decoderShape.layers; ++index)
+    {
+        pass.barrier();
         encodeLayer(pass, weights.layers[index], index, tokenCount);
+    }
+
+    pass.barrier();
 
     encodeLayerNorm(pass,
                     *hidden,
@@ -592,6 +629,8 @@ void Decoder::step(ComputePass& pass,
                     weights.finalNormBias,
                     *normalisedRows,
                     tokenCount);
+
+    pass.barrier();
 
     // The logits projection is embed_tokens itself — there is no proj_out in a
     // Whisper safetensors file, and no bias either, so the zero buffer this

@@ -19,7 +19,7 @@ constexpr auto elementsPerThread = 8;
 
 int Argmax::groupsPerRow(int rowLength)
 {
-    const auto perGroup = ComputeProgram::groupWidth * elementsPerThread;
+    const auto perGroup = Argmax::lanes * elementsPerThread;
     return std::max(1, (rowLength + perGroup - 1) / perGroup);
 }
 
@@ -67,6 +67,9 @@ void Argmax::encode(ComputePass& pass,
     partialStage.groupsPerRow = (std::uint32_t) groups;
 
     partialStage.dispatchRows(pass, rowCount * groups);
+
+    // The second stage scans the candidates the first one wrote.
+    pass.barrier();
 
     finalStage.partialValues = *partialValues;
     finalStage.partialIndices = *partialIndices;
