@@ -86,7 +86,7 @@ auto tLayerNormMatchesCpu = test("Kernels/layerNormMatchesCpu") = []
     kernel.output = output;
     kernel.rowLength = (unsigned) rowLength;
 
-    auto result = runOverRows(kernel, output, rowCount, rowCount * rowLength);
+    auto result = runGroupPerRow(kernel, output, rowCount, rowCount * rowLength);
 
     auto expected = layerNormReference(
         input, weight, bias, rowCount, rowLength, LayerNorm::whisperEpsilon);
@@ -127,7 +127,7 @@ auto tLayerNormConstantRowYieldsBias =
     kernel.output = output;
     kernel.rowLength = (unsigned) flatRowLength;
 
-    auto result = runOverRows(kernel, output, 1, flatRowLength);
+    auto result = runGroupPerRow(kernel, output, 1, flatRowLength);
 
     for (auto i = 0; i < flatRowLength; ++i)
         check(isClose(result[i], bias[i], 1e-5));
@@ -135,7 +135,8 @@ auto tLayerNormConstantRowYieldsBias =
 
 // The property the encoder rests on: one compiled pipeline, re-pointed at other
 // buffers and told a different row length. A kernel that had baked the width in
-// gets the second dispatch wrong.
+// gets the second dispatch wrong. The wide row is longer than a group and not
+// a multiple of one, so the lanes' strided shares are ragged.
 auto tLayerNormOneProgramTwoWidths =
     test("Kernels/layerNormOneProgramTwoWidths") = []
 {
@@ -145,7 +146,7 @@ auto tLayerNormOneProgramTwoWidths =
         return;
 
     constexpr auto narrowLength = 13;
-    constexpr auto wideLength = 64;
+    constexpr auto wideLength = 200;
 
     auto narrow = rowsWithDifferentStatistics(rowCount, narrowLength);
     auto wide = rowsWithDifferentStatistics(rowCount, wideLength);
@@ -176,14 +177,14 @@ auto tLayerNormOneProgramTwoWidths =
         kernel.bias = narrowBiasBuffer;
         kernel.output = narrowOutput;
         kernel.rowLength = (unsigned) narrowLength;
-        pass.dispatch(kernel, rowCount);
+        kernel.dispatchRows(pass, rowCount);
 
         kernel.input = wideInput;
         kernel.weight = wideWeightBuffer;
         kernel.bias = wideBiasBuffer;
         kernel.output = wideOutput;
         kernel.rowLength = (unsigned) wideLength;
-        pass.dispatch(kernel, rowCount);
+        kernel.dispatchRows(pass, rowCount);
     }
 
     commands.commit();

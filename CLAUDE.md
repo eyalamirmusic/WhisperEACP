@@ -168,9 +168,11 @@ rather than `eacp-core`, since every layer above it holds GPU buffers.
 Those constants are the model's, not choices; they are pinned by value in
 `Tests/Audio` the way a wire format would be.
 
-**Kernels/** — layernorm, GELU, softmax and matmul as `ComputeProgram`
-subclasses, shapes as uniforms so the encoder and decoder can be written out of
-them.
+**Kernels/** — layernorm, GELU, softmax, the tiled matrix product and the
+rest as `ComputeProgram` subclasses, shapes as uniforms so the encoder and
+decoder can be written out of them. Row-wise kernels give a group to a row
+(`Reduce.h`); products are `TiledMatMul` for many rows and `SplitLinear` for a
+step's few; a decode step's attention is `SingleQueryAttention`.
 
 **Mel/** — the front-end: Hann, a reflect-padded STFT, the 80 x 201 filterbank,
 log10 and Whisper's clamp-and-scale.

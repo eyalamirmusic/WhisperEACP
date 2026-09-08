@@ -105,7 +105,7 @@ same boundaries.
 - **Anything but `tiny.en`** and, by default, anything but `jfk.wav`. The
   model is the one the build fetches; another WAV is an argument.
 
-- **Kernel-level cost.** Every kernel of ours is still the per-thread version
-  the scalar references were written against, and the decoder pays a host
-  round trip per token. This table is the baseline those two things are
-  measured against, not a result.
+- **Kernel-level cost.** The step's GPU time is a chain of some sixty small
+  kernels run one after another; `plan.md`'s performance round says which
+  ones and what each costs. Per-kernel numbers come from eacp's labelled
+  passes, sixteen to a command buffer, not from this table.

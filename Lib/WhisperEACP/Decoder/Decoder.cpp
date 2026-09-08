@@ -1,5 +1,6 @@
 #include "Decoder.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <string>
 
@@ -8,7 +9,7 @@ namespace WSP
 using eacp::GPU::Buffer;
 using eacp::GPU::BufferRange;
 using eacp::GPU::BufferUsage;
-using eacp::GPU::CommandBuffer;
+using eacp::GPU::ComputePass;
 using eacp::GPU::Device;
 
 namespace
@@ -47,20 +48,48 @@ void allocatePerLayer(Vector<Buffer>& buffers,
         buffers.emplace_back(allocate(device, elementCount));
 }
 
-// The two Linear programs differ only in how they read the weight, so the bind
-// is written once against whichever of them the caller picked. The target is a
-// range rather than a buffer because one of its call sites writes into the
-// middle of a KV cache.
+// The Linear programs differ in how they read the weight and in how they
+// spread the work, so the bind is written once against whichever of them the
+// caller picked. The target is a range rather than a buffer because one of its
+// call sites writes into the middle of a KV cache.
 template <WeightStorage weightStorage>
-void dispatchLinear(LinearProgram<weightStorage>& program,
-                    CommandBuffer& commands,
+void dispatchLinear(
+    TiledMatMulProgram<OperandLayout::ContiguousK, weightStorage>& program,
+    ComputePass& pass,
+    const Buffer& input,
+    const Buffer& weight,
+    const Buffer& bias,
+    const BufferRange& target,
+    int innerCount,
+    int outputWidth,
+    int rowCount,
+    bool gelu,
+    bool residual)
+{
+    program.a = input;
+    program.b = weight;
+    program.bias = bias;
+    program.output = target;
+
+    auto shape = TiledMatMulShape::forLinear(rowCount, innerCount, outputWidth);
+    shape.gelu = gelu;
+    shape.residual = residual;
+
+    program.dispatch(pass, shape);
+}
+
+template <WeightStorage weightStorage>
+void dispatchLinear(SplitLinearProgram<weightStorage>& program,
+                    ComputePass& pass,
                     const Buffer& input,
                     const Buffer& weight,
                     const Buffer& bias,
                     const BufferRange& target,
                     int innerCount,
                     int outputWidth,
-                    int rowCount)
+                    int rowCount,
+                    bool gelu,
+                    bool residual)
 {
     program.input = input;
     program.weights = weight;
@@ -68,10 +97,17 @@ void dispatchLinear(LinearProgram<weightStorage>& program,
     program.output = target;
     program.innerCount = (std::uint32_t) innerCount;
     program.outputWidth = (std::uint32_t) outputWidth;
+    program.rowCount = (std::uint32_t) rowCount;
+    program.gelu = gelu ? 1u : 0u;
+    program.residual = residual ? 1u : 0u;
 
-    auto pass = commands.beginCompute();
-    pass.dispatch(program, outputWidth, rowCount);
+    program.dispatch(pass, outputWidth, rowCount);
 }
+
+// Up to how many rows a projection splits its inner sum across a group rather
+// than tiling the product. A step is one row and a prompt a few; the
+// cross-attention projections over the encoder's 1500 are the other kind.
+constexpr auto splitRowLimit = 16;
 } // namespace
 
 Decoder::Decoder(const DecoderShape& shapeToUse)
@@ -83,44 +119,42 @@ Decoder::Decoder(const DecoderShape& shapeToUse)
 // than for the step in hand, so a prompt of several tokens and a single token
 // after it are the same buffers at different dispatch heights.
 //
-// The two score pairs are what that costs, and they are the only allocations
+// The two score buffers are what that costs, and they are the only allocations
 // here worth a number: [heads, maxPositions, keys] floats each, which for
-// tiny.en's 6 heads and 448 target positions is 4.8 MB apiece against the cache
-// and 16 MB apiece against a full 1500-row encoder output — 42 MB for the four,
-// beside 5.5 MB of self-attention cache and 18 MB of cross-attention keys and
-// values over the four layers.
+// tiny.en's 6 heads and 448 target positions is 4.8 MB against the cache and
+// 16 MB against a full 1500-row encoder output — the softmax normalises them
+// in place, so there is no second pair — beside 5.5 MB of self-attention
+// cache and 18 MB of cross-attention keys and values over the four layers.
 void Decoder::prepare(Device& device)
 {
     embedding.prepare(device);
-    activation.prepare(device);
-    sum.prepare(device);
     normalisation.prepare(device);
     projection.prepare(device);
     packedProjection.prepare(device);
+    splitProjection.prepare(device);
+    packedSplitProjection.prepare(device);
     scores.prepare(device);
     softmax.prepare(device);
     attention.prepare(device);
+    singleQueryAttention.prepare(
+        device,
+        decoderShape.heads,
+        decoderShape.headWidth(),
+        std::max(decoderShape.crossPositions, decoderShape.maxPositions));
 
     const auto stepElements = decoderShape.stepElementCount();
 
     hidden.emplace(allocate(device, stepElements));
-    afterSelfAttention.emplace(allocate(device, stepElements));
-    afterCrossAttention.emplace(allocate(device, stepElements));
     normalised.emplace(allocate(device, stepElements));
     queries.emplace(allocate(device, stepElements));
     attended.emplace(allocate(device, stepElements));
-    attentionOutput.emplace(allocate(device, stepElements));
-    feedForwardOutput.emplace(allocate(device, stepElements));
     normalisedRows.emplace(allocate(device, stepElements));
 
     selfScores.emplace(allocate(device, decoderShape.selfScoreElementCount()));
-    selfWeights.emplace(allocate(device, decoderShape.selfScoreElementCount()));
     crossScores.emplace(allocate(device, decoderShape.crossScoreElementCount()));
-    crossWeights.emplace(allocate(device, decoderShape.crossScoreElementCount()));
 
-    const auto feedForwardElements = decoderShape.stepFeedForwardElementCount();
-    feedForward.emplace(allocate(device, feedForwardElements));
-    activatedFeedForward.emplace(allocate(device, feedForwardElements));
+    feedForward.emplace(
+        allocate(device, decoderShape.stepFeedForwardElementCount()));
 
     const auto layers = decoderShape.layers;
     allocatePerLayer(selfKeyCache, device, layers, decoderShape.cacheElementCount());
@@ -147,33 +181,7 @@ void Decoder::requireMatchingWeights(const DecoderWeights& weights) const
                           "shape than this decoder was built for"};
 }
 
-void Decoder::encodeGelu(CommandBuffer& commands,
-                         const Buffer& input,
-                         const Buffer& target,
-                         int elementCount)
-{
-    activation.input = input;
-    activation.output = target;
-
-    auto pass = commands.beginCompute();
-    pass.dispatch(activation, elementCount);
-}
-
-void Decoder::encodeSum(CommandBuffer& commands,
-                        const Buffer& left,
-                        const Buffer& right,
-                        const Buffer& target,
-                        int elementCount)
-{
-    sum.a = left;
-    sum.b = right;
-    sum.output = target;
-
-    auto pass = commands.beginCompute();
-    pass.dispatch(sum, elementCount);
-}
-
-void Decoder::encodeLayerNorm(CommandBuffer& commands,
+void Decoder::encodeLayerNorm(ComputePass& pass,
                               const Buffer& input,
                               const TensorBuffer& weight,
                               const TensorBuffer& bias,
@@ -186,44 +194,77 @@ void Decoder::encodeLayerNorm(CommandBuffer& commands,
     normalisation.output = target;
     normalisation.rowLength = (std::uint32_t) decoderShape.width;
 
-    auto pass = commands.beginCompute();
-    pass.dispatch(normalisation, rowCount);
+    normalisation.dispatchRows(pass, rowCount);
 }
 
 // The one place a weight's storage decides anything: a tensor the loader left
 // packed goes to the program that reads packed halves, and one it uploaded as
 // floats to the program that subscripts floats. Neither can read the other's
 // buffer, which is why the choice is made from the buffer rather than from a
-// build-time switch.
-void Decoder::encodeLinear(CommandBuffer& commands,
+// build-time switch. The row count decides the other axis: a step's few rows
+// take the split form, and the sequence's opening projection over every
+// encoder row the tiled one.
+void Decoder::encodeLinear(ComputePass& pass,
                            const Buffer& input,
                            const TensorBuffer& weight,
                            const Buffer& bias,
                            const BufferRange& target,
                            int innerCount,
                            int outputWidth,
-                           int rowCount)
+                           int rowCount,
+                           bool gelu,
+                           bool residual)
 {
-    if (weight.isPackedHalf())
-        dispatchLinear(packedProjection,
-                       commands,
+    const auto fewRows = rowCount <= splitRowLimit;
+
+    if (weight.isPackedHalf() && fewRows)
+        dispatchLinear(packedSplitProjection,
+                       pass,
                        input,
                        weight.buffer,
                        bias,
                        target,
                        innerCount,
                        outputWidth,
-                       rowCount);
+                       rowCount,
+                       gelu,
+                       residual);
+    else if (weight.isPackedHalf())
+        dispatchLinear(packedProjection,
+                       pass,
+                       input,
+                       weight.buffer,
+                       bias,
+                       target,
+                       innerCount,
+                       outputWidth,
+                       rowCount,
+                       gelu,
+                       residual);
+    else if (fewRows)
+        dispatchLinear(splitProjection,
+                       pass,
+                       input,
+                       weight.buffer,
+                       bias,
+                       target,
+                       innerCount,
+                       outputWidth,
+                       rowCount,
+                       gelu,
+                       residual);
     else
         dispatchLinear(projection,
-                       commands,
+                       pass,
                        input,
                        weight.buffer,
                        bias,
                        target,
                        innerCount,
                        outputWidth,
-                       rowCount);
+                       rowCount,
+                       gelu,
+                       residual);
 }
 
 // Appending to the cache is a bind, not a copy: the key and value projections
@@ -253,11 +294,17 @@ BufferRange Decoder::cacheRowsAt(const Buffer& cache, int tokenCount) const
 // whichever keys and values the caller cached. The queries are already
 // projected into *queries; what comes out is [queryCount, width] in *attended,
 // the concatenation of the heads the output projection is a plain matmul over.
-void Decoder::encodeAttentionOverCache(CommandBuffer& commands,
+// The softmax normalises the scores where they lie, so the buffer the first
+// dispatch writes is the one the third reads.
+//
+// A single query, which is every step after the prompt, takes the fused
+// pair instead: the keys split across groups and joined, the scores never
+// leaving shared memory. The query stands at the last position there, so the
+// causal mask masks nothing and the kernels have none.
+void Decoder::encodeAttentionOverCache(ComputePass& pass,
                                        const Buffer& keys,
                                        const Buffer& values,
-                                       const Buffer& scoreTarget,
-                                       const Buffer& weightTarget,
+                                       const Buffer& scoreBuffer,
                                        int queryCount,
                                        int keyCount,
                                        bool causal)
@@ -265,9 +312,23 @@ void Decoder::encodeAttentionOverCache(CommandBuffer& commands,
     const auto width = decoderShape.width;
     const auto scoreRows = decoderShape.scoreRowCount(queryCount);
 
+    if (queryCount == 1)
+    {
+        singleQueryAttention.encode(pass,
+                                    *queries,
+                                    keys,
+                                    values,
+                                    *attended,
+                                    width,
+                                    decoderShape.headWidth(),
+                                    keyCount,
+                                    decoderShape.attentionScale());
+        return;
+    }
+
     scores.queries = *queries;
     scores.keys = keys;
-    scores.scores = scoreTarget;
+    scores.scores = scoreBuffer;
     scores.modelWidth = (std::uint32_t) width;
     scores.headWidth = (std::uint32_t) decoderShape.headWidth();
     scores.queryCount = (std::uint32_t) queryCount;
@@ -275,21 +336,14 @@ void Decoder::encodeAttentionOverCache(CommandBuffer& commands,
     scores.causal = causal ? 1u : 0u;
     scores.scale = decoderShape.attentionScale();
 
-    {
-        auto pass = commands.beginCompute();
-        pass.dispatch(scores, keyCount, scoreRows);
-    }
+    pass.dispatch(scores, keyCount, scoreRows);
 
-    softmax.input = scoreTarget;
-    softmax.output = weightTarget;
+    softmax.values = scoreBuffer;
     softmax.rowLength = (std::uint32_t) keyCount;
 
-    {
-        auto pass = commands.beginCompute();
-        pass.dispatch(softmax, scoreRows);
-    }
+    softmax.dispatchRows(pass, scoreRows);
 
-    attention.probabilities = weightTarget;
+    attention.probabilities = scoreBuffer;
     attention.values = values;
     attention.output = *attended;
     attention.modelWidth = (std::uint32_t) width;
@@ -297,10 +351,7 @@ void Decoder::encodeAttentionOverCache(CommandBuffer& commands,
     attention.queryCount = (std::uint32_t) queryCount;
     attention.keyCount = (std::uint32_t) keyCount;
 
-    {
-        auto pass = commands.beginCompute();
-        pass.dispatch(attention, width, queryCount);
-    }
+    attention.dispatch(pass, width, queryCount);
 }
 
 // Self-attention over the sequence so far: the queries are this step's, the
@@ -309,7 +360,7 @@ void Decoder::encodeAttentionOverCache(CommandBuffer& commands,
 // — which is exactly where this step's rows landed in the cache — so a prompt
 // decoded in one call is masked the way the same tokens fed one at a time
 // would be.
-void Decoder::encodeSelfAttention(CommandBuffer& commands,
+void Decoder::encodeSelfAttention(ComputePass& pass,
                                   const DecoderLayerWeights& weights,
                                   int layerIndex,
                                   int tokenCount)
@@ -317,7 +368,7 @@ void Decoder::encodeSelfAttention(CommandBuffer& commands,
     const auto width = decoderShape.width;
     const auto keyCount = decodedPositions + tokenCount;
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalised,
                  weights.selfQueryWeight,
                  weights.selfQueryBias.buffer,
@@ -326,7 +377,7 @@ void Decoder::encodeSelfAttention(CommandBuffer& commands,
                  width,
                  tokenCount);
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalised,
                  weights.selfKeyWeight,
                  *zeroBias,
@@ -335,7 +386,7 @@ void Decoder::encodeSelfAttention(CommandBuffer& commands,
                  width,
                  tokenCount);
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalised,
                  weights.selfValueWeight,
                  weights.selfValueBias.buffer,
@@ -344,11 +395,10 @@ void Decoder::encodeSelfAttention(CommandBuffer& commands,
                  width,
                  tokenCount);
 
-    encodeAttentionOverCache(commands,
+    encodeAttentionOverCache(pass,
                              selfKeyCache[layerIndex],
                              selfValueCache[layerIndex],
                              *selfScores,
-                             *selfWeights,
                              tokenCount,
                              keyCount,
                              true);
@@ -357,14 +407,14 @@ void Decoder::encodeSelfAttention(CommandBuffer& commands,
 // Cross-attention against the encoder's rows: only the queries are projected
 // here, since the keys and values were projected once when the sequence opened.
 // Nothing is masked — every token attends to the whole utterance.
-void Decoder::encodeCrossAttention(CommandBuffer& commands,
+void Decoder::encodeCrossAttention(ComputePass& pass,
                                    const DecoderLayerWeights& weights,
                                    int layerIndex,
                                    int tokenCount)
 {
     const auto width = decoderShape.width;
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalised,
                  weights.crossQueryWeight,
                  weights.crossQueryBias.buffer,
@@ -373,11 +423,10 @@ void Decoder::encodeCrossAttention(CommandBuffer& commands,
                  width,
                  tokenCount);
 
-    encodeAttentionOverCache(commands,
+    encodeAttentionOverCache(pass,
                              crossKeys[layerIndex],
                              crossValues[layerIndex],
                              *crossScores,
-                             *crossWeights,
                              tokenCount,
                              decoderShape.crossPositions,
                              false);
@@ -385,99 +434,91 @@ void Decoder::encodeCrossAttention(CommandBuffer& commands,
 
 // Pre-norm, which is what Whisper is: each of the three sublayers normalises
 // what it reads and adds what it computed to what it was given, so the residual
-// is the unnormalised input. The three buffers take turns holding the stream
-// rather than one being read and written by the same dispatch, and the layer
-// ends where it started so the next one needs to know nothing about the order.
-void Decoder::encodeLayer(CommandBuffer& commands,
+// is the unnormalised input. The stream is one buffer, added to in place by
+// each sublayer's last projection, so the layer ends where it started and the
+// next one needs to know nothing about the order.
+void Decoder::encodeLayer(ComputePass& pass,
                           const DecoderLayerWeights& weights,
                           int layerIndex,
                           int tokenCount)
 {
     const auto width = decoderShape.width;
-    const auto elements = tokenCount * width;
 
-    encodeLayerNorm(commands,
+    encodeLayerNorm(pass,
                     *hidden,
                     weights.selfAttentionNormWeight,
                     weights.selfAttentionNormBias,
                     *normalised,
                     tokenCount);
 
-    encodeSelfAttention(commands, weights, layerIndex, tokenCount);
+    encodeSelfAttention(pass, weights, layerIndex, tokenCount);
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *attended,
                  weights.selfAttentionOutputWeight,
                  weights.selfAttentionOutputBias.buffer,
-                 BufferRange::of(*attentionOutput),
+                 BufferRange::of(*hidden),
                  width,
                  width,
-                 tokenCount);
+                 tokenCount,
+                 false,
+                 true);
 
-    encodeSum(commands, *hidden, *attentionOutput, *afterSelfAttention, elements);
-
-    encodeLayerNorm(commands,
-                    *afterSelfAttention,
+    encodeLayerNorm(pass,
+                    *hidden,
                     weights.crossAttentionNormWeight,
                     weights.crossAttentionNormBias,
                     *normalised,
                     tokenCount);
 
-    encodeCrossAttention(commands, weights, layerIndex, tokenCount);
+    encodeCrossAttention(pass, weights, layerIndex, tokenCount);
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *attended,
                  weights.crossAttentionOutputWeight,
                  weights.crossAttentionOutputBias.buffer,
-                 BufferRange::of(*attentionOutput),
+                 BufferRange::of(*hidden),
                  width,
                  width,
-                 tokenCount);
+                 tokenCount,
+                 false,
+                 true);
 
-    encodeSum(commands,
-              *afterSelfAttention,
-              *attentionOutput,
-              *afterCrossAttention,
-              elements);
-
-    encodeLayerNorm(commands,
-                    *afterCrossAttention,
+    encodeLayerNorm(pass,
+                    *hidden,
                     weights.finalNormWeight,
                     weights.finalNormBias,
                     *normalised,
                     tokenCount);
 
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalised,
                  weights.feedForwardWeight,
                  weights.feedForwardBias.buffer,
                  BufferRange::of(*feedForward),
                  width,
                  decoderShape.feedForwardWidth,
-                 tokenCount);
+                 tokenCount,
+                 true,
+                 false);
 
-    encodeGelu(commands,
-               *feedForward,
-               *activatedFeedForward,
-               tokenCount * decoderShape.feedForwardWidth);
-
-    encodeLinear(commands,
-                 *activatedFeedForward,
+    encodeLinear(pass,
+                 *feedForward,
                  weights.feedForwardOutputWeight,
                  weights.feedForwardOutputBias.buffer,
-                 BufferRange::of(*feedForwardOutput),
+                 BufferRange::of(*hidden),
                  decoderShape.feedForwardWidth,
                  width,
-                 tokenCount);
-
-    encodeSum(commands, *afterCrossAttention, *feedForwardOutput, *hidden, elements);
+                 tokenCount,
+                 false,
+                 true);
 }
 
 // The keys and values every step of this sequence will attend to, projected
 // once out of the encoder's rows. k_proj has no bias in either attention — that
 // is PyTorch's own bias=False on those two Linears — so it binds the zero
 // buffer where v_proj binds the model's.
-void Decoder::beginSequence(CommandBuffer& commands,
+void Decoder::beginSequence(ComputePass& pass,
                             const Buffer& encoderOutput,
                             const DecoderWeights& weights)
 {
@@ -490,7 +531,7 @@ void Decoder::beginSequence(CommandBuffer& commands,
     {
         const auto& layer = weights.layers[index];
 
-        encodeLinear(commands,
+        encodeLinear(pass,
                      encoderOutput,
                      layer.crossKeyWeight,
                      *zeroBias,
@@ -499,7 +540,7 @@ void Decoder::beginSequence(CommandBuffer& commands,
                      width,
                      rows);
 
-        encodeLinear(commands,
+        encodeLinear(pass,
                      encoderOutput,
                      layer.crossValueWeight,
                      layer.crossValueBias.buffer,
@@ -512,8 +553,8 @@ void Decoder::beginSequence(CommandBuffer& commands,
     decodedPositions = 0;
 }
 
-void Decoder::step(CommandBuffer& commands,
-                   const Buffer& tokens,
+void Decoder::step(ComputePass& pass,
+                   const BufferRange& tokens,
                    int tokenCount,
                    const DecoderWeights& weights,
                    const Buffer& logits)
@@ -540,15 +581,12 @@ void Decoder::step(CommandBuffer& commands,
     embedding.width = (std::uint32_t) decoderShape.width;
     embedding.firstPosition = (std::uint32_t) decodedPositions;
 
-    {
-        auto pass = commands.beginCompute();
-        pass.dispatch(embedding, decoderShape.width, tokenCount);
-    }
+    pass.dispatch(embedding, decoderShape.width, tokenCount);
 
     for (auto index = 0; index < decoderShape.layers; ++index)
-        encodeLayer(commands, weights.layers[index], index, tokenCount);
+        encodeLayer(pass, weights.layers[index], index, tokenCount);
 
-    encodeLayerNorm(commands,
+    encodeLayerNorm(pass,
                     *hidden,
                     weights.finalNormWeight,
                     weights.finalNormBias,
@@ -559,7 +597,7 @@ void Decoder::step(CommandBuffer& commands,
     // Whisper safetensors file, and no bias either, so the zero buffer this
     // binds is the vocabulary-wide one rather than the width-wide one k_proj
     // takes.
-    encodeLinear(commands,
+    encodeLinear(pass,
                  *normalisedRows,
                  weights.tokenEmbedding,
                  *zeroLogitBias,

@@ -11,6 +11,7 @@
 #include <WhisperEACP/Audio/Audio.h>
 #include <WhisperEACP/Core/Core.h>
 
+#include "Basis.h"
 #include "MelKernels.h"
 #include "MelShape.h"
 #include "MelSpectrogram.h"

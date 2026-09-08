@@ -1,12 +1,13 @@
 #include "MelSpectrogram.h"
 
+#include "Basis.h"
 #include "Window.h"
 
 namespace WSP
 {
 using eacp::GPU::Buffer;
 using eacp::GPU::BufferUsage;
-using eacp::GPU::CommandBuffer;
+using eacp::GPU::ComputePass;
 using eacp::GPU::Device;
 
 namespace
@@ -30,7 +31,9 @@ MelSpectrogram::MelSpectrogram(const MelShape& shapeToUse)
 
 void MelSpectrogram::prepare(Device& device)
 {
-    spectrum.prepare(device);
+    framing.prepare(device);
+    transform.prepare(device);
+    squaring.prepare(device);
     projection.prepare(device);
     reduction.prepare(device);
     normalisation.prepare(device);
@@ -38,6 +41,28 @@ void MelSpectrogram::prepare(Device& device)
     const auto hann = periodicHannWindow(melShape.fftLength);
     window.emplace(
         device, hann.data(), floatBytes(melShape.fftLength), BufferUsage::Storage);
+
+    const auto complexBins = 2 * melShape.binCount();
+    const auto dft = dftBasis(melShape.fftLength);
+    basis.emplace(device, dft.data(), floatBytes(dft.size()), BufferUsage::Storage);
+
+    auto zeroes = Vector<float>(complexBins);
+
+    for (auto index = 0; index < complexBins; ++index)
+        zeroes[index] = 0.f;
+
+    zeroBias.emplace(
+        device, zeroes.data(), floatBytes(complexBins), BufferUsage::Storage);
+
+    frames.emplace(device,
+                   nullptr,
+                   floatBytes(melShape.frameCount * melShape.fftLength),
+                   BufferUsage::Storage);
+
+    spectrum.emplace(device,
+                     nullptr,
+                     floatBytes(melShape.frameCount * complexBins),
+                     BufferUsage::Storage);
 
     power.emplace(device,
                   nullptr,
@@ -60,22 +85,38 @@ void MelSpectrogram::prepare()
     prepare(Device::shared());
 }
 
-void MelSpectrogram::encodeSpectrum(CommandBuffer& commands, const Buffer& samples)
+// Frames, transform, power: the windowed frames gathered into rows, one
+// tiled product of them against the basis, and each bin squared out of its
+// real and imaginary parts.
+void MelSpectrogram::encodeSpectrum(ComputePass& pass, const Buffer& samples)
 {
-    spectrum.samples = samples;
-    spectrum.window = *window;
-    spectrum.power = *power;
-    spectrum.sampleCount = melShape.sampleCount;
-    spectrum.fftLength = melShape.fftLength;
-    spectrum.hopLength = melShape.hopLength;
-    spectrum.binCount = (std::uint32_t) melShape.binCount();
+    framing.samples = samples;
+    framing.window = *window;
+    framing.frames = *frames;
+    framing.sampleCount = melShape.sampleCount;
+    framing.fftLength = melShape.fftLength;
+    framing.hopLength = melShape.hopLength;
 
-    auto pass = commands.beginCompute();
-    pass.dispatch(spectrum, melShape.binCount(), melShape.frameCount);
+    pass.dispatch(framing, melShape.fftLength, melShape.frameCount);
+
+    transform.a = *frames;
+    transform.b = *basis;
+    transform.bias = *zeroBias;
+    transform.output = *spectrum;
+
+    transform.dispatch(pass,
+                       TiledMatMulShape::forLinear(melShape.frameCount,
+                                                   melShape.fftLength,
+                                                   2 * melShape.binCount()));
+
+    squaring.spectrum = *spectrum;
+    squaring.power = *power;
+    squaring.binCount = (std::uint32_t) melShape.binCount();
+
+    pass.dispatch(squaring, melShape.binCount(), melShape.frameCount);
 }
 
-void MelSpectrogram::encodeProjection(CommandBuffer& commands,
-                                      const Buffer& filterBank)
+void MelSpectrogram::encodeProjection(ComputePass& pass, const Buffer& filterBank)
 {
     projection.power = *power;
     projection.filters = filterBank;
@@ -83,14 +124,14 @@ void MelSpectrogram::encodeProjection(CommandBuffer& commands,
     projection.binCount = (std::uint32_t) melShape.binCount();
     projection.frameCount = (std::uint32_t) melShape.frameCount;
 
-    auto pass = commands.beginCompute();
     pass.dispatch(projection, melShape.frameCount, melShape.melCount);
 }
 
 // Rounds of a tree reduction, ping-ponging between the two partial buffers
-// until one value is left. Each round is its own pass: threads of a dispatch
-// are ordered against each other by the end of that dispatch and nothing else.
-const Buffer& MelSpectrogram::encodePeak(CommandBuffer& commands)
+// until one value is left. Each round is its own dispatch: threads of a
+// dispatch are ordered against each other by the end of that dispatch and
+// nothing else.
+const Buffer& MelSpectrogram::encodePeak(ComputePass& pass)
 {
     const auto* source = &logMel.value();
     auto remaining = melShape.melElementCount();
@@ -106,10 +147,7 @@ const Buffer& MelSpectrogram::encodePeak(CommandBuffer& commands)
         reduction.count = (std::uint32_t) remaining;
         reduction.stride = (std::uint32_t) (groups * MaxReduceKernel::groupWidth);
 
-        {
-            auto pass = commands.beginCompute();
-            pass.dispatch(reduction, groups * MaxReduceKernel::groupWidth);
-        }
+        pass.dispatch(reduction, groups * MaxReduceKernel::groupWidth);
 
         source = &target;
         remaining = groups;
@@ -119,21 +157,20 @@ const Buffer& MelSpectrogram::encodePeak(CommandBuffer& commands)
     return *source;
 }
 
-void MelSpectrogram::encode(CommandBuffer& commands,
+void MelSpectrogram::encode(ComputePass& pass,
                             const Buffer& samples,
                             const Buffer& filterBank,
                             const Buffer& output)
 {
-    encodeSpectrum(commands, samples);
-    encodeProjection(commands, filterBank);
+    encodeSpectrum(pass, samples);
+    encodeProjection(pass, filterBank);
 
-    const auto& peak = encodePeak(commands);
+    const auto& peak = encodePeak(pass);
 
     normalisation.values = *logMel;
     normalisation.peak = peak;
     normalisation.normalised = output;
 
-    auto pass = commands.beginCompute();
     pass.dispatch(normalisation, melShape.melElementCount());
 }
 } // namespace WSP

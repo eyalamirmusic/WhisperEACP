@@ -153,10 +153,10 @@ references:
 | the same with fp16 projections | 5e-6 | 2.5e-7 |
 | tiny.en's real weights over 64 frames (32 positions, all 4 layers) | 1e-4 | 1.8e-5 |
 
-in the mixed measure `|a - e| / (1 + |e|)`. The full 30 s window gives
-1500 x 384 finite values in about 60 ms of GPU time on this machine — wall
-clock around `commit()` from a Debug host build, which is the only clock
-available (below) — from the naive per-thread kernels with no tiling.
+in the mixed measure `|a - e| / (1 + |e|)`. The full 30 s window gave
+1500 x 384 finite values in about 60 ms of GPU time on this machine from the
+naive per-thread kernels with no tiling; the tiled kernels of the performance
+round below do it in about 7 ms, mel excluded.
 
 ### `Decoder/` — `whisper-decoder`, `Tests/Decoder`
 
@@ -195,10 +195,10 @@ pick is asserted against the reference's in every one of them, which puts it at
 the real 51864-wide row.
 
 A single-token step at the shape it is really run at — 1500 encoder rows, four
-layers, the full vocabulary — is about 9 ms of wall clock around `commit()`
-(4.6 to 13.7 over repeated runs from a Debug host build, which is the only clock
-available), after about 5 ms to project the cross-attention keys and values for
-the whole sequence. Naive per-thread kernels with no tiling, as everywhere else.
+layers, the full vocabulary — was about 9 ms of wall clock around `commit()`
+from the naive per-thread kernels, after about 5 ms to project the
+cross-attention keys and values for the whole sequence. It is 0.9 ms after
+the performance round below.
 
 Mutation-checked rather than trusted green: running cross-attention first,
 projecting k and v from the unnormalised hidden state, binding the cache one row
@@ -234,11 +234,14 @@ to off, so a default whisper.cpp run suppresses less than a default HF one.
 Its per-segment cap of 220 tokens is a chunking policy and is not adopted; the
 cap here is HF's 448 positions.
 
-Each decode step is its own committed command buffer, because the sampled id
-has to reach the host before the next `Embed` can read it: eacp has no integer
-input buffer and `write()` takes a `UInt` only into an `AtomicBuffer`, so no
-kernel can hand a token to the next step on the device. That is the whole of
-the per-step cost below.
+Each decode step was its own committed command buffer, because the sampled
+id had to reach the host before the next `Embed` could read it: eacp had no
+integer input buffer then. It has one now, and the sequence lives in one uint
+buffer on the device — the prompt uploaded into its first slots, every slot
+after them written by one step's `Argmax` and read by the next step's `Embed`
+through ranged binds — so steps go four to a command buffer and the host
+reads a slot back only to learn whether the run is over. The numbers below
+are from before that.
 
 On `jfk.wav`, tiny.en produces 24 tokens:
 
@@ -583,21 +586,19 @@ the mel, the logits and the transcript. What is above it now:
   leaves unmasked start to matter, and the `<|startofprev|>` prompt carries the
   previous window's text across.
 - **Streaming through MakeASound.** `Audio/` captures; nothing feeds the
-  capture into a window yet. The encoder is 60 ms and a step 14 ms, so a
-  window re-decoded as it fills is affordable, but the step's host round trip
-  is the thing to remove first: a device-side token buffer between steps is
-  exactly the integer buffer eacp does not have (the gaps table).
+  capture into a window yet. The encoder is 10 ms and a step under 1 ms, so a
+  window re-decoded as it fills is affordable.
 - **Multilingual prompts.** The language and task tokens between
   `<|startoftranscript|>` and `<|notimestamps|>`, and language detection from
   the first step's logits over the language ids. `SpecialTokens` already names
   them; `Whisper` does not emit them.
 - **Resampling** in the WAV reader and the capture path, since 16 kHz mono is
   the model's contract and not the microphone's.
-- **Kernels.** Every kernel is still the naive per-thread version the scalar
-  references were written against. Tiling the two matmul shapes is where the
-  time is.
+- **Kernels.** What the performance round below left: the decode step is a
+  chain of some sixty small kernels whose latencies add up, and the fix for
+  that is concurrency in eacp's compute pass rather than another kernel here.
 
-### Where it stands against whisper.cpp
+### Where it stood against whisper.cpp
 
 `Benchmark/` is the baseline the kernel work is measured against: our runtime
 and whisper.cpp v1.9.3 in one Release process, on the same 480000 samples,
@@ -619,20 +620,97 @@ Apple M4 Max, `tiny.en`, `jfk.wav` zero-filled to the window:
 | decode, median, 25 steps | 0.345 s | 0.016 s | 0.021 s |
 | decode per step | 13.8 ms | 0.6 ms | 0.8 ms |
 
-Two readings. The encoder is six times whisper.cpp's on the same GPU, and
-that gap is the naive kernels: the two matmul shapes are the whole of it. The
-decoder is twenty times, and a Release build moved the step from the 14 ms the
-Debug tests recorded to 13.8 ms — so the step is not host code but the GPU
-side of the loop: four layers of kernels dispatched over a single token, the
-51864 x 384 vocabulary projection read in full every step, and a commit and a
-readback between one token and the next. The device-side token buffer in the
-gaps table is what removes the round trip; the per-step kernel cost is the
-same tiling work as the encoder's.
+Two readings, at the time. The encoder was six times whisper.cpp's on the
+same GPU, and that gap was the naive kernels: the two matmul shapes were the
+whole of it. The decoder was twenty times, and a Release build moved the step
+from the 14 ms the Debug tests recorded to 13.8 ms — so the step was not host
+code but the GPU side of the loop. What each turned out to be is the section
+after next.
 
 `Benchmark/backends.py` runs mlx-whisper, faster-whisper and openai-whisper on
 the same protocol for the runtimes that cannot be in the process. Written
 against their documented APIs and not yet exercised: none of the three is
 installed on this machine.
+
+### The performance round
+
+The same benchmark, the same machine, after the kernels were rewritten for
+speed. Every kernel keeps agreeing with the scalar references, the
+double-precision encoder and decoder references and whisper.cpp's logits and
+transcript — 248 tests — and every change was measured on the way in with
+eacp's labelled passes, which time the GPU per pass.
+
+| | WhisperEACP | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- |
+| transcribe, median | 0.032 s | 0.037 s | 0.103 s |
+| x real time, over the 30 s window | 932 | 822 | 292 |
+| encode, median | 0.010 s (mel + encoder) | 0.008 s (encoder only) | 0.073 s |
+| decode, median, 25 steps | 0.022 s | 0.015 s | 0.015 s |
+| decode per step | 0.9 ms | 0.6 ms | 0.6 ms |
+
+The first profile of a decode step said where the 9.4 ms went, and it was
+not where the previous section guessed: 3.9 ms in `Argmax`, one thread
+walking 51864 logits; 1.5 ms in four softmaxes over 1500 keys, one thread per
+row; 1.6 ms in four attention applies, one thread per column walking 1500
+keys; 0.9 ms in thirteen layernorms over a single row; 1.4 ms in thirty-three
+matrix-vector products, one thread per output walking 384 or 1536 inputs. The
+vocabulary projection, 80 MB of F32 read once, was 0.2 ms and already at the
+bandwidth. Every one of those is a loop whose depth is the cost, and the
+whole of the encoder's 46 ms was the same shape: a thread per output of a
+1500-row product.
+
+What changed, in the order it was measured:
+
+| change | what it is | effect |
+| --- | --- | --- |
+| `Reduce.h`: group-per-row `Softmax`, `LayerNorm`, two-stage `Argmax` | 64 lanes walk a row's strided shares and fold in shared memory; the argmax spreads a row over ~100 groups and folds (value, index) pairs, lowest index on ties, into a `UIntOutputBuffer` | step 9.9 to 1.2 ms with the two rows below |
+| `SplitLinear` | a step's matrix-vector products with the inner sum split eight ways across a group, `read4` along the weight row | in the row above |
+| split-key `AttentionApply` | the same split over the keys | in the row above |
+| `TiledMatMul` | 32 x 32 tiles of C per group, a 4 x 4 block per thread in registers, 16-deep slabs of A and B in shared memory; strides and a batch fold so a head's slice of an activation is an operand; `forLinear`, `forAttentionScores` (scaled, causally masked on the store) and `forAttentionApply` name the three products; fp16 weights through the same template | encoder 46 to 13 ms; 3.8 TFLOPS on a 384-wide projection, 5.2 on fc1 |
+| gelu and residual folded into the stores of `SplitLinear` and `TiledMatMul` | the stages either side of every projection, gone as dispatches | 16 fewer dispatches a step, 5 a layer |
+| `Unfold` + `TiledMatMul` for both convolutions | PyTorch's unfold, the input addressed by two strides so the band-major mel and the frame-major activation are the same kernel; the weight in its file layout is the B operand | conv2 2.3 to 0.3 ms |
+| `StftFramesKernel` + `TiledMatMul` against `Mel/Basis.h` | the windowed, reflect-padded frames as rows, the DFT as a [402, 400] matrix computed once, the power squared out of the pairs | STFT 3.4 to 0.5 ms; encoder 13 to 10 ms |
+| `SingleQueryAttention` | a decode step's attention as a partial and a combine: eight groups per head over chunks of the keys, each with the query slice in registers, a chunk maximum, an exponential sum and an unnormalised row; the combine rescales the chunks by exp of their maxima less the largest, which is exact | step 1.0 to 0.9 ms; a single group per head was 1.6 ms, latency again |
+| the sequence on the device, four steps a commit | `Embed` reads a `UIntInputBuffer`, `Argmax` writes a `UIntOutputBuffer`, both ranges of one buffer of slots | commit latency off the critical path; up to three steps computed past the end |
+| one compute pass per step and per encode | every recording call takes the `ComputePass` the caller opened | no measurable change — the cost was never the pass boundary |
+
+Three measurements that decided things. First, the per-dispatch GPU cost:
+a trivial 64-element kernel dispatched a thousand times in one pass is
+1.6 us a dispatch, and about 1 us a pass, so a step's sixty-odd dispatches
+cost 0.1 ms of overhead and the rest of its 0.8 ms of GPU time is the kernels
+themselves — small kernels whose few microseconds each are their latency,
+serialised. Second, the step's host side: encoding the dispatches is 0.03 ms,
+the commit and the wait around 0.2 ms over the GPU's own time and sometimes
+0.5 ms more when the GPU had idled, which is what batching the steps was for.
+Third, an eacp semantic that cost an afternoon: a buffer read handle names
+the element, not the value, and re-materialises after a store to its slot —
+the in-place softmax computed `exp(exp(x - max) - max)` for its sum until the
+exponential was held in a `var`. It is documented in eacp's README under "In
+place" and is what makes in-place scaling read what was stored; it is stated
+in `Softmax.h` so the next kernel does not rediscover it.
+
+Not done, and why: a concatenated q/k/v projection would drop eight dispatches
+a step but needs the loader to build a joined tensor; folding the layernorm
+into the projections that consume it would drop thirteen and is worth about
+50 us; and F16 for the token embedding would halve the 80 MB the vocabulary
+projection reads every step, which is a numerical decision about a model
+that ships F32.
+
+### What the performance round surfaced in eacp
+
+Against eacp `develop` at `209e735`, which this project fetches. The step's
+remaining 0.3 ms over whisper.cpp is the first row; none of these is worked
+around here.
+
+| finding | where, and what it means |
+| --- | --- |
+| a compute pass is serial | `ComputePass` dispatches run one after another: Metal's serial encoder, and a UAV barrier after every dispatch on D3D12 (`ComputePass-Windows.cpp:162`). ggml-metal encodes with `MTLDispatchTypeConcurrent` and a memory barrier only where a node depends on the one before, so its independent nodes — a layer's q, k and v projections, the two attentions' out projections — overlap and their launch latencies hide behind each other. A concurrent pass with an explicit `barrier()` the recording code calls between dependent stages is the missing piece, and it is what the decoder's chain of sixty small kernels needs |
+| `Buffer::read` waits for every submission | `Buffer-Apple.mm:77`: "waiting for the newest submission waits for every" one before it, and there is no `CommandBuffer::wait()`. So a step's token cannot be read while the next step is in flight — the read would wait for both — and the CPU cannot encode step k + 1 while the GPU runs step k. A per-command-buffer wait, and a read that trusts the caller to have waited, would pipeline the loop; batching the steps is the workaround that is not one, since it is what keeps the GPU fed either way |
+| dispatches within a pass are ordered, and the README does not say so | the README says "let a pass end before beginning the one that reads what it wrote", and both backends in fact order the dispatches of one pass (the serial encoder; the barrier after each). Everything here now records a step or an encode into one pass on that behaviour, which should be a promise |
+| a read handle re-materialises after a store to its slot | documented under "In place", and by design; but an expression built on the read and used after the store is recomputed from the stored value, silently. Worth a sentence beside the rule: hold what a store must not change in a `var` |
+| sixteen labelled passes per command buffer | `GpuTimestamps::maxTimedPasses = 16`: a step is one pass now, and was ninety, so per-kernel profiling here labels one block of sixteen per run and takes six runs. A per-dispatch timestamp, or a larger cap, is what a profile of a real net wants |
+| the group shape is fixed | 64 in 1D, 8 x 8 in 2D, 4 x 4 x 4 in 3D. `TiledMatMul` is written to an 8 x 8 group with a 4 x 4 block per thread and gets 4 to 5 TFLOPS; a 16 x 16 group with the same block would halve the shared-memory traffic per FLOP, and a 1D group of 256 would give the reductions eight elements a lane over a 1500-key row instead of twenty-four. A per-program group size is the knob |
+| no SIMD-group reductions | `simd_sum`, `simd_max` and their kin exist in MSL and as wave intrinsics in HLSL SM6, and are what ggml's matrix-vector kernels reduce with; the EDSL has none, and FXC at `cs_5_0` has none to emit, so every reduction here is shared memory and six barriers |
 
 Two things ours surfaced on the way, recorded here rather than in the
 dependency tables: `SafeTensors::makeBuffer` and `PreprocessorConfig`'s

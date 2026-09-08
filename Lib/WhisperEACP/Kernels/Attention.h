@@ -131,35 +131,69 @@ struct AttentionScores final : ComputeProgram
 // [queryCount, W] — the concatenation of the heads, which is what the output
 // projection is a plain matmul over.
 //
-// One thread per (h * D + c, i) over a 2D grid: dispatch(kernel, W,
-// queryCount). The head is recovered from the column rather than passed in,
-// since h * D + c divided by D is h whatever c is, and c itself is never
-// needed as a number: the column indexes V and the output directly.
+// The sum over the keys is split eight ways across a group, for SplitLinear's
+// reason: a decode step has one query against 1500 keys, and a thread per
+// output walking all of them serially was 0.4 ms a layer. The grid is
+// [W, queryCount * 8] — position.y is the query and its eighth of the keys —
+// so a group is eight columns by the eight shares of one query, which the
+// fold in shared memory adds up before the one store. Adjacent threads read
+// adjacent columns of a value row, which is the access the memory system
+// serves whole.
+//
+// dispatch(pass, W, queryCount), which rounds the width up to whole groups
+// since the fold is a barrier; a thread past the last column computes the last
+// one and stores nothing. The head is recovered from the column rather than
+// passed in, since h * D + c divided by D is h whatever c is.
 struct AttentionApply final : ComputeProgram
 {
+    static constexpr auto splits = (unsigned) groupSize2D;
+
     AttentionApply() { compile(); }
+
+    void dispatch(ComputePass& pass, int modelWidth, int queryCount)
+    {
+        const auto width =
+            (modelWidth + groupSize2D - 1) / groupSize2D * groupSize2D;
+        pass.dispatch(*this, width, queryCount * groupSize2D);
+    }
 
     void define() override
     {
         auto position = threadPosition();
-        auto column = position.x;
-        auto query = position.y;
+        auto column = min(position.x, modelWidth - 1u);
+        auto query = position.y / splits;
+        auto split = position.y % splits;
         auto head = column / headWidth;
 
         auto probabilityBase = (head * queryCount + query) * keyCount;
 
         auto total = var(0.f);
-        auto key = var(0u);
+        auto key = var(split);
 
-        loop(key < keyCount,
+        loop(key.get() < keyCount,
              [&]
              {
-                 total += probabilities[probabilityBase + key]
-                          * values[key * modelWidth + column];
-                 key += 1u;
+                 total += probabilities[probabilityBase + key.get()]
+                          * values[key.get() * modelWidth + column];
+                 key += splits;
              });
 
-        write(output, query * modelWidth + column, total.get());
+        auto local = localPosition();
+        auto tile = shared<Float>(groupSize2D * groupSize2D);
+
+        write(tile, local.y * splits + local.x, total.get());
+        barrier();
+
+        ifThen(local.y == 0u && position.x < modelWidth,
+               [&]
+               {
+                   auto sum = var(0.f);
+
+                   for (auto part = 0u; part < splits; ++part)
+                       sum += tile[part * splits + local.x];
+
+                   write(output, query * modelWidth + column, sum.get());
+               });
     }
 
     Uniform<InputBuffer> probabilities;

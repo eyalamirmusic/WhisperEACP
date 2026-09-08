@@ -14,6 +14,7 @@ using eacp::GPU::Buffer;
 using eacp::GPU::BufferRange;
 using eacp::GPU::BufferUsage;
 using eacp::GPU::CommandBuffer;
+using eacp::GPU::ComputePass;
 using eacp::GPU::Device;
 
 namespace
@@ -250,7 +251,7 @@ void Whisper::prepare(Device& device)
     frontEnd.prepare(device);
     encoder->prepare(device);
     decoder->prepare(device);
-    selection.prepare(device);
+    selection.prepare(device, 1, decoder->shape().logitElementCount());
 
     encoderWeights.emplace(*weightsFile, encoder->shape());
     decoderWeights.emplace(*weightsFile, decoder->shape());
@@ -258,7 +259,10 @@ void Whisper::prepare(Device& device)
     filterBank.emplace(preprocessor.makeMelFilterBuffer());
 
     paddedSamples.resize(windowSamples);
-    stepTokens.resize(promptTokens.size());
+    promptIds.resize(promptTokens.size());
+
+    for (auto index = 0; index < promptTokens.size(); ++index)
+        promptIds[index] = (std::uint32_t) promptTokens[index];
 
     sampleBuffer.emplace(
         device.makeBuffer(floatBytes(windowSamples), BufferUsage::Storage));
@@ -266,9 +270,6 @@ void Whisper::prepare(Device& device)
         floatBytes(frontEnd.shape().melElementCount()), BufferUsage::Storage));
     encodedBuffer.emplace(device.makeBuffer(
         floatBytes(encoder->shape().elementCount()), BufferUsage::Storage));
-
-    tokenBuffer.emplace(device.makeBuffer(
-        (int) sizeof(std::uint32_t) * promptTokens.size(), BufferUsage::Storage));
 
     // Sized for the prompt rather than for the window: the prompt is the only
     // step with more than one row, and a buffer covering all 448 positions of a
@@ -286,8 +287,9 @@ void Whisper::prepare(Device& device)
                           floatBytes(laterStepSuppression.size()),
                           BufferUsage::Storage));
 
-    sampledIndex.emplace(
-        device.makeBuffer((int) sizeof(std::uint32_t), BufferUsage::Storage));
+    sequenceTokens.emplace(device.makeBuffer(
+        (int) sizeof(std::uint32_t) * (decoder->shape().maxPositions + 1),
+        BufferUsage::Storage));
 }
 
 void Whisper::prepare()
@@ -307,87 +309,84 @@ void Whisper::uploadSamples(Span<const float> samples)
     sampleBuffer->update(paddedSamples.data(), floatBytes(windowSamples));
 }
 
-// Ids are indices, so they travel as unsigned integers and Embed reads their bit
-// pattern back through asUInt — eacp has no integer input buffer, which plan.md
-// records against Codegen/ShaderValue.h:582.
-void Whisper::uploadTokens(Span<const TokenId> tokens)
+void Whisper::uploadPrompt()
 {
-    for (auto index = 0; index < tokens.size(); ++index)
-        stepTokens[index] = (std::uint32_t) tokens[index];
-
-    tokenBuffer->update(stepTokens.data(),
-                        (int) sizeof(std::uint32_t) * tokens.size());
+    sequenceTokens->update(promptIds.data(),
+                           (int) sizeof(std::uint32_t) * promptIds.size());
 }
 
 double Whisper::encodeAudio()
 {
     auto commands = gpu->makeCommandBuffer();
 
-    frontEnd.encode(commands, *sampleBuffer, *filterBank, *melBuffer);
-    encoder->encode(commands, *melBuffer, *encoderWeights, *encodedBuffer);
+    {
+        auto pass = commands.beginCompute();
+        frontEnd.encode(pass, *sampleBuffer, *filterBank, *melBuffer);
+        encoder->encode(pass, *melBuffer, *encoderWeights, *encodedBuffer);
+    }
 
     return commitSeconds(commands);
 }
 
+BufferRange Whisper::sequenceSlots(int first, int count) const
+{
+    constexpr auto slotBytes = (int) sizeof(std::uint32_t);
+    return {&*sequenceTokens, first * slotBytes, count * slotBytes};
+}
+
 // Greedy sampling over the last row of the step's logits, which is the
-// distribution over the token that follows everything decoded so far. The row is
-// bound as a range rather than the whole buffer — the same ranged bind the KV
-// cache needed — so a prompt step's earlier rows are neither scanned nor copied.
-void Whisper::encodeSampling(CommandBuffer& commands,
+// distribution over the token that follows everything decoded so far. The row
+// is bound as a range rather than the whole buffer — the same ranged bind the
+// KV cache needed — so a prompt step's earlier rows are neither scanned nor
+// copied, and the answer lands in the sequence slot the next step embeds.
+void Whisper::encodeSampling(ComputePass& pass,
                              int rowCount,
-                             const Buffer& mask)
+                             const Buffer& mask,
+                             int slot)
 {
-    const auto rowBytes = floatBytes(decoder->shape().logitElementCount());
+    const auto rowLength = decoder->shape().logitElementCount();
+    const auto rowBytes = floatBytes(rowLength);
 
-    selection.logits =
-        BufferRange {&*logitBuffer, (rowCount - 1) * rowBytes, rowBytes};
-    selection.mask = mask;
-    selection.indices = *sampledIndex;
-    selection.rowLength = (std::uint32_t) decoder->shape().logitElementCount();
-
-    auto pass = commands.beginCompute();
-    pass.dispatch(selection, 1);
+    selection.encode(
+        pass,
+        BufferRange {&*logitBuffer, (rowCount - 1) * rowBytes, rowBytes},
+        mask,
+        sequenceSlots(slot, 1),
+        1,
+        rowLength);
 }
 
-TokenId Whisper::sampledToken() const
+void Whisper::encodeStep(ComputePass& pass, int step)
 {
-    auto index = std::uint32_t {};
-    sampledIndex->read(&index, (int) sizeof(index));
+    const auto promptLength = promptTokens.size();
 
-    return (TokenId) index;
+    if (step == 0)
+    {
+        decoder->beginSequence(pass, *encodedBuffer, *decoderWeights);
+        decoder->step(pass,
+                      sequenceSlots(0, promptLength),
+                      promptLength,
+                      *decoderWeights,
+                      *logitBuffer);
+        encodeSampling(pass, promptLength, *firstStepMaskBuffer, promptLength);
+        return;
+    }
+
+    decoder->step(pass,
+                  sequenceSlots(promptLength + step - 1, 1),
+                  1,
+                  *decoderWeights,
+                  *logitBuffer);
+    encodeSampling(pass, 1, *laterStepMaskBuffer, promptLength + step);
 }
 
-TokenId Whisper::openSequenceAndPrompt()
+TokenId Whisper::sampledToken(int step) const
 {
-    uploadTokens(promptTokens);
+    auto id = std::uint32_t {};
+    sequenceTokens->read(
+        &id, (int) sizeof(id), (int) sizeof(id) * (promptTokens.size() + step));
 
-    auto commands = gpu->makeCommandBuffer();
-
-    decoder->beginSequence(commands, *encodedBuffer, *decoderWeights);
-    decoder->step(
-        commands, *tokenBuffer, promptTokens.size(), *decoderWeights, *logitBuffer);
-    encodeSampling(commands, promptTokens.size(), *firstStepMaskBuffer);
-
-    decodeSeconds += commitSeconds(commands);
-    ++stepCount;
-
-    return sampledToken();
-}
-
-TokenId Whisper::decodeStep(TokenId token)
-{
-    const auto one = Span<const TokenId> {&token, &token + 1};
-    uploadTokens(one);
-
-    auto commands = gpu->makeCommandBuffer();
-
-    decoder->step(commands, *tokenBuffer, 1, *decoderWeights, *logitBuffer);
-    encodeSampling(commands, 1, *laterStepMaskBuffer);
-
-    decodeSeconds += commitSeconds(commands);
-    ++stepCount;
-
-    return sampledToken();
+    return (TokenId) id;
 }
 
 TokenId Whisper::endOfTextToken() const
@@ -397,6 +396,12 @@ TokenId Whisper::endOfTextToken() const
                : vocabulary->specials().endOfText;
 }
 
+// The search is HF's greedy generate, stepsPerCommit steps at a time: a batch
+// is recorded with each step embedding the slot the one before it sampled,
+// committed, and its slots read back in order until `<|endoftext|>`, the
+// token limit, or the window's end. A step is recorded only while there is a
+// position to embed at and a token the transcript could still take, so the
+// last batch is short rather than thrown over by Decoder::step.
 Vector<TokenId> Whisper::transcribe(Span<const float> samples)
 {
     requirePrepared();
@@ -409,6 +414,7 @@ Vector<TokenId> Whisper::transcribe(Span<const float> samples)
                             "not exist yet"};
 
     uploadSamples(samples);
+    uploadPrompt();
 
     decodeSeconds = 0.0;
     stepCount = 0;
@@ -416,24 +422,49 @@ Vector<TokenId> Whisper::transcribe(Span<const float> samples)
 
     const auto endOfText = endOfTextToken();
     const auto maxPositions = decoder->shape().maxPositions;
+    const auto promptLength = promptTokens.size();
 
     auto transcript = Vector<TokenId> {};
-    auto sampled = openSequenceAndPrompt();
+    auto nextStep = 0;
 
-    while (sampled != endOfText && transcript.size() < maximumTokenCount)
+    while (true)
     {
-        transcript.add(sampled);
+        const auto firstStep = nextStep;
+        auto commands = gpu->makeCommandBuffer();
 
-        // The window is full when the next step would have no position to embed
-        // at, which Decoder::step would throw over — a transcript that ran out
-        // of window is a stop, not a failure.
-        if (decoder->position() + 1 > maxPositions)
-            break;
+        {
+            auto pass = commands.beginCompute();
 
-        sampled = decodeStep(sampled);
+            for (auto recorded = 0; recorded < stepsPerCommit; ++recorded)
+            {
+                const auto position = promptLength + nextStep;
+                const auto pending = transcript.size() + recorded;
+
+                if (position > maxPositions || pending >= maximumTokenCount)
+                    break;
+
+                encodeStep(pass, nextStep);
+                ++nextStep;
+            }
+        }
+
+        if (nextStep == firstStep)
+            return transcript;
+
+        decodeSeconds += commitSeconds(commands);
+
+        for (auto step = firstStep; step < nextStep; ++step)
+        {
+            ++stepCount;
+
+            const auto sampled = sampledToken(step);
+
+            if (sampled == endOfText)
+                return transcript;
+
+            transcript.add(sampled);
+        }
     }
-
-    return transcript;
 }
 
 std::string Whisper::transcribeText(Span<const float> samples)

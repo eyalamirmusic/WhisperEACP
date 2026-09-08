@@ -49,14 +49,12 @@ auto tGeluMatchesExactCpu = test("Kernels/geluMatchesExactCpu") = []
         return;
 
     auto input = sweptValues(sweepCount, -8.0, 8.0);
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(sweepCount);
+    auto values = storageOf(input);
 
     auto kernel = Gelu {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
 
-    auto result = runOverRows(kernel, output, sweepCount, sweepCount);
+    auto result = runOverRows(kernel, values, sweepCount, sweepCount);
 
     for (auto i = 0; i < sweepCount; ++i)
         check(isClose(result[i], exactGeluReference(input[i]), 1e-6));
@@ -74,14 +72,12 @@ auto tGeluBeatsTanhApproximation = test("Kernels/geluBeatsTanhApproximation") = 
         return;
 
     auto input = sweptValues(sweepCount, -4.0, 4.0);
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(sweepCount);
+    auto values = storageOf(input);
 
     auto kernel = Gelu {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
 
-    auto result = runOverRows(kernel, output, sweepCount, sweepCount);
+    auto result = runOverRows(kernel, values, sweepCount, sweepCount);
 
     auto worstKernelError = 0.0;
     auto worstTanhError = 0.0;
@@ -117,14 +113,12 @@ auto tGeluTailsStayFinite = test("Kernels/geluTailsStayFinite") = []
     for (auto i = 0; i < tailCount; ++i)
         input[i] = tails[i];
 
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(tailCount);
+    auto values = storageOf(input);
 
     auto kernel = Gelu {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
 
-    auto result = runOverRows(kernel, output, tailCount, tailCount);
+    auto result = runOverRows(kernel, values, tailCount, tailCount);
 
     for (auto i = 0; i < tailCount; ++i)
     {

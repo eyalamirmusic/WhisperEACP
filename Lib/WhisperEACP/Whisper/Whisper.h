@@ -186,11 +186,22 @@ public:
     double lastEncodeSeconds() const { return encodeSeconds; }
     double lastDecodeSeconds() const { return decodeSeconds; }
 
-    // How many command buffers the decoding loop committed, which is one for
-    // the prompt and one per token after it — one more than the transcript
-    // holds when the run ended on `<|endoftext|>`, since that token was sampled
-    // and then dropped.
+    // How many decoder steps the last run consumed, which is one for the
+    // prompt and one per token after it — one more than the transcript holds
+    // when the run ended on `<|endoftext|>`, since that token was sampled and
+    // then dropped. Steps are committed stepsPerCommit at a time, each
+    // embedding the token the one before it sampled on the device, so a run
+    // may have computed a few steps past the one it ended on; those are not
+    // counted, though the clock above includes them.
     int lastStepCount() const { return stepCount; }
+
+    // How many steps go into one command buffer. A commit is a fixed cost —
+    // the submission, the wait and the wake — of a fifth of a step's work,
+    // and the GPU idles between one commit and the next; four steps a commit
+    // pays it a quarter as often and keeps the GPU fed, at the price of up to
+    // three steps computed past the end of a transcript, which a transcript
+    // of any length pays once.
+    static constexpr int stepsPerCommit = 4;
 
 private:
     void requireLoaded() const;
@@ -205,16 +216,22 @@ private:
     void buildGenerationConfig();
 
     void uploadSamples(Span<const float> samples);
-    void uploadTokens(Span<const TokenId> tokens);
+    void uploadPrompt();
 
     double encodeAudio();
-    void encodeSampling(eacp::GPU::CommandBuffer& commands,
-                        int rowCount,
-                        const eacp::GPU::Buffer& mask);
 
-    TokenId sampledToken() const;
-    TokenId openSequenceAndPrompt();
-    TokenId decodeStep(TokenId token);
+    // Step zero opens the sequence and decodes the prompt; step j embeds the
+    // token step j - 1 sampled. Every step samples into slot
+    // prompt().size() + step of the sequence buffer, and reads its tokens
+    // out of the slots before it.
+    void encodeStep(eacp::GPU::ComputePass& pass, int step);
+    void encodeSampling(eacp::GPU::ComputePass& pass,
+                        int rowCount,
+                        const eacp::GPU::Buffer& mask,
+                        int slot);
+
+    eacp::GPU::BufferRange sequenceSlots(int first, int count) const;
+    TokenId sampledToken(int step) const;
 
     TokenId endOfTextToken() const;
 
@@ -244,17 +261,22 @@ private:
     // run fills the same 480000 floats, and a shorter utterance's tail has to be
     // zeroed again anyway.
     Vector<float> paddedSamples;
-    Vector<std::uint32_t> stepTokens;
+    Vector<std::uint32_t> promptIds;
 
     std::optional<eacp::GPU::Buffer> filterBank;
     std::optional<eacp::GPU::Buffer> sampleBuffer;
     std::optional<eacp::GPU::Buffer> melBuffer;
     std::optional<eacp::GPU::Buffer> encodedBuffer;
-    std::optional<eacp::GPU::Buffer> tokenBuffer;
     std::optional<eacp::GPU::Buffer> logitBuffer;
     std::optional<eacp::GPU::Buffer> firstStepMaskBuffer;
     std::optional<eacp::GPU::Buffer> laterStepMaskBuffer;
-    std::optional<eacp::GPU::Buffer> sampledIndex;
+
+    // The whole sequence as unsigned ids, one slot per position and one more
+    // for the token sampled at the last: the prompt uploaded into the first
+    // slots, and every slot after them written by the Argmax of one step and
+    // read by the Embed of the next, on the device. The host reads a slot
+    // back only to learn whether the run is over.
+    std::optional<eacp::GPU::Buffer> sequenceTokens;
 
     double encodeSeconds = 0.0;
     double decodeSeconds = 0.0;

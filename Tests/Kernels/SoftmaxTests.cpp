@@ -46,15 +46,13 @@ auto tSoftmaxMatchesCpu = test("Kernels/softmaxMatchesCpu") = []
         return;
 
     auto input = spreadValues(rowCount * rowLength, 90210u, 6.f);
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(rowCount * rowLength);
+    auto values = storageOf(input);
 
     auto kernel = Softmax {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
     kernel.rowLength = (unsigned) rowLength;
 
-    auto result = runOverRows(kernel, output, rowCount, rowCount * rowLength);
+    auto result = runGroupPerRow(kernel, values, rowCount, rowCount * rowLength);
     auto expected = softmaxReference(input, rowCount, rowLength);
 
     for (auto i = 0; i < result.size(); ++i)
@@ -92,15 +90,13 @@ auto tSoftmaxSurvivesLargeLogits = test("Kernels/softmaxSurvivesLargeLogits") = 
         input[wideRowLength + i] = -1000.f - (float) i;
     }
 
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(2 * wideRowLength);
+    auto values = storageOf(input);
 
     auto kernel = Softmax {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
     kernel.rowLength = (unsigned) wideRowLength;
 
-    auto result = runOverRows(kernel, output, 2, 2 * wideRowLength);
+    auto result = runGroupPerRow(kernel, values, 2, 2 * wideRowLength);
     auto expected = softmaxReference(input, 2, wideRowLength);
 
     for (auto i = 0; i < result.size(); ++i)
@@ -110,47 +106,39 @@ auto tSoftmaxSurvivesLargeLogits = test("Kernels/softmaxSurvivesLargeLogits") = 
     }
 };
 
-// The exponentials live in the output buffer between the summing pass and the
-// scaling one, so a read that came back with whatever the buffer held before
-// the store would pass unnoticed against a fresh allocation of zeroes. Binding
-// an output already full of a large constant is what makes that loud: scaling
-// the constant instead of the exponential leaves a row summing to rowLength
-// times it, and every element far from what the reference says.
-auto tSoftmaxIgnoresPoisonedOutput =
-    test("Kernels/softmaxIgnoresPoisonedOutput") = []
+// The shape the decoder's cross-attention has: a row far longer than a group,
+// so every lane walks many elements and the strided shares interleave, and a
+// count that is not a multiple of the group so the last share is ragged.
+auto tSoftmaxRowsLongerThanAGroup = test("Kernels/softmaxRowsLongerThanAGroup") = []
 {
     auto& device = Device::shared();
 
     if (!device.isValid())
         return;
 
-    constexpr auto poison = 1e9f;
+    constexpr auto longRowLength = 1500;
+    constexpr auto longRowCount = 3;
 
-    auto input = spreadValues(rowCount * rowLength, 424242u, 4.f);
-    auto inputBuffer = storageOf(input);
-
-    auto poisoned = Vector<float> {};
-    poisoned.assign(rowCount * rowLength, poison);
-
-    auto output = storageOf(poisoned);
+    auto input = spreadValues(longRowCount * longRowLength, 424242u, 4.f);
+    auto values = storageOf(input);
 
     auto kernel = Softmax {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
-    kernel.rowLength = (unsigned) rowLength;
+    kernel.values = values;
+    kernel.rowLength = (unsigned) longRowLength;
 
-    auto result = runOverRows(kernel, output, rowCount, rowCount * rowLength);
-    auto expected = softmaxReference(input, rowCount, rowLength);
+    auto result =
+        runGroupPerRow(kernel, values, longRowCount, longRowCount * longRowLength);
+    auto expected = softmaxReference(input, longRowCount, longRowLength);
 
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
 
-    for (auto row = 0; row < rowCount; ++row)
+    for (auto row = 0; row < longRowCount; ++row)
     {
         auto total = 0.0;
 
-        for (auto i = 0; i < rowLength; ++i)
-            total += result[row * rowLength + i];
+        for (auto i = 0; i < longRowLength; ++i)
+            total += result[row * longRowLength + i];
 
         check(isClose((float) total, 1.0, 1e-5));
     }
@@ -172,15 +160,13 @@ auto tSoftmaxUniformRowIsUniform = test("Kernels/softmaxUniformRowIsUniform") = 
     for (auto i = 0; i < flatRowLength; ++i)
         input[i] = -7.25f;
 
-    auto inputBuffer = storageOf(input);
-    auto output = outputFor(flatRowLength);
+    auto values = storageOf(input);
 
     auto kernel = Softmax {};
-    kernel.input = inputBuffer;
-    kernel.output = output;
+    kernel.values = values;
     kernel.rowLength = (unsigned) flatRowLength;
 
-    auto result = runOverRows(kernel, output, 1, flatRowLength);
+    auto result = runGroupPerRow(kernel, values, 1, flatRowLength);
 
     for (auto i = 0; i < flatRowLength; ++i)
         check(isClose(result[i], 1.0 / flatRowLength, 1e-6));

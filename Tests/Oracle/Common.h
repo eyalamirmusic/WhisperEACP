@@ -199,7 +199,12 @@ inline std::vector<float> ourMelSpectrogram(eacp::GPU::Device& device,
     front.prepare(device);
 
     auto commands = device.makeCommandBuffer();
-    front.encode(commands, samplesBuffer, filterBuffer, output);
+
+    {
+        auto pass = commands.beginCompute();
+        front.encode(pass, samplesBuffer, filterBuffer, output);
+    }
+
     commands.commit();
 
     return melTest::download(output, shape.melElementCount());

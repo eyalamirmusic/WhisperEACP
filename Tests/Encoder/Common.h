@@ -644,7 +644,12 @@ inline Vector<float> runEncoder(const EncoderShape& shape,
     encoder.prepare(device);
 
     auto commands = device.makeCommandBuffer();
-    encoder.encode(commands, melBuffer, weights, output);
+
+    {
+        auto pass = commands.beginCompute();
+        encoder.encode(pass, melBuffer, weights, output);
+    }
+
     commands.commit();
 
     return readBack(output, shape.elementCount());

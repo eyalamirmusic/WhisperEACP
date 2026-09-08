@@ -91,8 +91,13 @@ public:
         const auto melBuffer = melTest::upload(device, mel);
 
         auto commands = device.makeCommandBuffer();
-        encoder.encode(commands, melBuffer, encoderWeights, *encoded);
-        decoder.beginSequence(commands, *encoded, decoderWeights);
+
+        {
+            auto pass = commands.beginCompute();
+            encoder.encode(pass, melBuffer, encoderWeights, *encoded);
+            decoder.beginSequence(pass, *encoded, decoderWeights);
+        }
+
         commands.commit();
     }
 
@@ -114,8 +119,13 @@ public:
                               BufferUsage::Storage);
 
         auto commands = device.makeCommandBuffer();
-        decoder.step(
-            commands, tokenBuffer, (int) tokens.size(), decoderWeights, *logits);
+
+        {
+            auto pass = commands.beginCompute();
+            decoder.step(
+                pass, tokenBuffer, (int) tokens.size(), decoderWeights, *logits);
+        }
+
         commands.commit();
 
         const auto width = vocabularySize();

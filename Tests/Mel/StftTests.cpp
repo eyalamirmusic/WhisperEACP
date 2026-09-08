@@ -41,6 +41,67 @@ std::vector<float> runStft(Device& device,
     return melTest::download(powerBuffer, frameCount * binCount);
 }
 
+// The same power through the framing, the tiled transform and the squaring,
+// which is the path the runtime takes.
+std::vector<float> runStftByBasis(Device& device,
+                                  const std::vector<float>& samples,
+                                  const std::vector<float>& window,
+                                  int hopLength,
+                                  int frameCount)
+{
+    const auto fftLength = (int) window.size();
+    const auto binCount = fftLength / 2 + 1;
+
+    const auto samplesBuffer = melTest::upload(device, samples);
+    const auto windowBuffer = melTest::upload(device, window);
+    const auto framesBuffer = melTest::allocate(device, frameCount * fftLength);
+    const auto spectrumBuffer = melTest::allocate(device, frameCount * 2 * binCount);
+    const auto powerBuffer = melTest::allocate(device, frameCount * binCount);
+
+    const auto dft = WSP::dftBasis(fftLength);
+    const auto basisBuffer = melTest::upload(
+        device, std::vector<float>(dft.data(), dft.data() + dft.size()));
+    const auto zeroBias = melTest::upload(
+        device, std::vector<float>((std::size_t) (2 * binCount), 0.f));
+
+    auto framing = WSP::StftFramesKernel {};
+    framing.samples = samplesBuffer;
+    framing.window = windowBuffer;
+    framing.frames = framesBuffer;
+    framing.sampleCount = (std::int32_t) samples.size();
+    framing.fftLength = (std::int32_t) fftLength;
+    framing.hopLength = (std::int32_t) hopLength;
+    framing.prepare(device);
+
+    auto transform = WSP::TiledLinear {};
+    transform.a = framesBuffer;
+    transform.b = basisBuffer;
+    transform.bias = zeroBias;
+    transform.output = spectrumBuffer;
+    transform.prepare(device);
+
+    auto squaring = WSP::SpectrumPowerKernel {};
+    squaring.spectrum = spectrumBuffer;
+    squaring.power = powerBuffer;
+    squaring.binCount = (std::uint32_t) binCount;
+    squaring.prepare(device);
+
+    auto commands = device.makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        pass.dispatch(framing, fftLength, frameCount);
+        transform.dispatch(
+            pass,
+            WSP::TiledMatMulShape::forLinear(frameCount, fftLength, 2 * binCount));
+        pass.dispatch(squaring, binCount, frameCount);
+    }
+
+    commands.commit();
+
+    return melTest::download(powerBuffer, frameCount * binCount);
+}
+
 std::vector<float> rectangularWindow(int length)
 {
     return std::vector<float>((std::size_t) length, 1.0f);
@@ -167,4 +228,71 @@ auto tStftMatchesScalarReference = test("Mel/stftMatchesScalarReference") = []
         check(melTest::close(power[(std::size_t) i],
                              expected[(std::size_t) i],
                              largest * 1e-5 + expected[(std::size_t) i] * 1e-4));
+};
+
+// The production path against the same scalar reference, and against the
+// per-bin kernel it replaced: the framing has to reflect at both edges as that
+// kernel does, and the basis has to be the DFT it says it is.
+auto tStftByBasisMatchesScalarReference =
+    test("Mel/stftByBasisMatchesScalarReference") = []
+{
+    auto& device = Device::shared();
+
+    if (!device.isValid())
+        return;
+
+    constexpr auto fftLength = 32;
+    constexpr auto hopLength = 8;
+    constexpr auto sampleCount = 300;
+    constexpr auto frameCount = 30;
+    constexpr auto binCount = fftLength / 2 + 1;
+
+    const auto samples = melTest::toneAndNoise(sampleCount);
+    const auto hann = WSP::periodicHannWindow(fftLength);
+    const auto window = std::vector<float>(hann.data(), hann.data() + hann.size());
+
+    const auto power =
+        runStftByBasis(device, samples, window, hopLength, frameCount);
+    const auto perBin = runStft(device, samples, window, hopLength, frameCount);
+    const auto expected = scalar::stftPower(
+        samples, scalar::periodicHann(fftLength), fftLength, hopLength, frameCount);
+
+    auto largest = 0.0;
+
+    for (auto i = 0; i < frameCount * binCount; ++i)
+        largest = std::max(largest, expected[(std::size_t) i]);
+
+    for (auto i = 0; i < frameCount * binCount; ++i)
+    {
+        check(melTest::close(power[(std::size_t) i],
+                             expected[(std::size_t) i],
+                             largest * 1e-5 + expected[(std::size_t) i] * 1e-4));
+        check(melTest::close(power[(std::size_t) i],
+                             perBin[(std::size_t) i],
+                             largest * 1e-5 + perBin[(std::size_t) i] * 1e-4));
+    }
+};
+
+auto tStftByBasisReflectsAtBothEdges =
+    test("Mel/stftByBasisReflectsAtBothEdges") = []
+{
+    auto& device = Device::shared();
+
+    if (!device.isValid())
+        return;
+
+    constexpr auto fftLength = 8;
+    constexpr auto hopLength = 4;
+    constexpr auto sampleCount = 16;
+    constexpr auto frameCount = 5;
+    constexpr auto binCount = fftLength / 2 + 1;
+
+    const auto power = runStftByBasis(device,
+                                      ramp(sampleCount),
+                                      rectangularWindow(fftLength),
+                                      hopLength,
+                                      frameCount);
+
+    check(melTest::close(power[0], 16.0 * 16.0, 1e-2));
+    check(melTest::close(power[(std::size_t) (4 * binCount)], 104.0 * 104.0, 1e-1));
 };

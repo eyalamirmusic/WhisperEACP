@@ -1,5 +1,6 @@
 #pragma once
 
+#include "Gelu.h"
 #include "KernelTypes.h"
 #include "MatMul.h"
 
@@ -83,4 +84,145 @@ struct LinearProgram final : ComputeProgram
 
 using Linear = LinearProgram<WeightStorage::Float>;
 using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
+
+// The same product for a handful of rows — a decode step's one token, or the
+// prompt's two — where a thread per output is a thread per 384 or 1536 serial
+// multiply-adds and the GPU is nearly idle. The inner sum is split eight ways
+// across a group instead: the grid is [8, rowCount * outputWidth], the eight
+// threads of a group row take every eighth run of four inputs of one output,
+// and the group folds the eight partial sums in shared memory before the one
+// store. Adjacent threads read adjacent words of the same weight row, which
+// is the access the memory system serves whole.
+//
+// dispatch(pass, outputWidth, rowCount), which rounds the height up to whole
+// groups since the fold is a barrier; a thread past the last output computes
+// against the last row and stores nothing. The runs of four are read4 when
+// innerCount divides by four and single elements otherwise, so the kernel is
+// correct at every shape and fast at the model's.
+//
+// Two flags fold the stages either side of a projection into its store, each
+// a dispatch of its own otherwise and a few microseconds of GPU whatever its
+// size: gelu applies the activation to the result, which is what follows fc1,
+// and residual adds the result to what the output already holds, which is
+// what follows every out_proj and fc2 — in place on the residual stream, the
+// element read and stored by the one thread that owns it.
+template <WeightStorage weightStorage>
+struct SplitLinearProgram final : ComputeProgram
+{
+    static constexpr auto splits = (unsigned) groupSize2D;
+
+    SplitLinearProgram() { compile(); }
+
+    void dispatch(ComputePass& pass, int outputWidth, int rowCount)
+    {
+        const auto outputs = outputWidth * rowCount;
+        const auto height = (outputs + groupSize2D - 1) / groupSize2D * groupSize2D;
+
+        pass.dispatch(*this, groupSize2D, height);
+    }
+
+    void define() override
+    {
+        auto position = threadPosition();
+        auto split = position.x;
+        auto element = position.y;
+        auto row = element / outputWidth;
+        auto column = element % outputWidth;
+
+        auto inputBase = min(row, rowCount - 1u) * innerCount;
+        auto weightBase = column * innerCount;
+
+        auto total = var(0.f);
+
+        ifThen(
+            innerCount % 4u == 0u,
+            [&]
+            {
+                auto step = var(split * 4u);
+
+                loop(step.get() < innerCount,
+                     [&]
+                     {
+                         total += dot(input.read4((inputBase + step.get()) / 4u),
+                                      weight4(weightBase + step.get()));
+                         step += splits * 4u;
+                     });
+            },
+            [&]
+            {
+                auto step = var(split);
+
+                loop(step.get() < innerCount,
+                     [&]
+                     {
+                         total += input[inputBase + step.get()]
+                                  * weight(weightBase + step.get());
+                         step += splits;
+                     });
+            });
+
+        auto local = localPosition();
+        auto tile = shared<Float>(groupSize2D * groupSize2D);
+
+        write(tile, local.y * splits + local.x, total.get());
+        barrier();
+
+        ifThen(local.x == 0u && row < rowCount,
+               [&]
+               {
+                   auto sum = var(0.f);
+
+                   for (auto part = 0u; part < splits; ++part)
+                       sum += tile[local.y * splits + part];
+
+                   auto value = sum.get() + bias[column];
+                   auto activated = select(gelu != 0u, exactGelu(value), value);
+                   auto carried = select(residual != 0u, output[element], 0.f);
+
+                   write(output, element, activated + carried);
+               });
+    }
+
+    Float weight(const UInt& index)
+    {
+        if constexpr (weightStorage == WeightStorage::PackedHalf)
+            return weights.readHalf(index);
+        else
+            return weights[index];
+    }
+
+    // Four consecutive weights from a four-aligned index: one record of the
+    // float buffer, or the two words that hold four halves.
+    Float4 weight4(const UInt& index)
+    {
+        if constexpr (weightStorage == WeightStorage::PackedHalf)
+            return float4(weights.readHalf2(index / 2u),
+                          weights.readHalf2(index / 2u + 1u));
+        else
+            return weights.read4(index / 4u);
+    }
+
+    Uniform<InputBuffer> input;
+    Uniform<InputBuffer> weights;
+    Uniform<InputBuffer> bias;
+    Uniform<OutputBuffer> output;
+    Uniform<UInt> innerCount;
+    Uniform<UInt> outputWidth;
+    Uniform<UInt> rowCount;
+    Uniform<UInt> gelu;
+    Uniform<UInt> residual;
+
+    EACP_SHADER(input,
+                weights,
+                bias,
+                output,
+                innerCount,
+                outputWidth,
+                rowCount,
+                gelu,
+                residual)
+};
+
+using SplitLinear = SplitLinearProgram<WeightStorage::Float>;
+using HalfWeightSplitLinear = SplitLinearProgram<WeightStorage::PackedHalf>;
 } // namespace WSP

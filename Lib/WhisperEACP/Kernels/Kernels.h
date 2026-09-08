@@ -10,10 +10,12 @@
 // bounds guard already has it. The inner extents, which are what a kernel walks
 // its buffers at, are uniforms.
 //
-// Every one of these is the simplest kernel that is correct: a thread per row
-// or per output element, reducing serially, with no threadgroup tiling. That is
-// the version a scalar CPU reference can be checked against without argument,
-// and the one an optimised kernel later has to keep agreeing with.
+// Each began as the simplest kernel that is correct — a thread per row or per
+// output element, reducing serially — which is the version a scalar CPU
+// reference is checked against without argument. The ones a decode step
+// spends its time in now give a group of threads to a row (Reduce.h) or split
+// an inner sum across one (SplitLinear, AttentionApply), and keep agreeing
+// with the same references.
 
 #include "Add.h"
 #include "Argmax.h"
@@ -25,4 +27,8 @@
 #include "LayerNorm.h"
 #include "Linear.h"
 #include "MatMul.h"
+#include "Reduce.h"
+#include "SingleQueryAttention.h"
 #include "Softmax.h"
+#include "TiledMatMul.h"
+#include "Unfold.h"

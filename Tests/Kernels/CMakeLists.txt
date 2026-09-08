@@ -8,7 +8,9 @@ set(kernel_test_sources
         LayerNormTests.cpp
         LinearTests.cpp
         MatMulTests.cpp
-        SoftmaxTests.cpp)
+        SoftmaxTests.cpp
+        TiledMatMulTests.cpp
+        UnfoldTests.cpp)
 
 # NO_MAIN: these reach the GPU, so they run inside eacp's event loop through
 # the shared entry point in Tests/Support.

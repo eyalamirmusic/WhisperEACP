@@ -20,7 +20,9 @@ inline Float exactGelu(const Float& x)
     return 0.5f * x * (1.f + erf(x * inverseRootTwo));
 }
 
-// Elementwise, one thread per element: dispatch(kernel, elementCount).
+// Elementwise and in place, one thread per element: dispatch(kernel,
+// elementCount). The activation replaces what it was computed from, since
+// nothing in a transformer reads a pre-activation twice.
 struct Gelu final : ComputeProgram
 {
     Gelu() { compile(); }
@@ -28,12 +30,11 @@ struct Gelu final : ComputeProgram
     void define() override
     {
         auto at = threadId();
-        write(output, at, exactGelu(input[at]));
+        write(values, at, exactGelu(values[at]));
     }
 
-    Uniform<InputBuffer> input;
-    Uniform<OutputBuffer> output;
+    Uniform<OutputBuffer> values;
 
-    EACP_SHADER(input, output)
+    EACP_SHADER(values)
 };
 } // namespace WSP

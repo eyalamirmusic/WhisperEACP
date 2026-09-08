@@ -30,9 +30,71 @@ inline Int reflectedIndex(const Int& index, const Int& lastIndex)
     return lastIndex - abs(lastIndex - abs(index));
 }
 
+// One thread per (tap, frame): the windowed, reflect-padded frame, laid out
+// [frameCount, fftLength] so the transform can be one product of every frame
+// against the DFT basis (Basis.h) rather than a per-bin loop — which is what
+// StftPowerKernel below does, and at 3.4 ms of a 12 ms encoder was the
+// largest kernel in it.
+//
+// The frame is centred on hopLength * frame, which is center=True: the signal
+// is reflected by fftLength / 2 at each end rather than the frame starting
+// there. Frame 3000 — the one HF computes and then drops — is simply never
+// dispatched.
+struct StftFramesKernel final : ComputeProgram
+{
+    StftFramesKernel() { compile(); }
+
+    void define() override
+    {
+        auto position = threadPosition();
+        auto tap = toInt(position.x);
+        auto windowStart = toInt(position.y) * hopLength - fftLength / 2;
+        auto source = reflectedIndex(windowStart + tap, sampleCount - 1);
+
+        write(frames,
+              position.y * toUInt(fftLength) + position.x,
+              samples[toUInt(source)] * window[position.x]);
+    }
+
+    Uniform<InputBuffer> samples;
+    Uniform<InputBuffer> window;
+    Uniform<OutputBuffer> frames;
+    Uniform<Int> sampleCount;
+    Uniform<Int> fftLength;
+    Uniform<Int> hopLength;
+
+    EACP_SHADER(samples, window, frames, sampleCount, fftLength, hopLength)
+};
+
+// One thread per (bin, frame): the power of a bin out of the real and
+// imaginary parts the transform left side by side.
+struct SpectrumPowerKernel final : ComputeProgram
+{
+    SpectrumPowerKernel() { compile(); }
+
+    void define() override
+    {
+        auto position = threadPosition();
+        auto at = position.y * (2u * binCount) + 2u * position.x;
+        auto real = spectrum[at];
+        auto imaginary = spectrum[at + 1u];
+
+        write(power,
+              position.y * binCount + position.x,
+              real * real + imaginary * imaginary);
+    }
+
+    Uniform<InputBuffer> spectrum;
+    Uniform<OutputBuffer> power;
+    Uniform<UInt> binCount;
+
+    EACP_SHADER(spectrum, power, binCount)
+};
+
 // One thread per (bin, frame) of the power spectrum: a windowed DFT evaluated
-// bin by bin, squared. Naive on purpose — an FFT is the optimisation this is
-// the reference for.
+// bin by bin, squared. Naive on purpose — the framing and product above are
+// the optimisation this is the reference for, and the tests hold the two to
+// each other.
 //
 // The frame is centred on hopLength * frame, which is center=True: the signal
 // is reflected by fftLength / 2 at each end rather than the frame starting

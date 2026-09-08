@@ -49,17 +49,18 @@ Vector<std::uint32_t> runArgmax(const Vector<float>& logits,
                                      BufferUsage::Storage);
 
     auto kernel = Argmax {};
-    kernel.logits = logitBuffer;
-    kernel.mask = maskBuffer;
-    kernel.indices = indices;
-    kernel.rowLength = (unsigned) rowLength;
-    kernel.prepare();
+    kernel.prepare(device, rowCount, rowLength);
 
     auto commands = device.makeCommandBuffer();
 
     {
         auto pass = commands.beginCompute();
-        pass.dispatch(kernel, rowCount);
+        kernel.encode(pass,
+                      BufferRange::of(logitBuffer),
+                      maskBuffer,
+                      indices,
+                      rowCount,
+                      rowLength);
     }
 
     commands.commit();
@@ -86,12 +87,12 @@ Vector<float> suppressing(int rowLength, std::initializer_list<int> tokens)
     return values;
 }
 
-// A prime, so nothing in the scan lines up with the 64-wide dispatch group and
-// a thread that walked a rounded-up row runs off its own end.
+// A prime, so nothing in the scan lines up with the 64-wide group and a
+// thread that walked a rounded-up row runs off its own end.
 constexpr auto rowLength = 37;
 
-// tiny.en's vocabulary, which is what a real step reduces over: one thread
-// walking 51864 logits serially is the shape this kernel actually runs in.
+// tiny.en's vocabulary, which is what a real step reduces over: a hundred
+// groups of candidates folded to one is the shape this kernel actually runs in.
 constexpr auto vocabulary = 51864;
 
 // Rows whose answers can be written down: the maximum at the first index, at

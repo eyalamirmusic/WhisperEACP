@@ -112,6 +112,28 @@ Vector<float> runOverRows(Kernel& kernel,
     return readBack(output, outputElements);
 }
 
+// The runner for a kernel that gives a group to each row and dispatches
+// itself: what it reads back is whichever buffer the caller bound, which for
+// an in-place kernel is the one it was fed.
+template <typename Kernel>
+Vector<float> runGroupPerRow(Kernel& kernel,
+                             const eacp::GPU::Buffer& output,
+                             int rowCount,
+                             int outputElements)
+{
+    kernel.prepare();
+
+    auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        kernel.dispatchRows(pass, rowCount);
+    }
+
+    commands.commit();
+    return readBack(output, outputElements);
+}
+
 template <typename Kernel>
 Vector<float> runOverGrid(Kernel& kernel,
                           const eacp::GPU::Buffer& output,

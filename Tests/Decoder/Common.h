@@ -528,7 +528,9 @@ public:
         , decoder(shapeToUse)
     {
         decoder.prepare(eacp::GPU::Device::shared());
-        selection.prepare(eacp::GPU::Device::shared());
+        selection.prepare(eacp::GPU::Device::shared(),
+                          decoderShape.maxPositions,
+                          decoderShape.logitElementCount());
     }
 
     // Seconds around the commit, which is the only clock available: eacp's
@@ -538,7 +540,11 @@ public:
     {
         const auto rows = storageOf(encoderOutput);
         auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
-        decoder.beginSequence(commands, rows, weights);
+
+        {
+            auto pass = commands.beginCompute();
+            decoder.beginSequence(pass, rows, weights);
+        }
 
         return commitSeconds(commands);
     }
@@ -609,7 +615,10 @@ private:
         const auto tokenBuffer = storageOf(ids);
         auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
 
-        decoder.step(commands, tokenBuffer, ids.size(), weights, logits);
+        {
+            auto pass = commands.beginCompute();
+            decoder.step(pass, tokenBuffer, ids.size(), weights, logits);
+        }
 
         return commitSeconds(commands);
     }
@@ -623,16 +632,16 @@ private:
         const auto mask = storageOf(sized(rowLength));
         const auto chosen = outputFor(rowCount);
 
-        selection.logits = logits;
-        selection.mask = mask;
-        selection.indices = chosen;
-        selection.rowLength = (std::uint32_t) rowLength;
-
         auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
 
         {
             auto pass = commands.beginCompute();
-            pass.dispatch(selection, rowCount);
+            selection.encode(pass,
+                             eacp::GPU::BufferRange::of(logits),
+                             mask,
+                             chosen,
+                             rowCount,
+                             rowLength);
         }
 
         commands.commit();

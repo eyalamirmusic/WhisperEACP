@@ -213,8 +213,17 @@ Vector<float> runApply(const Vector<float>& probabilities,
     kernel.headWidth = (unsigned) shape.headWidth;
     kernel.queryCount = (unsigned) shape.queryCount;
     kernel.keyCount = (unsigned) shape.keyCount;
+    kernel.prepare();
 
-    return runOverGrid(kernel, output, shape.modelWidth(), shape.queryCount);
+    auto commands = Device::shared().makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        kernel.dispatch(pass, shape.modelWidth(), shape.queryCount);
+    }
+
+    commands.commit();
+    return readBack(output, shape.queryElementCount());
 }
 
 // The three dispatches attention is, each its own pass: threads of a dispatch
@@ -224,7 +233,8 @@ Vector<float> runApply(const Vector<float>& probabilities,
 // The scores buffer needs no reshaping between the first and the second: a
 // [headCount, queryCount, keyCount] row-major block already is
 // headCount * queryCount rows of keyCount, which is the only thing Softmax
-// wants to know about it.
+// wants to know about it — and it normalises them in place, so the same buffer
+// is what the third reads as probabilities.
 // The softmaxed scores on their own, which is where a causal mask has to be
 // visible as an exact zero rather than as a small weight.
 Vector<float> runNormalisedScores(const Vector<float>& queries,
@@ -234,15 +244,13 @@ Vector<float> runNormalisedScores(const Vector<float>& queries,
                                   bool causal)
 {
     auto scores = runScores(queries, keys, shape, scale, causal);
-    auto scoreBuffer = storageOf(scores);
-    auto probabilities = outputFor(shape.scoreCount());
+    auto probabilities = storageOf(scores);
 
     auto normalising = Softmax {};
-    normalising.input = scoreBuffer;
-    normalising.output = probabilities;
+    normalising.values = probabilities;
     normalising.rowLength = (unsigned) shape.keyCount;
 
-    return runOverRows(
+    return runGroupPerRow(
         normalising, probabilities, shape.scoreRowCount(), shape.scoreCount());
 }
 
@@ -258,7 +266,6 @@ Vector<float> runAttention(const Vector<float>& queries,
     auto valueBuffer = storageOf(values);
 
     auto scores = outputFor(shape.scoreCount());
-    auto probabilities = outputFor(shape.scoreCount());
     auto output = outputFor(shape.queryElementCount());
 
     auto scoring = AttentionScores {};
@@ -274,13 +281,12 @@ Vector<float> runAttention(const Vector<float>& queries,
     scoring.prepare();
 
     auto normalising = Softmax {};
-    normalising.input = scores;
-    normalising.output = probabilities;
+    normalising.values = scores;
     normalising.rowLength = (unsigned) shape.keyCount;
     normalising.prepare();
 
     auto applying = AttentionApply {};
-    applying.probabilities = probabilities;
+    applying.probabilities = scores;
     applying.values = valueBuffer;
     applying.output = output;
     applying.modelWidth = (unsigned) shape.modelWidth();
@@ -298,12 +304,12 @@ Vector<float> runAttention(const Vector<float>& queries,
 
     {
         auto pass = commands.beginCompute();
-        pass.dispatch(normalising, shape.scoreRowCount());
+        normalising.dispatchRows(pass, shape.scoreRowCount());
     }
 
     {
         auto pass = commands.beginCompute();
-        pass.dispatch(applying, shape.modelWidth(), shape.queryCount);
+        applying.dispatch(pass, shape.modelWidth(), shape.queryCount);
     }
 
     commands.commit();
@@ -753,6 +759,64 @@ auto tAttentionCausalMaskOutrunsVeryNegativeScores =
             }
 
             check(isClose((float) total, 1.0, 1e-5));
+        }
+    }
+};
+
+// The split form a decode step takes: one query at the last position, held to
+// the three-kernel chain and to the reference over eleven keys, where most
+// chunks hold none; at the model's own head width over more keys than a
+// chunk's lanes, so a lane takes several; and at a head one quad wide, so the
+// quads past it are the guarded ones.
+auto tSingleQueryAttentionMatchesTheChain =
+    test("Kernels/singleQueryAttentionMatchesTheChain") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto& shape: {AttentionShape {4, 4, 1, 11},
+                             AttentionShape {3, 64, 1, 203},
+                             AttentionShape {2, 8, 1, 130}})
+    {
+        const auto scale = 0.37;
+        auto queries = spreadValues(shape.queryElementCount(), 7100u, 1.f);
+        auto keys = spreadValues(shape.keyElementCount(), 7101u, 1.f);
+        auto values = spreadValues(shape.keyElementCount(), 7102u, 2.f);
+
+        auto queryBuffer = storageOf(queries);
+        auto keyBuffer = storageOf(keys);
+        auto valueBuffer = storageOf(values);
+        auto output = outputFor(shape.queryElementCount());
+
+        auto kernel = SingleQueryAttention {};
+        kernel.prepare(shape.headCount, shape.headWidth, shape.keyCount);
+
+        auto commands = Device::shared().makeCommandBuffer();
+
+        {
+            auto pass = commands.beginCompute();
+            kernel.encode(pass,
+                          queryBuffer,
+                          keyBuffer,
+                          valueBuffer,
+                          output,
+                          shape.modelWidth(),
+                          shape.headWidth,
+                          shape.keyCount,
+                          (float) scale);
+        }
+
+        commands.commit();
+
+        auto result = readBack(output, shape.queryElementCount());
+        auto chain = runAttention(queries, keys, values, shape, scale);
+        auto expected =
+            attentionReference(queries, keys, values, shape, scale, false);
+
+        for (auto i = 0; i < result.size(); ++i)
+        {
+            check(isClose(result[i], expected[i], 1e-5));
+            check(isClose(result[i], chain[i], 1e-5));
         }
     }
 };

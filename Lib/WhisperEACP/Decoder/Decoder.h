@@ -27,18 +27,22 @@ namespace WSP
 // token after it is another.
 //
 // The shape of this is the Encoder's: prepare() compiles every kernel and sizes
-// every intermediate once, and the two recording calls only record. Each
-// dispatch is its own compute pass, because a pass boundary is what orders one
-// dispatch's writes against the next one's reads — every stage below reads what
-// the stage before it wrote, and the KV cache is read in the same command
-// buffer that appended to it.
+// every intermediate once, and the two recording calls only record, into the
+// one compute pass the caller opened. eacp orders the dispatches of a pass —
+// Metal's serial encoder, a UAV barrier after each on D3D12 — so every stage
+// below reads what the stage before it wrote, and the KV cache is read in the
+// same pass that appended to it. A step used to open a pass per dispatch,
+// and at a few microseconds of GPU each its ninety passes were half of it.
 //
 // One program of each kind serves every dispatch of that kind: the shapes are
 // uniforms, so the layers, the two attentions and the two feed-forward widths
-// are re-bindings of eight pipelines rather than pipelines of their own. The
-// exception is Linear, which is held twice — the float-weight program and the
-// packed-half one — so a weight that arrived fp16 is dispatched through the
-// program that reads it as fp16.
+// are re-bindings of a few pipelines rather than pipelines of their own. The
+// projections are held four ways: a float-weight program and a packed-half
+// one, so a weight that arrived fp16 is dispatched through the program that
+// reads it as fp16, and each of those in the many-row form the cross-attention
+// keys and values are projected with once per sequence and the few-row form a
+// step's one or two tokens take, where the inner sum is split across a group
+// instead of walked by a thread.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -58,14 +62,15 @@ public:
     // The cross-attention keys and values are projected out of it for every
     // layer, and the position goes back to zero, so the next step is the
     // sequence's first.
-    void beginSequence(eacp::GPU::CommandBuffer& commands,
+    void beginSequence(eacp::GPU::ComputePass& pass,
                        const eacp::GPU::Buffer& encoderOutput,
                        const DecoderWeights& weights);
 
     // Appends tokenCount tokens to the sequence and writes their logits.
     //
-    // tokens holds tokenCount uint32 ids — ids are indices, so they travel as
-    // integers and Embed reads their bit pattern back — and logits receives
+    // tokens holds tokenCount uint32 ids, a range so that the slot an Argmax
+    // wrote at the end of one step is what the next step embeds, with the
+    // host nowhere in between; logits receives
     // tokenCount * shape().logitElementCount() floats, [tokenCount,
     // vocabularySize] row-major. The hidden rows behind them stay readable
     // through hiddenStates() until the next step.
@@ -74,11 +79,20 @@ public:
     // thrown before a single dispatch is recorded, since a half-recorded step
     // would leave the cache holding rows the position count does not know
     // about.
-    void step(eacp::GPU::CommandBuffer& commands,
-              const eacp::GPU::Buffer& tokens,
+    void step(eacp::GPU::ComputePass& pass,
+              const eacp::GPU::BufferRange& tokens,
               int tokenCount,
               const DecoderWeights& weights,
               const eacp::GPU::Buffer& logits);
+
+    void step(eacp::GPU::ComputePass& pass,
+              const eacp::GPU::Buffer& tokens,
+              int tokenCount,
+              const DecoderWeights& weights,
+              const eacp::GPU::Buffer& logits)
+    {
+        step(pass, eacp::GPU::BufferRange::of(tokens), tokenCount, weights, logits);
+    }
 
     // How many tokens the sequence holds, which is the position the next one
     // takes and the number of keys already cached.
@@ -93,56 +107,49 @@ public:
 private:
     void requireMatchingWeights(const DecoderWeights& weights) const;
 
-    void encodeLayer(eacp::GPU::CommandBuffer& commands,
+    void encodeLayer(eacp::GPU::ComputePass& pass,
                      const DecoderLayerWeights& weights,
                      int layerIndex,
                      int tokenCount);
 
-    void encodeSelfAttention(eacp::GPU::CommandBuffer& commands,
+    void encodeSelfAttention(eacp::GPU::ComputePass& pass,
                              const DecoderLayerWeights& weights,
                              int layerIndex,
                              int tokenCount);
 
-    void encodeCrossAttention(eacp::GPU::CommandBuffer& commands,
+    void encodeCrossAttention(eacp::GPU::ComputePass& pass,
                               const DecoderLayerWeights& weights,
                               int layerIndex,
                               int tokenCount);
 
-    void encodeAttentionOverCache(eacp::GPU::CommandBuffer& commands,
+    void encodeAttentionOverCache(eacp::GPU::ComputePass& pass,
                                   const eacp::GPU::Buffer& keys,
                                   const eacp::GPU::Buffer& values,
-                                  const eacp::GPU::Buffer& scoreTarget,
-                                  const eacp::GPU::Buffer& weightTarget,
+                                  const eacp::GPU::Buffer& scores,
                                   int queryCount,
                                   int keyCount,
                                   bool causal);
 
-    void encodeGelu(eacp::GPU::CommandBuffer& commands,
-                    const eacp::GPU::Buffer& input,
-                    const eacp::GPU::Buffer& target,
-                    int elementCount);
-
-    void encodeSum(eacp::GPU::CommandBuffer& commands,
-                   const eacp::GPU::Buffer& left,
-                   const eacp::GPU::Buffer& right,
-                   const eacp::GPU::Buffer& target,
-                   int elementCount);
-
-    void encodeLayerNorm(eacp::GPU::CommandBuffer& commands,
+    void encodeLayerNorm(eacp::GPU::ComputePass& pass,
                          const eacp::GPU::Buffer& input,
                          const TensorBuffer& weight,
                          const TensorBuffer& bias,
                          const eacp::GPU::Buffer& target,
                          int rowCount);
 
-    void encodeLinear(eacp::GPU::CommandBuffer& commands,
+    // gelu applies the activation on the store, and residual adds the result
+    // into what the target holds: the stages either side of a projection,
+    // folded into it rather than dispatched on their own.
+    void encodeLinear(eacp::GPU::ComputePass& pass,
                       const eacp::GPU::Buffer& input,
                       const TensorBuffer& weight,
                       const eacp::GPU::Buffer& bias,
                       const eacp::GPU::BufferRange& target,
                       int innerCount,
                       int outputWidth,
-                      int rowCount);
+                      int rowCount,
+                      bool gelu = false,
+                      bool residual = false);
 
     // Where this step's keys and values are written into the layer's cache:
     // the row the sequence has reached, as a byte offset into the buffer.
@@ -153,35 +160,28 @@ private:
     int decodedPositions = 0;
 
     Embed embedding;
-    Gelu activation;
-    Add sum;
     LayerNorm normalisation;
-    Linear projection;
-    HalfWeightLinear packedProjection;
+    TiledLinear projection;
+    HalfWeightTiledLinear packedProjection;
+    SplitLinear splitProjection;
+    HalfWeightSplitLinear packedSplitProjection;
     AttentionScores scores;
     Softmax softmax;
     AttentionApply attention;
+    SingleQueryAttention singleQueryAttention;
 
-    // The residual stream, which three sublayers add to in turn. Three buffers
-    // rather than two because there are three additions and no dispatch here
-    // reads and writes one buffer: a layer enters and leaves in hidden, so the
+    // The residual stream, which three sublayers add to in place from their
+    // last projection's store: a layer enters and leaves in hidden, so the
     // next layer reads what this one wrote without a swap the call site would
     // have to keep track of.
     std::optional<eacp::GPU::Buffer> hidden;
-    std::optional<eacp::GPU::Buffer> afterSelfAttention;
-    std::optional<eacp::GPU::Buffer> afterCrossAttention;
 
     std::optional<eacp::GPU::Buffer> normalised;
     std::optional<eacp::GPU::Buffer> queries;
     std::optional<eacp::GPU::Buffer> attended;
-    std::optional<eacp::GPU::Buffer> attentionOutput;
     std::optional<eacp::GPU::Buffer> selfScores;
-    std::optional<eacp::GPU::Buffer> selfWeights;
     std::optional<eacp::GPU::Buffer> crossScores;
-    std::optional<eacp::GPU::Buffer> crossWeights;
     std::optional<eacp::GPU::Buffer> feedForward;
-    std::optional<eacp::GPU::Buffer> activatedFeedForward;
-    std::optional<eacp::GPU::Buffer> feedForwardOutput;
     std::optional<eacp::GPU::Buffer> normalisedRows;
 
     // One pair per layer. The self-attention pair grows a row per token and is

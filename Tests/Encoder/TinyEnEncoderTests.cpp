@@ -101,7 +101,11 @@ auto tTinyEnFullWindow = test("Encoder/TinyEn/fullWindow") = []
     encoder.prepare(device);
 
     auto commands = device.makeCommandBuffer();
-    encoder.encode(commands, mel, weights, output);
+
+    {
+        auto pass = commands.beginCompute();
+        encoder.encode(pass, mel, weights, output);
+    }
 
     const auto start = std::chrono::steady_clock::now();
     commands.commit();

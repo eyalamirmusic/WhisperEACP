@@ -223,6 +223,7 @@ auto tEncoderShapeMismatchIsAnError = test("Encoder/shapeMismatchIsAnError") = [
     const auto mel = storageOf(syntheticMel(shorter));
     const auto output = outputFor(shorter.elementCount());
     auto commands = device.makeCommandBuffer();
+    auto pass = commands.beginCompute();
 
-    check(throwsModelError([&] { encoder.encode(commands, mel, weights, output); }));
+    check(throwsModelError([&] { encoder.encode(pass, mel, weights, output); }));
 };
