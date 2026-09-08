@@ -7,6 +7,7 @@
 nano_add_executable(WhisperTests
         NO_MAIN
         SOURCES
+        LiveTranscriberTests.cpp
         TranscribeTests.cpp
         WhisperTests.cpp
         ${WHISPER_GPU_TEST_MAIN}

@@ -166,7 +166,11 @@ rather than `eacp-core`, since every layer above it holds GPU buffers.
 **Audio/** — the audio contract Whisper was trained against (16 kHz mono,
 400-point STFT, 160-sample hop, 30 s window) and capture through MakeASound.
 Those constants are the model's, not choices; they are pinned by value in
-`Tests/Audio` the way a wire format would be.
+`Tests/Audio` the way a wire format would be. `Audio/Capture` is the microphone
+half: a `MakeASound::DeviceManager` opened at Whisper's own rate, the selected
+channels mixed to mono on the device callback and handed to `drain()` through a
+queue that thread never blocks on, with the peak and RMS of the last block for a
+meter and the device and channel choice as `setDevice`/`setChannels`.
 
 **Kernels/** — layernorm, GELU, softmax, the tiled matrix product and the
 rest as `ComputeProgram` subclasses, shapes as uniforms so the encoder and
@@ -182,7 +186,11 @@ BPE and Whisper's special tokens.
 
 **Encoder/** and **Decoder/** — HF's two halves out of those kernels, the second
 over a KV cache. **Whisper/** — the whole runtime, and the greedy search the
-decoder leaves to a layer that can hold the generation config.
+decoder leaves to a layer that can hold the generation config. `LiveTranscriber`
+sits above it: 16 kHz mono samples in and a growing transcript out, with the
+open segment re-run as audio arrives and closed into `committed()` on silence or
+on length. Every clock in it is audio time rather than wall time, so a run over
+a given recording is deterministic.
 
 The pipeline runs end to end: 30 seconds of audio in, a string out, checked
 against a double-precision reference at every layer and against whisper.cpp at
@@ -308,6 +316,35 @@ Three forms, and the app says which one it took before printing the transcript:
 
 A form that needs the bundled model in a build that copied none prints how to
 get one and returns 2.
+
+### `Apps/Demo/LiveTranscribe`
+
+The runtime over a microphone, in a window: an input device and a channel slice
+chosen from two `UI::ComboBox`es filled from MakeASound's
+`UIDeviceManager` dropdowns, a level meter, and the transcript as it is spoken.
+Three parts under a `UI::ComponentHost`: `MainPanel` is the tree and the layout,
+`LevelMeter` draws the last block's RMS as a dB-scaled fill under a peak tick
+that holds and falls, and `TranscriptView` wraps the text by hand inside a
+`ScrollPanel` — eacp's painter draws one line and measures one, and there is no
+wrapped-text call or text-area widget in the tier. `Session` is the non-UI half:
+the `Whisper`, the `Capture` and the `LiveTranscriber` over the two.
+
+**Everything runs on the message thread**, from one 30 Hz `Threads::Timer`, and
+that is a constraint rather than a simplification: eacp's GPU layer is
+main-thread only and `Whisper::transcribe` blocks on its own commits, so a tick
+drains the capture queue, pushes it, and lets `LiveTranscriber::update()` decide
+whether a run is due. The device callback is the only other thread and it
+reaches nothing here. The model is loaded from a `Threads::callAsync` posted in
+the app's constructor, so the window is up saying "loading model..." before the
+half second of mapping and kernel compilation starts.
+
+Two build-side requirements. The bundle needs an `Info.plist.in` of its own
+carrying `NSMicrophoneUsageDescription` — set **after**
+`whisper_set_default_target_setting`, which points every bundle here at eacp's
+stock template — since macOS blocks a capture app that asks for the microphone
+without one, and blocks it by hanging inside CoreAudio on the thread that asked.
+And `Apps/CMakeLists.txt` adds the tree behind `if (TARGET eacp-ui)`, eacp
+building its widget tier only where it has a Metal or D3D12 backend.
 
 ## Correctness validation
 

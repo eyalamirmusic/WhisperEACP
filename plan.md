@@ -723,3 +723,85 @@ a `Vector`, which is deliberate and costs a named local at every such call —
 `transcribe(readWavFile(...))` in `Tests/Bundled` are two more of them, and
 each reads as a temporary that had to be given a name for no reason a call
 site can see.
+
+## Live transcription
+
+Three pieces, in the order the audio moves through them.
+
+`Audio/Capture` is the microphone: a `MakeASound::DeviceManager` opened at
+Whisper's own 16 kHz, the chosen slice of the chosen device's channels averaged
+to mono in the device callback, and the result pushed into an SPSC queue the
+main thread empties with `drain()`. Nothing on the audio thread allocates,
+locks or calls back into the manager — the mono block is one scratch sized once
+at 8192 frames and a larger block is dropped and counted, and the notifications
+are drained on the caller's thread rather than taken from the callback the OS
+raises them on, which can already hold the device. The peak and the RMS of the
+last block go out through two relaxed atomics, which is the whole of what a
+meter needs.
+
+`Whisper/LiveTranscriber` is the policy: samples in, a growing transcript out.
+It quantises everything to 100 ms blocks and measures every clock in audio time
+rather than wall time, so a run over a given recording is deterministic. A block
+whose RMS is above **-40 dBFS** is speech; the open segment keeps 0.3 s of
+lead-in silence and drops what came before the first speech block; it is re-run
+through `Whisper::transcribe` every **0.5 s** of new audio; and it closes — into
+`committed()`, the open text moving out of `pending()` — on **1.0 s** of
+continuous silence after speech, or at **25 s**, which is the 30 s window less
+room to grow. A segment holding less than 0.3 s of speech is never sent to the
+model at all. At most one model run happens per `update()`, which is what makes
+it safe to drive from a timer.
+
+`Apps/Demo/LiveTranscribe` is the window over the two: an input device and a
+channel pair from MakeASound's `UIDeviceManager` dropdowns, a dB-scaled level
+meter, and the transcript with the closed segments in the theme's text colour
+and the open one in the accent, since every word of it may still change. The
+whole loop is one 30 Hz `Threads::Timer` on the message thread — eacp's GPU
+layer is main-thread only and `Whisper::transcribe` blocks on its own commits,
+so there is nowhere else for it to be.
+
+### What the live loop surfaced in the dependencies
+
+| finding | where, and what it means |
+| --- | --- |
+| no wrapped text, and no text area | `UI::Graphics` draws a run on one line (`drawText(text, baselineLeft)`) and places one in a box (`drawText(text, area, justification)`); neither wraps, and `TextEditor` is single line "on purpose", wrapping being "a layout problem the tier has not needed yet". So `TranscriptView` measures word by word and lays the lines out itself, and because a component cannot resize itself, the height that wrap came to has to be pushed back into the `ScrollPanel` by the panel that owns both. A `drawFittedText`, or a read-only multi-line label, is the missing piece |
+| the GPU is main-thread only, and a run blocks | `GPU/README.md:6`, and `Whisper::transcribe` waits on every `commit()`. A live run therefore stalls the window for the length of the run — tens of milliseconds in Release, a good deal more in Debug — and the meter and the transcript both freeze for it. The fix direction is a `CommandBuffer::commitAsync` inside `Whisper` (a completion handler rather than a wait), or a run on a device queue of its own that the message thread polls |
+| `AudioCallbackInfo::maxBlockSize` is not the block delivered | `MiniAudioDeviceManager::openStream` overwrites `config.maxBlockSize` with the device's *internal* period at its *native* rate, so a 48 kHz device opened at 16 kHz reports about three times the frames the callback actually receives. Anything sizing a scratch from it over-allocates by the resample ratio; `Capture` sizes a fixed 8192-frame scratch and reports `info.numSamples` as the block size instead |
+| no resampler choice | `StreamConfig` has no resampler field, so a device that cannot open at 16 kHz goes through miniaudio's default converter with no way to ask for a better one. On this machine no input lists 16000 Hz, so every capture here is resampled — and still arrives at exactly 16 kHz mono, 6656 samples in 400 ms, block 512 |
+| nothing reports what a stream resampled *from* | miniaudio knows (`device.capture.internalSampleRate`) and MakeASound does not surface it, so "native or resampled" can only be inferred from the enumerated `sampleRates` snapshot, which another app can invalidate between the enumeration and the open |
+| `SPSCQueue` has no bulk operations | no `pushRange`/`popRange`, no `size()`, no `clear()`. A 512-frame block is 512 acquire/release pairs each way, and flushing stale audio before a re-open is a pop-until-empty loop |
+| `setConfig` always starts the stream | `DeviceManager::setConfig` unconditionally starts, so "change the config and stay stopped" needs the caller to guard on `isRunning()` before every re-open, which `Capture::applySelection` does |
+| `getDevices()` re-enumerates every call | `MiniAudio::DeviceManager::getDevices` refreshes its cache on each ask rather than on a device notification, and with ten inputs on this machine that is about **90 ms on the calling thread**. A panel polling it every two seconds, which is what MakeASound's own probe app does, therefore hitches; the answer is a cached snapshot invalidated by the notification that already exists |
+| opening an input blocks until the permission prompt is answered | `Capture::start` → `ma_device_init` → CoreAudio's `AudioDeviceCreateIOProcID` sits in `mach_msg` while TCC decides, so an app whose microphone grant has not been given yet freezes on the thread that asked — the message thread, here. MakeASound has neither an asynchronous open nor a way to ask about the permission first |
+| `UI::Button` has no enabled state | so "Start is disabled until the model is ready" is spelled as an accent colour and a click the handler swallows. `Checkbox` and `Slider` are the same |
+| `EA::Vector` has no bulk append from a `Span` | `LiveTranscriber::push` copies element by element. Not worth changing on its own, but it is the second half of the `SPSCQueue` row: nothing in either container library moves a run of samples in one call |
+
+### After the live loop
+
+Four things the live loop wants that are this project's own next work rather
+than anything a dependency owes it, all of them in `Whisper`'s API:
+
+**No incremental encode.** Every re-run of the open segment uploads the whole
+30 s window and recomputes the mel and the encoder — about 10 ms — for 0.5 s of
+new audio, which is 24 full encodes for one jfk-length utterance. A `Whisper`
+that held an encoded window and only re-decoded would roughly halve a live run.
+
+**No `<|startofprev|>` prompt.** `Whisper::prompt()` is fixed at
+`<|startoftranscript|><|notimestamps|>`, so nothing can carry the previous
+segment's text across a cut. Measured on jfk.wav repeated three times, the
+segment after the 12 s cut loses the "And so" that preceded it.
+
+**No timestamps out.** The timestamp ids are unmasked and nothing surfaces them,
+so a segment boundary can only sit where the block classifier guessed rather
+than at a decoded silence. The two together are the fix for the row above.
+
+**No token callback.** `transcribe()` returns when it is done; `stepsPerCommit`
+is already 4, so the hook a partial-result callback would hang off exists
+internally.
+
+The policy's own numbers, measured rather than picked: the longest internal
+silent run in jfk.wav at -40 dBFS is 9 blocks — 0.9 s, the pause after "can do
+for you" — so the 1.0 s hold clears it by a single block, and either a 0.8 s
+hold or a -35 dB threshold splits that sentence in two. A live run over the
+whole recording is 24 model runs over 130 chunks, 0.717 s of wall clock in a
+Debug build with the last run at 0.038 s, and the committed line comes out
+byte-identical to the pinned fixture.

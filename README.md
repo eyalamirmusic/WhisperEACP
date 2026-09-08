@@ -54,6 +54,7 @@ the second half of the point.
 | `Lib/WhisperEACP/Whisper` | The whole runtime — samples in, a transcript out |
 | `Apps/Console/DeviceInfo` | What this machine offers: GPU limits and input devices |
 | `Apps/Console/Transcribe` | A WAV file in, the transcript and what it cost out |
+| `Apps/Demo/LiveTranscribe` | A window: pick an input, watch the meter, read the transcript as it arrives |
 | `Samples` | `jfk.wav`, the recording the end-to-end tests run on |
 | `Tests` | NanoTest, one executable per module |
 | `Benchmark` | Our runtime against whisper.cpp, in one process, behind `WHISPER_EACP_ENABLE_BENCHMARK` |
@@ -106,6 +107,25 @@ above still works, and `Whisper::hasBundledModel()` answers `false`.
 `samples/jfk.wav`, which is OpenAI whisper's own `tests/jfk.flac`. The recording
 is a US government work held by the JFK Library and is
 [public domain](https://archive.org/details/JohnF.KennedyInauguralAddress).
+
+### Live Transcribe
+
+`Apps/Demo/LiveTranscribe` is the same runtime over a microphone: pick an input
+device and which of its channels to listen to, watch the level meter, and read
+the transcript as it is spoken — closed sentences in white, the one still being
+re-decoded in blue. It carries the model the way `Transcribe` does, so it needs
+nothing on disk either.
+
+```bash
+open ./build/Apps/Demo/LiveTranscribe/LiveTranscribe.app
+```
+
+Capture, the segment policy and the model all run on the message thread, since
+eacp's GPU layer is main-thread only — so a run of the model is a few tens of
+milliseconds the window waits for, and only the device callback is on a thread
+of its own. `--autostart` opens the default input as soon as the model is ready
+and logs a line a second to stdout, which is how a run is checked without a hand
+on the mouse.
 
 ## Benchmarking
 

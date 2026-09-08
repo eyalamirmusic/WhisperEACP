@@ -14,6 +14,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <memory>
 #include <filesystem>
 #include <string>
 #include <string_view>
@@ -68,6 +69,25 @@ constexpr auto jfkTranscript =
     "ask what you can do for your country.";
 
 constexpr auto jfkTokenCount = 24;
+
+// One prepared runtime for every test in this module: loading maps 151 MB and
+// preparing compiles every kernel and uploads every tensor, and none of that is
+// what any of these tests is about. Inline, so the two source files that
+// transcribe share the one rather than each preparing a model of its own.
+//
+// Only ever reached from a test that has already checked hasWhisperModel().
+inline Whisper& preparedModel()
+{
+    static const auto model = []
+    {
+        auto whisper = std::make_unique<Whisper>();
+        whisper->load(modelDirectory());
+        whisper->prepare();
+        return whisper;
+    }();
+
+    return *model;
+}
 
 inline std::string trimmed(const std::string& text)
 {

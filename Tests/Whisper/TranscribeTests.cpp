@@ -4,7 +4,6 @@
 
 #include <cmath>
 #include <iostream>
-#include <memory>
 #include <numbers>
 #include <string>
 #include <vector>
@@ -28,22 +27,6 @@ bool canRun()
 {
     return Device::shared().isValid() && hasWhisperModel()
            && hasSampleFile(jfkSample);
-}
-
-// One prepared runtime for the whole module: loading maps 151 MB and preparing
-// compiles every kernel and uploads every tensor, and none of that is what these
-// tests are about.
-Whisper& preparedModel()
-{
-    static const auto model = []
-    {
-        auto whisper = std::make_unique<Whisper>();
-        whisper->load(modelDirectory());
-        whisper->prepare();
-        return whisper;
-    }();
-
-    return *model;
 }
 } // namespace
 

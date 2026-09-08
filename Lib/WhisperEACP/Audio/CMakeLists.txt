@@ -5,6 +5,7 @@ add_library(whisper-audio STATIC)
 target_link_libraries(whisper-audio PUBLIC whisper-core MakeASound)
 
 target_sources(whisper-audio PRIVATE
+        Capture.cpp
         Format.cpp
         WavFile.cpp)
 

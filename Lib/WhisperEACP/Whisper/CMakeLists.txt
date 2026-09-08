@@ -16,6 +16,7 @@ target_link_libraries(whisper-runtime PUBLIC
         whisper-tokenizer)
 
 target_sources(whisper-runtime PRIVATE
+        LiveTranscriber.cpp
         Whisper.cpp)
 
 # Where the build's post-build copy put what this binary ships — see
