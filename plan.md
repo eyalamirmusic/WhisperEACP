@@ -1083,3 +1083,118 @@ third halving of it. What is left, in the order this machine values it:
   a non-finding; the transposed A slab was not retried this round.
 - **A movable `CommandBuffer`** in eacp, so the pipelined loop's ring need not
   be a row of `std::optional`s.
+
+## Fourth performance round: simdgroup matrices
+
+The item the last three rounds kept deferring. eacp grew a SIMD-group matrix —
+`SimdMatrix`, `simdGroupIndex()`, `multiplyAccumulate()`, `write()` — and every
+product in the tree was rewritten out of it and switched over one role at a
+time. Same M5 Max, same jfk.wav, same 30 timed runs.
+
+| | WhisperEACP before | WhisperEACP after | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- | --- |
+| transcribe, median | 0.01868 s | **0.01770 s** | 0.031 s | 0.103 s |
+| x real time, over the 30 s window | 1606 | **1696** | 976 | 292 |
+| encode, median | 0.00612 s | **0.00523 s** | 0.005 s | 0.076 s |
+| decode, median, 25 steps | 0.01238 s | **0.01229 s** | 0.0143 s | 0.0140 s |
+
+**5.2% off the run and 14.6% off the encode**, the transcript unchanged token
+for token against both whisper.cpp columns, and 284 tests green. The encode is
+now within 5% of whisper.cpp's own — the row this round was aimed at — and the
+whole run is 1.74x its.
+
+### The kernel
+
+`Kernels/SimdTiledMatMul.h`, beside `TiledMatMul.h` and templated over the same
+`OperandLayout` and `WeightStorage`, computing the same `TiledMatMulShape` with
+the same batch and stride semantics and the same fold on the store. A role is
+switched by an alias and no call site moves.
+
+256 threads is eight SIMD groups; they stand two deep and four across over a
+64 x 64 tile of C, so each holds 32 rows by 16 columns of it as eight 8 x 8
+accumulator fragments. The inner dimension goes by in slabs of 32, staged into
+one `shared<Float>(64 * 32 + 32 * 64)` array, and the tile of C goes back out
+through that same array so the copy-out can be guarded element by element — a
+fragment is loaded and stored whole and has no per-element guard to put on one.
+The store's fold happens in that copy-out, which every element passes through
+anyway.
+
+Four numbers decided the shape, all of them measured in eacp's own
+`Tests/GPU/SimdMatrixTests.cpp` before any of this was written: eight
+accumulator fragments a SIMD group rather than sixteen (sixteen collapses to
+under 1 TFLOPS), staging C back through threadgroup memory rather than straight
+to the buffer (free), storing the fragments unconditionally rather than
+branching around them (branching halves the throughput), and no bank-conflict
+pitch on the A slab, `simdgroup_load` wanting the natural stride.
+
+### What each role bought, and which were kept
+
+Each switched on its own and measured A B B A against the build before it, four
+runs of 30 a side, read from the `encode, median` row at five decimals — the
+benchmark's decimals were widened while the round ran and put back afterwards,
+as in the third round.
+
+| role | shape it dispatches | effect | kept |
+| --- | --- | --- | --- |
+| the encoder's linear projections — q, k, v, out_proj, fc1, fc2, and both convolutions' unfold products | [1500, 384] x [384, 384] and x [384, 1536], plus [3000, 240] x [240, 384] and [1500, 1152] x [1152, 384] | **−0.57 ms of encode**, −9.3% | yes |
+| the encoder's attention apply | [1500, 1500] x [1500, 64] per head, B read along n | **−0.19 ms**, −3.4% | yes |
+| the encoder's attention scores | [1500, 64] x [64, 1500] per head, six batches | **−0.13 ms**, −2.3% | yes |
+| the decoder's `beginSequence` cross projections | [1500, 384] x [384, 384], eight of them once a sequence | **−0.13 ms of decode**, −1.1% | yes |
+| the mel front-end's STFT product | [3000, 400] x [400, 402] | **−0.02 ms**, at the edge of what the harness resolves | yes |
+
+All five, then — the first time in four rounds that nothing had to be handed
+back. What separates them is only size: the encoder's linears are 78% of the
+round's win, and the STFT is a rounding error that was kept because every
+reading of it fell on the same side.
+
+The attention scores were split onto a program member of their own to be
+measured at all: they had been dispatched through the encoder's `projection`,
+a key row being contiguous along the head dimension exactly as a weight row is
+along its inputs, so switching the projections switched them silently. They
+stay split, because a [1500, 1500] product over a head's 64 columns is not the
+shape a projection is and the two roles should be free to disagree.
+
+### The negative results
+
+| tried, or found and not taken | result |
+| --- | --- |
+| zero-filling both slabs past the inner extent | **half of it is dead.** Dropping the zero-fill on either operand alone changes no answer and fails no test, because a term is zero if *either* factor is: the partial slab's A is already zeroed where B's tail is a clamped weight, and the other way round. Both were kept anyway — one of them is load-bearing, neither is obviously the one, and correctness resting on `0 * x` is not worth two `select`s. It is recorded here because a mutation check that drops one and passes looks like missing coverage and is not |
+| the register-tiled kernel, retired | **not retired, and it should not be.** eacp lowers a fragment to 64 floats of each thread's own wherever there is no wave matrix instruction, which is correct and does the arithmetic 32 times over. `TiledMatMul` stays as the Windows and Linux fast path, and the role aliases in `SimdTiledMatMul.h` are what pick between them |
+| one tolerance moved | `Kernels/simdTiledLinearEncoderWidths` is the only check in the tree that asks a product of 1536 terms, and 1e-5 relative to the answer is the wrong measure for one: the partial sums reach ±80 on the way to an answer that cancels to 0.1, so the error is the accumulation's and not the answer's. `TiledProduct::dotProductTolerance` adds one float epsilon per term and that test alone passes it. **No existing tolerance moved** — every other check still asks 1e-5, and the encoder's double-precision references and the oracle's residuals did not move at all |
+
+### What this needed in eacp
+
+Nothing. The primitive had already landed on the `simdgroup-matrix` branch, and
+this round did not have to add an overload to it or fix its lowering — which is
+the first time a round here has used something new in eacp without immediately
+finding a gap beside it. The four rules the README names (a fragment loaded and
+stored whole, offsets and strides uniform across the group, every thread
+reaching every operation, a threadgroup that is a whole number of SIMD groups)
+were enough to write a batched, strided, folded, ragged-edged product against.
+
+**The tree therefore needs eacp's `simdgroup-matrix` branch until it lands on
+develop** — but it does not *require* it. `CMake/Findeacp.cmake` asks the eacp
+it was handed whether `ShaderBuilder.h` declares `simdMatrix` and defines
+`WHISPER_EACP_HAS_SIMD_MATRIX` from the answer; without it the header declares
+no program, the role aliases all name the register-tiled product, and the tree
+builds and transcribes exactly as it did before this round, saying so at
+configure time. A fetch at develop is 269 tests green; the branch is 284, the
+fifteen extra being the new kernel's own.
+
+### What is still on the table after this
+
+The encode is 5.2 ms and the step 492 us. The encoder is now 30% of the run and
+the products inside it are no longer the largest thing in it.
+
+- **The cross attention's KV cache in fp16**, still, and still not free — see
+  the third round.
+- **The 64 x 64 tile against the decoder's few rows.** `beginSequence` was the
+  only decoder product worth switching because everything else a step does has
+  one to sixteen rows, where a 64-row tile is 98% waste and `SplitLinear` is
+  the right kernel. A SIMD-group form of *that* — the inner sum split across a
+  group, out of fragments — is a different kernel, not this one re-tiled.
+- **A shape that is not a multiple of 64 pays for it.** The encoder's 1500 rows
+  leave 36 of the last tile outside the shape on every one of its products,
+  which is 2.3% of the arithmetic thrown away. The register-tiled kernel's 32
+  wastes 0.7%. Nothing was done about it and nothing obvious can be.
+- **A movable `CommandBuffer`** in eacp, unchanged from the third round.

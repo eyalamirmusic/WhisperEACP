@@ -14,6 +14,28 @@ CPMAddPackage(
         OPTIONS
         "EACP_BUILD_WEBVIEW OFF")
 
+# eacp's SIMD-group matrix — SimdMatrix, simdGroupIndex(), multiplyAccumulate()
+# — is what Kernels/SimdTiledMatMul.h is written against, and it is on a branch
+# until it lands on develop. So the tree asks the eacp it was handed whether it
+# has one rather than assuming, and an eacp without it gets the register-tiled
+# product for every role, which is what every non-Metal backend gets anyway.
+#
+# The declaration in the header is the test: there is no version to compare
+# against, eacp tagging none.
+file(READ "${eacp_SOURCE_DIR}/Lib/eacp/GPU/Codegen/ShaderBuilder.h"
+        whisper_eacp_shader_builder)
+
+string(FIND "${whisper_eacp_shader_builder}" "SimdMatrix simdMatrix("
+        whisper_eacp_simd_matrix_at)
+
+if (whisper_eacp_simd_matrix_at EQUAL -1)
+    set(WHISPER_EACP_HAS_SIMD_MATRIX OFF)
+    message(STATUS "eacp has no SIMD-group matrix: the products run the "
+            "register-tiled kernel, and the benchmark measures that")
+else ()
+    set(WHISPER_EACP_HAS_SIMD_MATRIX ON)
+endif ()
+
 # eacp appends its own CMake/ to CMAKE_MODULE_PATH inside its directory scope,
 # which a parent project never inherits. Re-append it here so eacp's helper
 # modules stay reachable by name from this project's CMakeLists.

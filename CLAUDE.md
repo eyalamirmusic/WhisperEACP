@@ -128,6 +128,19 @@ suppressed inside quotes — `-DCPM_eacp_SOURCE="~/Code/eacp"` will silently
 configure against a non-existent path and fail later with an error about a
 missing `eacp-gpu` target.
 
+**The fastest products need eacp's `simdgroup-matrix` branch, and nothing here
+requires it.** `Kernels/SimdTiledMatMul.h` is written against eacp's SIMD-group
+matrix, which is on that branch until it lands on develop.
+`CMake/Findeacp.cmake` asks the eacp it was handed whether `ShaderBuilder.h`
+declares `simdMatrix` and defines `WHISPER_EACP_HAS_SIMD_MATRIX` from the
+answer; without it the header declares no program, the role aliases at its foot
+all name the register-tiled `TiledMatMul`, and the tree builds, tests and
+transcribes exactly as it did before — 269 tests rather than 284, and a
+configure that says so. The configure line above is still the whole story. What
+it costs is the fourth performance round's 5%: benchmark numbers only mean
+something from a tree configured against the branch, until that branch is on
+develop and this paragraph goes away.
+
 ## Architecture
 
 New source files are added directly to the module's CMakeLists.txt under the
@@ -177,6 +190,10 @@ rest as `ComputeProgram` subclasses, shapes as uniforms so the encoder and
 decoder can be written out of them. Row-wise kernels give a group to a row
 (`Reduce.h`); products are `TiledMatMul` for many rows and `SplitLinear` for a
 step's few; a decode step's attention is `SingleQueryAttention`.
+`SimdTiledMatMul.h` is the many-row product again out of eacp's SIMD-group
+matrices, and the role aliases at its foot — `LinearProduct`,
+`AttentionScoresProduct` and the rest — are what every call site names, so
+which of the two kernels a product runs is one decision in one place.
 
 **Mel/** — the front-end: Hann, a reflect-padded STFT, the 80 x 201 filterbank,
 log10 and Whisper's clamp-and-scale.

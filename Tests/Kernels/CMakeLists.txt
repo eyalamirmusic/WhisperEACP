@@ -8,6 +8,7 @@ set(kernel_test_sources
         LayerNormTests.cpp
         LinearTests.cpp
         MatMulTests.cpp
+        SimdTiledMatMulTests.cpp
         SoftmaxTests.cpp
         TiledMatMulTests.cpp
         UnfoldTests.cpp)

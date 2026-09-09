@@ -28,6 +28,7 @@
 #include "Linear.h"
 #include "MatMul.h"
 #include "Reduce.h"
+#include "SimdTiledMatMul.h"
 #include "SingleQueryAttention.h"
 #include "Softmax.h"
 #include "TiledMatMul.h"

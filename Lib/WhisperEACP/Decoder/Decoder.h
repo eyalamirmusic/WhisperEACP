@@ -170,8 +170,8 @@ private:
     // The one-row group: every layer norm a step takes is a single row of 384,
     // and the prompt step's is two.
     LayerNorm normalisation {LayerNorm::singleRowLanes};
-    TiledLinear projection;
-    HalfWeightTiledLinear packedProjection;
+    CrossProjectionProduct projection;
+    HalfWeightCrossProjectionProduct packedProjection;
     SplitLinear splitProjection;
     HalfWeightSplitLinear packedSplitProjection;
     AttentionScores scores;

@@ -34,21 +34,22 @@ Buffer allocateZeroed(Device& device, int elementCount)
         zeroes.data(), floatBytes(elementCount), BufferUsage::Storage);
 }
 
-// The two projection programs differ only in how they read the weight, so
-// the bind is written once against whichever of them the caller picked.
-template <WeightStorage weightStorage>
-void dispatchLinear(
-    TiledMatMulProgram<OperandLayout::ContiguousK, weightStorage>& program,
-    ComputePass& pass,
-    const Buffer& input,
-    const Buffer& weight,
-    const Buffer& bias,
-    const Buffer& target,
-    int innerCount,
-    int outputWidth,
-    int rowCount,
-    bool gelu,
-    bool residual)
+// The projection programs differ only in how they read the weight and in which
+// tiling they compute the product with, so the bind is written once against
+// whichever of them the caller picked: every one of them takes a
+// TiledMatMulShape.
+template <typename Program>
+void dispatchLinear(Program& program,
+                    ComputePass& pass,
+                    const Buffer& input,
+                    const Buffer& weight,
+                    const Buffer& bias,
+                    const Buffer& target,
+                    int innerCount,
+                    int outputWidth,
+                    int rowCount,
+                    bool gelu,
+                    bool residual)
 {
     program.a = input;
     program.b = weight;
@@ -76,6 +77,7 @@ void Encoder::prepare(Device& device)
     projection.prepare(device);
     packedProjection.prepare(device);
     softmax.prepare(device);
+    scores.prepare(device);
     attention.prepare(device);
 
     const auto convolutionElements = encoderShape.convolutionElementCount();
@@ -305,15 +307,15 @@ void Encoder::encodeAttention(ComputePass& pass, const EncoderLayerWeights& weig
     pass.barrier();
 
     // The scores are a product of the queries against the keys, one batch per
-    // head over the head's columns, through the same program as the
-    // projections: a key row is contiguous along the head dimension exactly
-    // as a weight row is along its inputs.
-    projection.a = *queries;
-    projection.b = *keys;
-    projection.bias = *zeroBias;
-    projection.output = *attentionScores;
+    // head over the head's columns, in the same layout as the projections: a
+    // key row is contiguous along the head dimension exactly as a weight row
+    // is along its inputs.
+    scores.a = *queries;
+    scores.b = *keys;
+    scores.bias = *zeroBias;
+    scores.output = *attentionScores;
 
-    projection.dispatch(
+    scores.dispatch(
         pass,
         TiledMatMulShape::forAttentionScores(positions,
                                              positions,

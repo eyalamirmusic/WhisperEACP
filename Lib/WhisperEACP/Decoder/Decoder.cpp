@@ -52,19 +52,18 @@ void allocatePerLayer(Vector<Buffer>& buffers,
 // spread the work, so the bind is written once against whichever of them the
 // caller picked. The target is a range rather than a buffer because one of its
 // call sites writes into the middle of a KV cache.
-template <WeightStorage weightStorage>
-void dispatchLinear(
-    TiledMatMulProgram<OperandLayout::ContiguousK, weightStorage>& program,
-    ComputePass& pass,
-    const Buffer& input,
-    const Buffer& weight,
-    const Buffer& bias,
-    const BufferRange& target,
-    int innerCount,
-    int outputWidth,
-    int rowCount,
-    bool gelu,
-    bool residual)
+template <typename Program>
+void dispatchLinear(Program& program,
+                    ComputePass& pass,
+                    const Buffer& input,
+                    const Buffer& weight,
+                    const Buffer& bias,
+                    const BufferRange& target,
+                    int innerCount,
+                    int outputWidth,
+                    int rowCount,
+                    bool gelu,
+                    bool residual)
 {
     program.a = input;
     program.b = weight;

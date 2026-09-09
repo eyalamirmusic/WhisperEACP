@@ -111,10 +111,16 @@ private:
 
     // The many-row group: every layer norm here is 1500 rows at once.
     LayerNorm normalisation {LayerNorm::manyRowLanes};
-    TiledLinear projection;
-    HalfWeightTiledLinear packedProjection;
+    LinearProduct projection;
+    HalfWeightLinearProduct packedProjection;
     Softmax softmax;
-    TiledMatMul attention;
+
+    // The scores are the same product shape as a projection and were dispatched
+    // through the same program, but the two roles pick their kernel separately
+    // — a [1500, 1500] product over a head's 64 columns is not the shape a
+    // projection is — so each holds its own.
+    AttentionScoresProduct scores;
+    AttentionApplyProduct attention;
 
     // The residual stream is hidden, added to in place by every sublayer's
     // last projection; the GELUs are on the stores that feed them and the

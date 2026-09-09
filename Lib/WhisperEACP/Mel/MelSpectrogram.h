@@ -3,7 +3,7 @@
 #include "MelKernels.h"
 #include "MelShape.h"
 
-#include <WhisperEACP/Kernels/TiledMatMul.h>
+#include <WhisperEACP/Kernels/SimdTiledMatMul.h>
 
 #include <optional>
 
@@ -52,7 +52,7 @@ private:
     MelShape melShape;
 
     StftFramesKernel framing;
-    TiledLinear transform;
+    SpectrumProduct transform;
     SpectrumPowerKernel squaring;
     MelProjectKernel projection;
     MaxReduceKernel reduction;
