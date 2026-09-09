@@ -539,14 +539,14 @@ public:
     // Seconds around the commit, which is the only clock available: eacp's
     // FrameTimer is driven by Frame and a CommandBuffer has no timestamp hook,
     // so an off-screen compute pass is timed by wall clock from a Debug host.
-    double begin(const Vector<float>& encoderOutput)
+    double begin(const Vector<float>& encoderOutput, int crossPositionCount = 0)
     {
         const auto rows = storageOf(encoderOutput);
         auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
 
         {
             auto pass = commands.beginCompute();
-            decoder.beginSequence(pass, rows, weights);
+            decoder.beginSequence(pass, rows, weights, crossPositionCount);
         }
 
         return commitSeconds(commands);
@@ -595,6 +595,7 @@ public:
     }
 
     int position() const { return decoder.position(); }
+    int crossPositions() const { return decoder.crossPositions(); }
     double stepSeconds() const { return lastStepSeconds; }
 
 private:

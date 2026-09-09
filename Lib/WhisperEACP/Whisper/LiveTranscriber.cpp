@@ -201,18 +201,34 @@ bool LiveTranscriber::hasAudioWorthTranscribing() const
            && segment.size() > coveredSamples;
 }
 
+// The first run of a segment happens as soon as there is speech worth sending;
+// every one after it wants both a step of new audio and some new speech in it.
+// The segment that closes is the exception and does not come through here:
+// closeSegment() runs on anything the last run did not cover, silence included,
+// since that trailing silence is what lets Whisper finish the last word.
 bool LiveTranscriber::runIsDue() const
 {
     if (!hasAudioWorthTranscribing())
         return false;
 
-    return !hasRunThisSegment
-           || segment.size() - coveredSamples
-                  >= samplesForSeconds(liveOptions.stepSeconds);
+    if (!hasRunThisSegment)
+        return true;
+
+    return segment.size() - coveredSamples
+               >= samplesForSeconds(liveOptions.stepSeconds)
+           && speechSamples - coveredSpeechSamples
+                  >= samplesForSeconds(liveOptions.minNewSpeechSeconds);
 }
 
+// The context is set per run rather than once, because the segment grows: a
+// run over 2 s of it encodes fewer positions than the run over 6 s that closes
+// it, and the count each one wants is the one its own audio fills.
 bool LiveTranscriber::runModel()
 {
+    if (liveOptions.encodeOnlyTheAudioThereIs)
+        model.setAudioContext(Whisper::audioContextForSamples(
+            segment.size(), liveOptions.audioContextMarginSeconds));
+
     const auto start = std::chrono::steady_clock::now();
     const auto tokens = model.transcribe(segment);
     const auto text = withoutSurroundingSpace(model.textForTokens(tokens));
@@ -221,6 +237,7 @@ bool LiveTranscriber::runModel()
     lastRun = std::chrono::duration<double>(elapsed).count();
     ++runCount;
     coveredSamples = segment.size();
+    coveredSpeechSamples = speechSamples;
     hasRunThisSegment = true;
 
     if (text == pendingText)
@@ -253,6 +270,7 @@ void LiveTranscriber::startSegment()
     speechSamples = 0;
     trailingSilentBlocks = 0;
     coveredSamples = 0;
+    coveredSpeechSamples = 0;
     segmentHasSpeech = false;
     hasRunThisSegment = false;
 }

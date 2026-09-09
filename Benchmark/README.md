@@ -27,7 +27,17 @@ Benchmark                  Samples/jfk.wav, 10 timed runs
 Benchmark 30               30 timed runs
 Benchmark recording.wav    another 16 kHz mono WAV of at most 30 s
 Benchmark 30 recording.wav
+Benchmark 30 --audio-ctx=704       both sides over 704 of the 1500 encoder positions
+Benchmark 30 --audio-ctx=audio     the positions Whisper::audioContextForSamples picks
+
+Benchmark --live           jfk.wav on repeat, 30 s of stream, a 1.5 s gap
+Benchmark --live 60        60 s of stream
+Benchmark --live 60 4      a 4 s gap between passes; 0 is speech with no pause in it
+Benchmark --live 60 4 recording.wav
+Benchmark --live --audio-ctx=audio    the live loop encoding only the audio it holds
 ```
+
+`--live` is the other measurement, and it has a section of its own below.
 
 ## Which whisper.cpp
 
@@ -86,6 +96,74 @@ Every clock is wall clock from the host. eacp has no GPU timestamp hook (the
 gaps table in `plan.md`), and whisper.cpp's are `ggml_time_us` around the
 same boundaries.
 
+## The live mode
+
+`--live` measures the other thing this runtime is asked to do: not one
+transcription, but keeping up with a microphone. `LiveTranscriber` re-runs the
+open segment every `stepSeconds` of new audio, so a machine that is listening
+pays a full transcribe several times a second, and what it costs is a *share of
+the wall clock* rather than a duration.
+
+The recording is played on repeat with a gap of silence between passes — a
+microphone left open over somebody who says the same thing again after a pause
+— pushed at a 33 ms tick, which is the timer `Apps/Demo/LiveTranscribe` runs.
+A run that overruns its tick hands the next one a larger block, exactly as the
+capture queue does while the model has the thread. No whisper.cpp on the other
+side: whisper.cpp has no equivalent of this layer, so there is nothing to put
+in a second column.
+
+Every clock in `LiveTranscriber` is audio time, so `runs` is the same number
+every time for a given recording, gap and policy, whatever the machine was
+doing. That is what makes this a before-and-after tool: the run count moves
+only when the policy does, and the seconds under it are the noise.
+
+```
+  stream, wall clock                       30.0 s
+  runs                                         49
+  runs that changed the text                   39
+  model                                    1.280 s
+  duty                                        4.3 %
+  per run, mean                             26.1 ms
+  per run, longest                          35.3 ms
+  encode, mean                              14.2 ms
+  decode, mean                              11.0 ms
+  steps per run                              13.0
+  segments committed                            2
+```
+
+`--audio-ctx=audio` runs the stream with `LiveOptions::encodeOnlyTheAudioThereIs`
+on, which is what `Apps/Demo/LiveTranscribe` does: each run encodes the
+segment's audio plus a margin rather than the whole window, and the policy line
+above the table says which of the two a run measured. In the comparison mode the
+same flag sizes the context to the recording, on both sides.
+
+| row | |
+| --- | --- |
+| `runs` | `Whisper::transcribe` calls the policy asked for. This is the number the policy moves; everything under it is what one of them costs |
+| `runs that changed the text` | of those, the ones whose transcript differed from the run before — a run over audio that told the model nothing is a run that should not have happened |
+| `model` | the wall clock inside those calls, added up |
+| `duty` | that over the stream's wall clock: **the number this mode exists for**, model seconds per wall second |
+| `per run` | the mean and the longest of the same calls. The longest is what a tick can be blocked for, which is the UI's latency rather than the machine's load |
+| `encode` / `decode` / `steps per run` | the same stages the table above breaks out, averaged over the runs |
+| `segments committed` | lines `LiveTranscriber` closed and handed to `committed()`, and the first of them is printed under the table so a policy change that broke the transcript says so |
+
+Two things have to be read with it, and both are ways of being wrong about
+this number.
+
+**A run at live cadence costs about twice what the table above measures.** The
+comparison runs back to back and holds the GPU at its clock; half a second of
+idle between 26 ms bursts does not, so the same work that takes ~21 ms there
+takes ~26 ms here, and the first run after a longer gap more. That is a real
+cost of running live, not a measurement artefact, which is why this mode times
+the runs it actually took rather than reusing the median from above.
+
+**macOS's GPU utilisation counter cannot see this.** The `AGXAccelerator`
+`Device Utilization %` in `ioreg`, which is what Activity Monitor shows, is a
+short-window snapshot: a 26 ms burst every 500 ms reads there as 50-80% busy
+while the true share is a twentieth. The duty row is the honest form of the
+same question, and only the runtime can answer it, since only the runtime knows
+which wall clock was its own.
+
 ## What it does not measure
 
 - **Other Whisper runtimes.** mlx-whisper, faster-whisper and openai-whisper
@@ -104,6 +182,18 @@ same boundaries.
 
 - **Anything but `tiny.en`** and, by default, anything but `jfk.wav`. The
   model is the one the build fetches; another WAV is an argument.
+
+- **The microphone**, in `--live`. The samples come from a file at a timer's
+  pace, so `Audio/Capture`, its device callback, its queue and its resampling
+  are all outside the measurement — which is deliberate: the numbers are then
+  the same on any machine with any input device, and reproducible on one with
+  none. `LiveTranscriber` is what the demo app puts between the two, and it is
+  what this drives.
+
+- **Whether the live transcript is any good**, beyond printing the first line
+  it committed. A policy that runs less often commits the same text or it does
+  not, and `Tests/Whisper/LiveTranscriberTests.cpp` is where that is asserted
+  rather than eyeballed.
 
 - **Kernel-level cost.** The step's GPU time is a chain of some sixty small
   kernels run one after another; `plan.md`'s performance rounds say which

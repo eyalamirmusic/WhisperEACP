@@ -43,12 +43,14 @@ namespace WSP
 // One program of each kind serves every dispatch of that kind: the shapes are
 // uniforms, so the layers, the two attentions and the two feed-forward widths
 // are re-bindings of a few pipelines rather than pipelines of their own. The
-// projections are held four ways: a float-weight program and a packed-half
-// one, so a weight that arrived fp16 is dispatched through the program that
-// reads it as fp16, and each of those in the many-row form the cross-attention
-// keys and values are projected with once per sequence and the few-row form a
-// step's one or two tokens take, where the inner sum is split across a group
-// instead of walked by a thread.
+// projections are the exception, and are held six ways over three questions: a
+// float-weight program and a packed-half one, so a weight that arrived fp16 is
+// dispatched through the program that reads it as fp16; the many-row form the
+// cross-attention keys and values are projected with once per sequence against
+// the few-row form a step's one or two tokens take, where the inner sum is
+// split across a group instead of walked by a thread; and, inside that
+// few-row form, the split count the shape wants — see stepSplitCount and
+// logitsSplitCount below.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -68,9 +70,16 @@ public:
     // The cross-attention keys and values are projected out of it for every
     // layer, and the position goes back to zero, so the next step is the
     // sequence's first.
+    //
+    // crossPositionCount is the encoder's own audio_ctx read back: an encoder
+    // that ran over a prefix wrote that many rows, so the projections take
+    // that many and every step of the sequence attends to that many. Zero, the
+    // default, is the whole encoder output. Nothing is allocated here — the
+    // caches are the shape's and a shorter sequence fills a prefix of them.
     void beginSequence(eacp::GPU::ComputePass& pass,
                        const eacp::GPU::Buffer& encoderOutput,
-                       const DecoderWeights& weights);
+                       const DecoderWeights& weights,
+                       int crossPositionCount = 0);
 
     // Appends tokenCount tokens to the sequence and writes their logits.
     //
@@ -104,6 +113,10 @@ public:
     // takes and the number of keys already cached.
     int position() const { return decodedPositions; }
 
+    // How many encoder rows this sequence attends to, which is what
+    // beginSequence was given.
+    int crossPositions() const { return activeCrossPositions; }
+
     // The last step's rows after the final layer norm and before the tied
     // projection — [tokenCount, width] row-major, valid until the next step
     // overwrites it. Exposed so a comparison that disagrees bisects to before
@@ -111,6 +124,27 @@ public:
     const eacp::GPU::Buffer& hiddenStates() const { return *normalisedRows; }
 
 private:
+    // How many lanes share one output's inner sum in the projections a step
+    // takes. A 384-wide input row is 96 float4s, so at 96 every lane reads
+    // exactly one and none idles; fc2's 1536 are four each. At the stock 8 a
+    // 384-wide projection dispatched 48 groups, which is a few thousand
+    // threads on a device that wants tens of thousands: measured against 8,
+    // 16, 32, 64, 128, 192, 256 and 384, and 96 is the floor of that curve on
+    // every one of the three shapes.
+    static constexpr auto stepSplitCount = 96;
+
+    // The logits projection wants far fewer. Its 51864 outputs fill the device
+    // at any split count, so the only thing more lanes buy is a longer fold
+    // and a thread that reads eight bytes — 64 measured 4% slower than 32 over
+    // the whole decode, 128 12% slower.
+    //
+    // The count is the **shape's** rather than the weight's, which is what
+    // keeps the float and packed logits bit identical: the two read the same
+    // matrix at two widths, and they sum it in the same order only if they are
+    // dispatched at the same split. Decoder/TinyEn/packedLogitsWeightIsIdentical
+    // is what says so.
+    static constexpr auto logitsSplitCount = 32;
+
     void requireMatchingWeights(const DecoderWeights& weights) const;
 
     void encodeLayer(eacp::GPU::ComputePass& pass,
@@ -164,6 +198,7 @@ private:
 
     DecoderShape decoderShape;
     int decodedPositions = 0;
+    int activeCrossPositions = 0;
 
     Embed embedding;
 
@@ -172,8 +207,10 @@ private:
     LayerNorm normalisation {LayerNorm::singleRowLanes};
     CrossProjectionProduct projection;
     HalfWeightCrossProjectionProduct packedProjection;
-    SplitLinear splitProjection;
-    HalfWeightSplitLinear packedSplitProjection;
+    SplitLinear splitProjection {stepSplitCount};
+    HalfWeightSplitLinear packedSplitProjection {stepSplitCount};
+    SplitLinear splitLogits {logitsSplitCount};
+    HalfWeightSplitLinear packedSplitLogits {logitsSplitCount};
     AttentionScores scores;
     Softmax softmax;
     AttentionApply attention;

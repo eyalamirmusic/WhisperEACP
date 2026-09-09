@@ -24,14 +24,19 @@ namespace WSP
 // the store would be recomputed from the stored value: exp of the exp.
 //
 // In place because the row is never needed unnormalised: an attention's score
-// buffer becomes its probability buffer, and the encoder's 54 MB of scores are
-// written once and read twice rather than copied.
+// buffer becomes its probability buffer rather than being copied.
+//
+// The encoder does not run this. Its score matrix is 54 MB a layer, and three
+// reads and two writes of that is more than the product either side of it
+// costs, so the scores product reports each row's maxima and the apply
+// normalises what it stages — TiledMatMul.h's AFold and RowMaxima. What is
+// left here is the decoder's prompt step, whose rows are few.
 //
 // Unlike LayerNorm's, one lane count serves both halves here, because a row
 // this long has work for every lane whichever half is asking: 256 measured
-// best over the encoder's 9000 rows of 1500 (207 us at the stock 64, 176 at
-// 256) and best again over the twelve rows the decoder's prompt step
-// normalises (9.6 us to 5.1). 512 loses at both.
+// best over 9000 rows of 1500 (207 us at the stock 64, 176 at 256) and best
+// again over the twelve rows the decoder's prompt step normalises (9.6 us to
+// 5.1). 512 loses at both.
 struct Softmax final : ReducingProgram
 {
     static constexpr auto preferredLanes = 256;

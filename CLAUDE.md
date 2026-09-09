@@ -128,18 +128,16 @@ suppressed inside quotes — `-DCPM_eacp_SOURCE="~/Code/eacp"` will silently
 configure against a non-existent path and fail later with an error about a
 missing `eacp-gpu` target.
 
-**The fastest products need eacp's `simdgroup-matrix` branch, and nothing here
-requires it.** `Kernels/SimdTiledMatMul.h` is written against eacp's SIMD-group
-matrix, which is on that branch until it lands on develop.
-`CMake/Findeacp.cmake` asks the eacp it was handed whether `ShaderBuilder.h`
-declares `simdMatrix` and defines `WHISPER_EACP_HAS_SIMD_MATRIX` from the
-answer; without it the header declares no program, the role aliases at its foot
-all name the register-tiled `TiledMatMul`, and the tree builds, tests and
-transcribes exactly as it did before — 269 tests rather than 284, and a
-configure that says so. The configure line above is still the whole story. What
-it costs is the fourth performance round's 5%: benchmark numbers only mean
-something from a tree configured against the branch, until that branch is on
-develop and this paragraph goes away.
+**The SIMD-group matrix is on eacp's develop, and nothing here requires it.**
+`Kernels/SimdTiledMatMul.h` is written against eacp's `SimdMatrix`, which
+landed on develop as `07ee972b`, so the plain fetch has it.
+`CMake/Findeacp.cmake` still asks the eacp it was handed whether
+`ShaderBuilder.h` declares `simdMatrix` and defines
+`WHISPER_EACP_HAS_SIMD_MATRIX` from the answer; against an older eacp the
+header declares no program, the role aliases at its foot all name the
+register-tiled `TiledMatMul`, and the tree builds, tests and transcribes as it
+did before the fourth performance round, with fifteen fewer tests and a
+configure that says so.
 
 ## Architecture
 
@@ -339,7 +337,15 @@ Three forms, and the app says which one it took before printing the transcript:
 ./build/Apps/Console/Transcribe/Transcribe                          # built-in model, built-in sample
 ./build/Apps/Console/Transcribe/Transcribe recording.wav            # built-in model
 ./build/Apps/Console/Transcribe/Transcribe path/to/model recording.wav
+./build/Apps/Console/Transcribe/Transcribe --audio-ctx=audio recording.wav   # encode only the audio there is
 ```
+
+`--audio-ctx=N|audio` is `Whisper::setAudioContext`, whisper.cpp's `audio_ctx`:
+the encoder runs over N of its 1500 positions, or over what the recording
+needs plus a margin. Off by default everywhere but `Apps/Demo/LiveTranscribe`,
+which turns `LiveOptions::encodeOnlyTheAudioThereIs` on; plan.md's fifth
+performance round has the transcripts at each context and the floor and margin
+that keep the decoder out of a repetition loop.
 
 A form that needs the bundled model in a build that copied none prints how to
 get one and returns 2.

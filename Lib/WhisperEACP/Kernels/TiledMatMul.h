@@ -16,6 +16,42 @@ enum class OperandLayout
     ContiguousN
 };
 
+// What the first operand goes through on its way into the product. Softmax
+// reads A as a row of raw scores and exponentiates each element as it is
+// staged, against the row maximum the product that wrote those scores left
+// behind — and, because one group's inner loop walks the whole row, sums what
+// it staged and divides the row by that sum on the store. So the softmax of an
+// attention costs no pass of its own: the score matrix is written once and read
+// once, where the normalising pass over it read it twice more and wrote it
+// twice.
+//
+// A row of A is the softmax row: batch b, row m, is row b * rows + m, which for
+// an attention's apply is head h, query i, exactly as the [heads, queries,
+// keys] score buffer is indexed.
+enum class AFold
+{
+    None,
+    Softmax
+};
+
+// Whether the product also reports, for each row of each of its column tiles,
+// the largest value it stored there — rowMaxima[(b * rows + m) * tiles + t],
+// tiles being the product's own column tile count. Which is the maximum an
+// AFold::Softmax reader of that same matrix needs, without the pass over it
+// that finding one otherwise costs: the reader folds the tiles of its row.
+//
+// The maximum is of the value stored, fold and mask included, so a masked
+// score is in it — which is what makes exp(masked - maximum) the zero
+// AttentionScores intends. A part of a tile that lies entirely past the shape
+// reports causalMaskScore, which is what an empty maximum is here for the same
+// reason it is what a masked score is: below every real one, and a literal
+// rather than a limit, so what the shader holds is what the host wrote.
+enum class RowMaxima
+{
+    None,
+    PerColumnTile
+};
+
 // One product the tiled kernel computes, batches of them at once:
 //
 //   C[b, m, n] = select(masked, causalMaskScore,
@@ -132,12 +168,20 @@ struct TiledMatMulShape
 // a product with none binds zeroes. The weight is the operand that can be
 // fp16, for MatMul's reason too, and only in the ContiguousK layout a shipped
 // weight has.
-template <OperandLayout bLayout, WeightStorage bStorage>
+template <OperandLayout bLayout,
+          WeightStorage bStorage,
+          AFold aFold = AFold::None,
+          RowMaxima cMaxima = RowMaxima::None>
 struct TiledMatMulProgram final : ComputeProgram
 {
     static constexpr auto tile = 32;
     static constexpr auto innerTile = 16;
     static constexpr auto block = 4;
+
+    // SimdTiledMatMulProgram's, at this kernel's own group: two threads walk a
+    // row of the tile, sixteen of its columns each, and each writes what it
+    // saw.
+    static constexpr auto maximaPerRow = 2;
 
     // The A slab's row pitch, one over the slab width so that the eight rows
     // a group reads at once land on eight different banks.
@@ -163,6 +207,9 @@ struct TiledMatMulProgram final : ComputeProgram
 
         const auto columnTiles = (shape.columns + tile - 1) / tile;
         const auto rowTiles = (shape.rows + tile - 1) / tile;
+
+        maximaStride = (std::uint32_t) (columnTiles * maximaPerRow);
+        foldTiles = (std::uint32_t) ((shape.inner + tile - 1) / tile * maximaPerRow);
 
         pass.dispatch(*this,
                       columnTiles * groupSize2D,
@@ -208,7 +255,32 @@ struct TiledMatMulProgram final : ComputeProgram
         // n. Either way adjacent threads fetch adjacent words.
         auto lane = thread / 2u;
         auto half = (thread % 2u) * 8u;
-        auto aRow = aBase + min(m0 + lane, rowCount - 1u) * aRowStride;
+        auto stagedRow = min(m0 + lane, rowCount - 1u);
+        auto aRow = aBase + stagedRow * aRowStride;
+
+        // SimdTiledMatMulProgram's, and its note on why each staging thread
+        // folds the row's maxima for itself.
+        auto sums = shared<Float>(aFold == AFold::Softmax ? (unsigned) tile : 1u);
+
+        auto foldMaximum = var(0.f);
+        auto foldSum = var(0.f);
+
+        if constexpr (aFold == AFold::Softmax)
+        {
+            auto maximaRow = (batch * rowCount + stagedRow) * foldTiles;
+            auto largest = var(causalMaskScore);
+            auto foldTile = var(0u);
+
+            loop(foldTile.get() < foldTiles,
+                 [&]
+                 {
+                     largest =
+                         max(largest.get(), rowMaxima[maximaRow + foldTile.get()]);
+                     foldTile += 1u;
+                 });
+
+            foldMaximum = largest.get();
+        }
 
         auto k0 = var(0u);
 
@@ -218,10 +290,13 @@ struct TiledMatMulProgram final : ComputeProgram
                  for (auto i = 0u; i < 8u; ++i)
                  {
                      auto k = k0.get() + half + i;
-                     auto value = select(
-                         k < innerCount, a[aRow + min(k, innerCount - 1u)], 0.f);
 
-                     write(aTile, lane * pitch + half + i, value);
+                     stageA(aTile,
+                            lane * pitch + half + i,
+                            aRow + min(k, innerCount - 1u),
+                            k < innerCount,
+                            foldMaximum,
+                            foldSum);
                  }
 
                  if constexpr (bLayout == OperandLayout::ContiguousK)
@@ -273,6 +348,94 @@ struct TiledMatMulProgram final : ComputeProgram
                  k0 += slab;
              });
 
+        // The two partial sums a row's two staging threads hold go through the
+        // B slab, which is between the last product and the store.
+        if constexpr (aFold == AFold::Softmax)
+        {
+            write(bTile, thread, foldSum.get());
+            barrier();
+
+            ifThen(thread < tileWidth,
+                   [&]
+                   {
+                       write(sums,
+                             thread,
+                             1.f / (bTile[2u * thread] + bTile[2u * thread + 1u]));
+                   });
+
+            barrier();
+        }
+
+        // The tile of C goes back out through threadgroup memory when its row
+        // maxima are wanted, since a thread's own 4 x 4 block is four rows by
+        // four columns and a row's maximum is over the whole tile's width.
+        auto cTile =
+            shared<Float>(cMaxima == RowMaxima::PerColumnTile ? tile * tile : 1);
+
+        if constexpr (cMaxima == RowMaxima::PerColumnTile)
+        {
+            for (auto i = 0u; i < (unsigned) block; ++i)
+            {
+                auto row = accumulators[i]->get();
+                Float parts[block] = {row.x(), row.y(), row.z(), row.w()};
+
+                for (auto j = 0u; j < (unsigned) block; ++j)
+                    write(cTile, (ty * 4u + i) * tileWidth + tx * 4u + j, parts[j]);
+            }
+
+            barrier();
+
+            constexpr auto groupThreads = (unsigned) (groupSize2D * groupSize2D);
+
+            for (auto t = 0u; t < (unsigned) (tile * tile) / groupThreads; ++t)
+            {
+                auto index = thread + t * groupThreads;
+                auto m = m0 + index / tileWidth;
+                auto n = n0 + index % tileWidth;
+
+                ifThen(m < rowCount && n < columnCount,
+                       [&]
+                       {
+                           auto at = cBase + m * cRowStride + n;
+                           auto stored = var(storedValue(
+                               cTile[index], sums, index / tileWidth, m, n, at));
+
+                           // Through the var, not the expression: a read
+                           // handle re-materialises after a store to its slot,
+                           // so a residual product's second evaluation would
+                           // read what the first one just wrote.
+                           write(output, at, stored.get());
+                           write(cTile, index, stored.get());
+                       });
+            }
+
+            barrier();
+
+            constexpr auto columnsPerLane = (unsigned) (tile / maximaPerRow);
+
+            auto maximaRow = thread / (unsigned) maximaPerRow;
+            auto maximaFirst = (thread % (unsigned) maximaPerRow) * columnsPerLane;
+            auto largest = var(causalMaskScore);
+
+            for (auto i = 0u; i < columnsPerLane; ++i)
+                largest = max(largest.get(),
+                              select(n0 + maximaFirst + i < columnCount,
+                                     cTile[maximaRow * tileWidth + maximaFirst + i],
+                                     causalMaskScore));
+
+            ifThen(m0 + maximaRow < rowCount,
+                   [&]
+                   {
+                       auto at = (batch * rowCount + m0 + maximaRow) * maximaStride
+                                 + group.x * (unsigned) maximaPerRow
+                                 + thread % (unsigned) maximaPerRow;
+
+                       write(tileMaxima, at, largest.get());
+                   });
+
+            return;
+        }
+
         for (auto i = 0u; i < (unsigned) block; ++i)
         {
             auto m = m0 + ty * 4u + i;
@@ -287,27 +450,73 @@ struct TiledMatMulProgram final : ComputeProgram
                        {
                            auto n = n0 + tx * 4u + j;
 
-                           ifThen(n < columnCount,
-                                  [&]
-                                  {
-                                      auto at = cBase + m * cRowStride + n;
-                                      auto value = scale * parts[j] + bias[n];
-                                      auto activated = select(
-                                          gelu != 0u, exactGelu(value), value);
-                                      auto carried =
-                                          select(residual != 0u, output[at], 0.f);
-                                      auto masked =
-                                          causal != 0u
-                                          && n + rowCount > m + columnCount;
+                           ifThen(
+                               n < columnCount,
+                               [&]
+                               {
+                                   auto at = cBase + m * cRowStride + n;
 
-                                      write(output,
-                                            at,
-                                            select(masked,
-                                                   causalMaskScore,
-                                                   activated + carried));
-                                  });
+                                   write(output,
+                                         at,
+                                         storedValue(
+                                             parts[j], sums, ty * 4u + i, m, n, at));
+                               });
                        }
                    });
+        }
+    }
+
+    // The fold every store passes through: the softmax's row divisor where one
+    // is being applied, then the scale, the bias, the GELU, the residual and
+    // the causal mask.
+    template <typename TileRow, typename Row, typename Column, typename At>
+    Float storedValue(const Float& accumulated,
+                      const Shared<Float>& sums,
+                      const TileRow& tileRow,
+                      const Row& m,
+                      const Column& n,
+                      const At& at)
+    {
+        auto value = scale * normalised(accumulated, sums, tileRow) + bias[n];
+        auto activated = select(gelu != 0u, exactGelu(value), value);
+        auto carried = select(residual != 0u, output[at], 0.f);
+        auto masked = causal != 0u && n + rowCount > m + columnCount;
+
+        return select(masked, causalMaskScore, activated + carried);
+    }
+
+    template <typename TileRow>
+    Float normalised(const Float& accumulated,
+                     const Shared<Float>& sums,
+                     const TileRow& tileRow)
+    {
+        if constexpr (aFold == AFold::Softmax)
+            return accumulated * sums[tileRow];
+        else
+            return accumulated;
+    }
+
+    // The A element as it is staged: exponentiated against the row maximum and
+    // added into this thread's share of the row's sum when the softmax is
+    // being folded in, and the element itself otherwise.
+    template <typename Slot, typename Index, typename Inside>
+    void stageA(const Shared<Float>& tile,
+                const Slot& slot,
+                const Index& index,
+                const Inside& inside,
+                const Var<Float>& maximum,
+                Var<Float>& sum)
+    {
+        if constexpr (aFold == AFold::Softmax)
+        {
+            auto staged = var(select(inside, exp(a[index] - maximum.get()), 0.f));
+
+            write(tile, slot, staged.get());
+            sum += staged.get();
+        }
+        else
+        {
+            write(tile, slot, select(inside, a[index], 0.f));
         }
     }
 
@@ -317,6 +526,42 @@ struct TiledMatMulProgram final : ComputeProgram
             return b.readHalf(index);
         else
             return b[index];
+    }
+
+    // Written out rather than declared by EACP_SHADER because rowStats is only
+    // a binding of the folding instantiation: a program that does not read it
+    // does not name it, and so nothing that dispatches one has to bind it.
+    void reflectMembers(eacp::GPU::ShaderVisitor& visitor) override
+    {
+        visitor("a", a);
+        visitor("b", b);
+        visitor("bias", bias);
+        visitor("output", output);
+        visitor("rowCount", rowCount);
+        visitor("columnCount", columnCount);
+        visitor("innerCount", innerCount);
+        visitor("aRowStride", aRowStride);
+        visitor("aBatchStride", aBatchStride);
+        visitor("bStride", bStride);
+        visitor("bBatchStride", bBatchStride);
+        visitor("cRowStride", cRowStride);
+        visitor("cBatchStride", cBatchStride);
+        visitor("scale", scale);
+        visitor("causal", causal);
+        visitor("gelu", gelu);
+        visitor("residual", residual);
+
+        if constexpr (aFold == AFold::Softmax)
+        {
+            visitor("rowMaxima", rowMaxima);
+            visitor("foldTiles", foldTiles);
+        }
+
+        if constexpr (cMaxima == RowMaxima::PerColumnTile)
+        {
+            visitor("tileMaxima", tileMaxima);
+            visitor("maximaStride", maximaStride);
+        }
     }
 
     Uniform<InputBuffer> a;
@@ -337,31 +582,28 @@ struct TiledMatMulProgram final : ComputeProgram
     Uniform<UInt> gelu;
     Uniform<UInt> residual;
 
-    EACP_SHADER(a,
-                b,
-                bias,
-                output,
-                rowCount,
-                columnCount,
-                innerCount,
-                aRowStride,
-                aBatchStride,
-                bStride,
-                bBatchStride,
-                cRowStride,
-                cBatchStride,
-                scale,
-                causal,
-                gelu,
-                residual)
+    // The tile maxima a RowMaxima::PerColumnTile product writes, and the ones
+    // an AFold::Softmax product folds. No instantiation is both.
+    Uniform<OutputBuffer> tileMaxima;
+    Uniform<InputBuffer> rowMaxima;
+    Uniform<UInt> maximaStride;
+    Uniform<UInt> foldTiles;
 };
 
 // A linear and an attention's scores read B along k; an attention's apply
-// reads it along n.
+// reads it along n, and reads it through the softmax when the row it is
+// applying was left un-normalised.
 using TiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::Float>;
 using HalfWeightTiledLinear =
     TiledMatMulProgram<OperandLayout::ContiguousK, WeightStorage::PackedHalf>;
 using TiledMatMul =
     TiledMatMulProgram<OperandLayout::ContiguousN, WeightStorage::Float>;
+using SoftmaxTiledMatMul = TiledMatMulProgram<OperandLayout::ContiguousN,
+                                              WeightStorage::Float,
+                                              AFold::Softmax>;
+using MaximaTiledLinear = TiledMatMulProgram<OperandLayout::ContiguousK,
+                                             WeightStorage::Float,
+                                             AFold::None,
+                                             RowMaxima::PerColumnTile>;
 } // namespace WSP

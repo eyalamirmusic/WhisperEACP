@@ -63,7 +63,15 @@ void Session::loadModel()
         return;
     }
 
-    live.emplace(whisper);
+    // The one place in the tree that turns the audio context on. The library
+    // default is the whole 30 s window; this app re-transcribes an open
+    // segment every half second and mostly against a segment far shorter than
+    // that, so it encodes what the segment holds instead — 5.8 ms a run
+    // against 14 ms over jfk.wav at a live pace, with the same transcript.
+    auto options = WSP::LiveOptions {};
+    options.encodeOnlyTheAudioThereIs = true;
+
+    live.emplace(whisper, options);
 
     modelLoadSeconds = secondsSince(start);
     modelState = ModelState::Ready;

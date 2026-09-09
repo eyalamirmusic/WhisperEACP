@@ -125,3 +125,42 @@ auto tTinyEnFullWindow = test("Encoder/TinyEn/fullWindow") = []
     std::cout << "  tiny.en over 3000 frames: " << elapsed << " s on the GPU, "
               << "largest output " << largest << "\n";
 };
+
+// The real weights over a context shorter than the shape, against the same
+// scalar reference: 64 mel frames loaded, 32 of them read, and 16 of the
+// shape's 32 positions computed. A reduced run is a shape built at that length
+// — that is what whisper.cpp's audio_ctx computes and what this asserts — so
+// the reference is the 32-frame shape's own forward pass, over the 32-frame
+// prefix of the same mel.
+auto tTinyEnReducedContextMatchesReference =
+    test("Encoder/TinyEn/reducedContextMatchesScalarReference") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, shortInputFrames);
+    const auto context = shape.positions() / 2;
+
+    auto shorter = shape;
+    shorter.inputFrames = shape.framesForPositions(context);
+
+    check(context == 16);
+    check(shorter.inputFrames == 32);
+    check(shorter.positions() == context);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto mel = syntheticMel(shape);
+
+    const auto result = runEncoder(shape, file, mel, context);
+    const auto expected =
+        referenceEncode(readReferenceModel(file, shorter),
+                        shorter,
+                        melPrefix(mel, shape, shorter.inputFrames));
+
+    const auto worst = worstError(result, expected);
+    std::cout << "  tiny.en over " << context << " of " << shape.positions()
+              << " positions: worst error " << worst << "\n";
+
+    check(worst <= 1e-4);
+};

@@ -13,6 +13,19 @@ struct LiveOptions
     // Re-run the open segment once this much new audio arrived.
     double stepSeconds = 0.5;
 
+    // ...and only if this much of that audio was speech. A run over silence
+    // tells the model nothing the one before it did not already see, so the
+    // hold that closes a segment, and a pause inside one, are runs not taken.
+    //
+    // Deliberately the same as minSpeechSeconds below: the speech that makes a
+    // step worth re-running is the speech that would have made a segment worth
+    // running at all. What it can cost is measured in speech rather than in
+    // wall time — a deferred run happens as soon as the speaker has produced
+    // this much more sound, so a voice with no gaps in it is never deferred at
+    // all and a quiet room is never waited on. Zero restores the unconditional
+    // step.
+    double minNewSpeechSeconds = 0.3;
+
     // Close the segment at this length whatever the audio does, which has to
     // stay inside the 30 s window and is clamped to it.
     double maxSegmentSeconds = 25.0;
@@ -28,6 +41,19 @@ struct LiveOptions
 
     // Silence kept before the first speech block; earlier silence is dropped.
     double leadInSeconds = 0.3;
+
+    // Encode only the audio the segment holds — Whisper::setAudioContext, with
+    // audioContextMarginSeconds of the silence after it — rather than the
+    // whole 30 s window. Off by default, and off is what every run before this
+    // option did: a five second segment then encodes about 320 of the
+    // encoder's 1500 positions, and each decode step's cross attention reads
+    // that many rows instead of all of them.
+    //
+    // This is the option a live loop is the case for. It re-runs the open
+    // segment every stepSeconds whatever its length, so the run that costs the
+    // whole window is most of what the model does.
+    bool encodeOnlyTheAudioThereIs = false;
+    double audioContextMarginSeconds = Whisper::defaultAudioContextMargin;
 };
 
 struct LiveStats
@@ -97,9 +123,12 @@ private:
     int speechSamples = 0;
     int trailingSilentBlocks = 0;
 
-    // How much of the segment the last run saw, which is what makes a closing
-    // run skippable and what the step is measured against.
+    // How much of the segment the last run saw, and how much of that was
+    // speech: the first is what makes a closing run skippable and what the step
+    // is measured against, the second what says whether a periodic run would
+    // see anything new.
     int coveredSamples = 0;
+    int coveredSpeechSamples = 0;
     bool segmentHasSpeech = false;
     bool hasRunThisSegment = false;
 

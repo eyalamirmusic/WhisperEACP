@@ -176,6 +176,65 @@ public:
     bool packsLogitsWeight() const { return packedLogitsWeight; }
     void setPacksLogitsWeight(bool shouldPack);
 
+    // whisper.cpp's audio_ctx: how many of the encoder's 1500 positions a run
+    // computes. Zero, the default, is the whole 30 s window, and every
+    // existing number in this tree is that one.
+    //
+    // A shorter utterance does not need the whole window. The encoder pays for
+    // all 1500 positions however little audio there is — the attention inside
+    // it is quadratic in them — and every decode step's cross attention then
+    // reads all 1500 rows of the projected keys and values. Setting this to
+    // the positions the audio actually fills makes both scale with the
+    // recording instead: the run computes that many rows out of the first
+    // 2 * positions mel frames, adds the first that many rows of the
+    // positional embedding, and attends to that many everywhere below. Nothing
+    // is reallocated — the buffers are the window's and a short run writes a
+    // prefix of each.
+    //
+    // What it costs is what the model was trained to see. The frames past the
+    // audio are silence either way, but at the full window there are 1500
+    // positions of it and the positional embedding runs to its own end; a
+    // truncated one is a shape the model never saw. The transcripts at each
+    // count are measured in Tests/Whisper and in plan.md rather than assumed,
+    // and that is why this is off by default.
+    int audioContext() const { return audioContextPositions; }
+    void setAudioContext(int positions);
+
+    // The positions a recording of sampleCount samples fills, plus
+    // marginSeconds of the silence after it, rounded up to audioContextTile
+    // and held between audioContextFloor and the window. 320 samples is one
+    // position — a 160-sample hop through a convolution of stride two — so a
+    // second of audio is 50 of them.
+    static int
+        audioContextForSamples(int sampleCount,
+                               double marginSeconds = defaultAudioContextMargin);
+
+    // What a context is rounded up to. The products under the encoder tile C
+    // in 64 x 64, so a count that is a multiple of 64 is one where the last
+    // tile of every one of them is whole.
+    static constexpr int audioContextTile = 64;
+
+    // Enough silence after the audio that the encoder is not asked to end at
+    // the last word — Whisper's own window is 30 s of it — and measured
+    // rather than chosen. Over prefixes of jfk.wav from three starting points
+    // and at every context from the audio's own length upwards: a context
+    // within about a second of what the audio fills either changes the
+    // transcript or sends the decoder into a repetition loop (4 s of audio at
+    // 256 positions, 9 s at 512), and everything two tiles clear of it agrees
+    // with the window. 2.5 s is 125 positions, which after the rounding is
+    // never less than those two tiles.
+    static constexpr double defaultAudioContextMargin = 2.5;
+
+    // And the floor, which is not a margin but a cliff. Measured over the
+    // first 1, 2, 3, 5, 8 and 11 seconds of jfk.wav at every context down to
+    // 128: at 384 and above the transcript is the window's, and at 256 and
+    // below the decoder falls into a repetition loop and runs to the token
+    // limit — "and so and so and so" for 446 tokens, which costs *ten times*
+    // what the whole window would have. A context below this is a slower
+    // wrong answer rather than a faster one, so a count computed from a short
+    // segment is held here. Two tiles of headroom over the 384 that behaved.
+    static constexpr int audioContextFloor = 448;
+
     // 16 kHz mono samples, at most one 30 s window of them.
     //
     // Fewer are zero-filled to the window, which is what HF's feature extractor
@@ -271,6 +330,7 @@ private:
     Vector<float> laterStepSuppression;
     int maximumTokenCount = 0;
     bool packedLogitsWeight = true;
+    int audioContextPositions = 0;
 
     MelSpectrogram frontEnd;
     std::optional<Encoder> encoder;

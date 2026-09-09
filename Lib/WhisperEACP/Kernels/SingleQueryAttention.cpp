@@ -17,16 +17,14 @@ constexpr int floatBytes(int elementCount)
     return elementCount * (int) sizeof(float);
 }
 
-int chunkCountFor(int keyCount)
+bool fitsOneRow(int keyCount)
 {
-    return keyCount <= SingleQueryAttention::singleChunkKeyLimit
-               ? 1
-               : SingleQueryAttention::chunksPerHead;
+    return keyCount <= SingleQueryAttention::singleChunkKeyLimit;
 }
 
 int chunkLengthFor(int keyCount)
 {
-    const auto chunks = chunkCountFor(keyCount);
+    constexpr auto chunks = SingleQueryAttention::chunksPerHead;
     return (keyCount + chunks - 1) / chunks;
 }
 } // namespace
@@ -46,6 +44,7 @@ void SingleQueryAttention::prepare(Device& device,
             + " keys, and was asked for " + std::to_string(headWidth) + " and "
             + std::to_string(chunkLengthFor(maxKeys))};
 
+    rowStage.prepare(device);
     partialStage.prepare(device);
     combineStage.prepare(device);
 
@@ -84,7 +83,24 @@ void SingleQueryAttention::encode(ComputePass& pass,
             + " heads over " + std::to_string(keyCapacity) + " keys and asked for "
             + std::to_string(headCount) + " over " + std::to_string(keyCount)};
 
-    const auto chunks = chunkCountFor(keyCount);
+    // A cache one group takes whole has no chunk to rescale and no partials to
+    // join, and is a kernel of its own rather than this one at chunkCount 1.
+    if (fitsOneRow(keyCount))
+    {
+        rowStage.queries = queries;
+        rowStage.keys = keys;
+        rowStage.values = values;
+        rowStage.output = output;
+        rowStage.modelWidth = (std::uint32_t) modelWidth;
+        rowStage.headWidth = (std::uint32_t) headWidth;
+        rowStage.keyCount = (std::uint32_t) keyCount;
+        rowStage.scale = scale;
+
+        rowStage.dispatchRows(pass, headCount);
+        return;
+    }
+
+    const auto chunks = chunksPerHead;
 
     partialStage.queries = queries;
     partialStage.keys = keys;
@@ -92,7 +108,6 @@ void SingleQueryAttention::encode(ComputePass& pass,
     partialStage.chunkMaxima = *chunkMaxima;
     partialStage.chunkSums = *chunkSums;
     partialStage.chunkRows = *chunkRows;
-    partialStage.output = output;
     partialStage.modelWidth = (std::uint32_t) modelWidth;
     partialStage.headWidth = (std::uint32_t) headWidth;
     partialStage.keyCount = (std::uint32_t) keyCount;
@@ -101,11 +116,6 @@ void SingleQueryAttention::encode(ComputePass& pass,
     partialStage.scale = scale;
 
     partialStage.dispatchRows(pass, headCount * chunks);
-
-    // One chunk holds the whole row, so the partial has already normalised it
-    // and there is nothing left to join.
-    if (chunks == 1)
-        return;
 
     // The combine folds what the partials wrote.
     pass.barrier();

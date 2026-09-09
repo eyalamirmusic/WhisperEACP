@@ -1198,3 +1198,247 @@ the products inside it are no longer the largest thing in it.
   which is 2.3% of the arithmetic thrown away. The register-tiled kernel's 32
   wastes 0.7%. Nothing was done about it and nothing obvious can be.
 - **A movable `CommandBuffer`** in eacp, unchanged from the third round.
+
+## Fifth performance round: the live loop
+
+The user's complaint was not a benchmark row. Running `Apps/Demo/LiveTranscribe`,
+the runtime "takes about 20-30% of GPU on a pretty high end device". This round
+is on an **Apple M4 Max** again, so the third and fourth rounds' M5 numbers do
+not carry over, and the first thing it did was find out what that 20-30% was
+measuring.
+
+### The number was the counter's, not the model's
+
+A throwaway driver streamed jfk.wav plus a 1.5 s gap through `LiveTranscriber`
+at the demo's 33 ms tick and added up what `Whisper::transcribe` cost: **53
+runs in 28 s, 1.36 s of model time, 4.9% of the wall clock**, 25.7 ms a run.
+Continuous speech, 25 s segments, was 6.4%. Meanwhile macOS's GPU utilisation
+(`ioreg -r -c AGXAccelerator` "Device Utilization %", which is what Activity
+Monitor draws on) read 50-80% at one sample a second — and `68 0 0 0 0 0 68 0
+...` at twenty a second. The counter is a short-window snapshot: a 26 ms burst
+every half second reads as the burst, not as the duty. There is no way to
+read the true share from outside the process without root, so the runtime
+now reports it itself (`Benchmark --live`, below).
+
+Two things the driver did show. A run at live cadence costs **about twice**
+what the benchmark measures for the same audio (encode 13.8 ms against 7,
+0.86 ms a step against 0.6), because the GPU clocks down between bursts; a run
+every 4 s cost 49 ms, its encode 34. And every run encoded the full
+zero-padded 30 s window — 1500 positions of encoder and 1500 rows of
+cross-attention K/V a step — for a segment that is mostly a few seconds long.
+
+So the round had two halves: do less per second of speech, and make each run
+cheaper. Four worktree agents, one per lever, each with its own Release
+build and a lock serialising every timing run on the one GPU.
+
+### Where it ended
+
+Same jfk.wav, same 30 timed runs, paired **A B B A** twice against the tree
+before the round, read from `x real time`:
+
+| | before | after | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- | --- |
+| transcribe, median | 0.0216 s | **0.0176 s** | 0.036 s | 0.100 s |
+| x real time, over the 30 s window | 1392 | **1700** | 837 | 300 |
+| encode, median | 0.0068 s | **0.0064 s** | 0.008 s | 0.072 s |
+| decode, median, 25 steps | 0.0147 s | **0.0111 s** | 0.015 s | 0.015 s |
+| decode per step | 0.586 ms | **0.445 ms** | 0.60 ms | 0.60 ms |
+| transcribe at 704 positions, `--audio-ctx=audio` | — | **0.013 s**, 2254 x real time | 0.032 s | 0.053 s |
+
+**22% off the run with the same work, 40% off it with the audio context**, the
+transcript token-identical to whisper.cpp on both columns at both settings,
+and 307 tests green (284 before the round). The whole run is now 2.0x
+whisper.cpp's at the window and 2.5x at the reduced context.
+
+And the row that answers the complaint, `Benchmark --live 30 1.5` — jfk.wav on
+repeat with a 1.5 s pause, 30 s of stream:
+
+| | before | kernels only | as `LiveTranscribe` now runs it |
+| --- | --- | --- | --- |
+| runs | 57 | 49 | 49 |
+| model time | 1.44 s | 1.25 s | **0.84 s** |
+| share of the wall clock | 4.8% | 4.2% | **2.8%** |
+| per run, mean | 25.2 ms | 25.5 ms | **17.2 ms** |
+| encode / decode, mean | 14.7 / 11.4 ms | 14.2 / 10.5 ms | **6.2 / 10.0 ms** |
+
+**42% less model time per second of speech**, the committed transcript
+unchanged. The demo app is the one call site that turns the audio context on.
+Speech with no pause in it, `--live 30 0`, is the other end: segments run to
+the 25 s cut, so the context is close to the window and the option buys
+less — 5.5% to 4.5%, 30.9 to 25.2 ms a run at 24 steps.
+
+### The four levers
+
+**1. Encode only the audio there is** — whisper.cpp's `audio_ctx`, as
+`Whisper::setAudioContext(positions)` with `audioContextForSamples(count,
+margin)` to size it, `LiveOptions::encodeOnlyTheAudioThereIs` to let the live
+loop use the segment's length, and `--audio-ctx=N|audio` on `Transcribe` and
+`Benchmark`. Default off, and off is byte-for-byte what the tree did before:
+A/B against the tree before the option was +0.6%, inside the spread.
+
+Nothing is allocated per run. `Encoder::encode` and `Decoder::beginSequence`
+take a position count and dispatch over a prefix of the window's buffers:
+conv1's unfold bound (the mel's stride stays 3000), both convolutions' rows,
+the positional rows used, every layer norm, projection and attention product,
+the score buffer as a compact `[heads, P, P]`, the cross K/V rows the
+projections write and every step's cross attention reads. The mel still runs
+over the whole window, deliberately: `logMel` is band-major so a frame prefix
+is strided, and the peak Whisper clamps against is a global maximum, which is
+what whisper.cpp also computes over the full window whatever `audio_ctx` is —
+truncating ours would give up the token-for-token agreement below exactly
+where a caller sets a context shorter than the audio.
+
+Quality was measured, both sides at the same context:
+
+| positions | jfk.wav, 11 s = 550 positions | whisper.cpp at the same `audio_ctx` |
+| --- | --- | --- |
+| 1500, 1024, 768, 704, 640 | the window's transcript, 24 tokens | identical |
+| 576 | the comma after "for you" is gone, 23 tokens | identical |
+| 512 | a full stop and a capital instead of the comma | identical |
+| 384 | truncated at 18 steps | — |
+| 320 | **runaway**: 446 tokens of "and so and so", 0.25 s | — |
+
+`whisper_full_params.audio_ctx` is the only public way into whisper.cpp's
+encoder context and it stays armed on the state, so
+`Tests/Oracle/Common.h::armOracleAudioContext` runs one full pass at the
+context and every stage call after it runs there. The reduced decoder's
+logits track the reference *better* than the full window's at 1024 and 768
+(rms 0.037 and 0.062 against 0.465 at 1500, all against a one-ulp resolution
+of 0.028) and worse at 576 (rms 0.556), which is where the transcript changes:
+that context sits on a decision boundary, and both sides sit on the same side
+of it.
+
+The round's real finding is in the last two rows. **A context sized to the
+audio plus a second sends the decoder into a repetition loop** — the first
+live run of this measured 65.6 ms a run and 103 steps against 13, the encoder
+at 4.6 ms and the decoder at its 446-token limit. Two causes, each measured
+over prefixes of jfk.wav from three starting points: a context far below the
+audio loops (1 s at 128 positions, 2 s at 192, 3 s at 256) and so does one
+barely above it (4 s of audio at 256, 9 s at 512), while two tiles clear is
+always the window's transcript. Hence `audioContextFloor = 448` and a default
+margin of 2.5 s (125 positions, never under two tiles after rounding). The
+encoder half of `audio_ctx` is exact and free; the whole risk is what a short
+context does to the decoder.
+
+Fourteen tests. The reduced encoder and decoder are checked against *the
+shorter shape's own* forward pass with real weights (a reduced run is a shape
+built at that length, which is what makes the assertion say something), with
+the rows past the context poisoned so a kernel reading the whole buffer cannot
+pass; two oracle tests at 576 and 1024/768; and the shared `preparedModel()`
+in `Tests/Whisper` means any test that sets a context must put it back, which
+`Live/leavesTheContextAloneByDefault` pins.
+
+**2. A run only when there is something new to hear.** `runIsDue()` fired
+whenever `stepSeconds` of audio had arrived, speech or not, so the hold before
+a segment closes and a pause inside one kept re-running the model on nothing.
+`LiveOptions::minNewSpeechSeconds` (0.3 s, the same as `minSpeechSeconds`: the
+speech that makes a step worth re-running is the speech that would have made
+a segment worth running) gates the periodic run; the closing run is untouched,
+since the silence after the last word is what lets Whisper finish it. One
+speech block was measured first and removes only 3.5% — a skipped run does not
+advance `coveredSamples`, so the next speech block fires it anyway. 0.3 s is
+57 → 49 runs and −11% model time at a 1.5 s gap, 48 → 42 at 4 s, transcripts
+identical, and 0.5 s would be −21% at the cost of lagging broken-up speech by
+a whole step.
+
+**3. The decode step**, profiled here as 61 labelled passes (a floor of
+2.7 us each, so the parts sum to 509 us where the real concurrent pass is
+445): the logits projection 98 us, the four cross attentions 21 each, the four
+self attentions 18, fc2 20 apiece, 24 384-wide `SplitLinear`s at 7.3, thirteen
+layernorms at 4.7. A chained dispatch costs **3.14 us** on this machine and an
+independent one 0.013 — between the M4's 5.5 of the second round and the M5's
+2.0, and the independent one is free everywhere.
+
+| change | effect on the decode |
+| --- | --- |
+| `SplitLinear`'s split count is the shape's, not a hard-wired 8: `Decoder::stepSplitCount` 96 (a 384-wide row is exactly 96 float4s) and `logitsSplitCount` 32. The count decides how many groups a dispatch has — 48 groups for one row was a few thousand threads on a device sized for tens of thousands — and at 64 lanes or more the fold is `groupSum` | **−18.6%** |
+| `SingleQueryAttentionRow`, a kernel of its own for a cache one group takes whole: a lane per output column, one accumulator, no partials array. 18.4 → 7.9 us; the partial's one-chunk branch is gone | **−4.0%** |
+| `chunksPerHead` 16 → 24, re-priced here: 8 → 11.56 ms, 16 → 11.37, **24 → 11.07**, 28 and 32 → 12.0, 48 → 12.5. A floor, then a cliff | **−2.6%** |
+
+The split count belongs to the shape and not to the weight: keyed on
+`WeightStorage`, `Decoder/TinyEn/packedLogitsWeightIsIdentical` failed at
+once, because the float and packed logits summed the same matrix in different
+orders — the third round's bit-identity claim doing exactly its job.
+`SplitLinear` had no kernel test of its own until now; three were added, on
+`TiledProduct::dotProductTolerance` for the 384- and 1536-term shapes.
+
+**4. The encoder's softmax is not a dispatch.** The encode profiled here: the
+attention chain 46.6% of 6.6 ms (scores 1.07 ms at 6.4 TFLOPS, softmax 0.69,
+apply 1.32 at 5.3), the FFN 26%, the four 384-wide projections 16%, the mel
+front-end 4.8%, the convolutions 5.3%. The obvious first cut — a two-sweep
+stats kernel writing `[max, 1/sum]` a row, the apply folding both — bought
+only 0.13 ms: the softmax pass is bound by the one DRAM read of the 54 MB
+score matrix and its other four traversals are cache hits, so the win is not
+in a cheaper pass but in no pass. `TiledMatMul` and `SimdTiledMatMul` grew two
+template axes: `RowMaxima` has the scores product write, as it stores each
+64 x 64 tile, the largest value in each row of the tile (3.5 MB a layer); `AFold`
+has the apply fold those maxima into the shift it exponentiates against as it
+stages A, sum what it staged — one group's inner loop walks the whole row, so
+the sum is exact — and divide the row by the sum on the store. The score
+matrix is written once and read once. **−0.41 ms of encode, −6.0%, 6 of 6
+pairs**, no tolerance moved, and four tier-1 tests that run both programs into
+one command buffer against a scalar scan of the scores the same run produced.
+`Softmax` stays for the decoder's prompt step.
+
+### The negative results
+
+| tried, or priced and not tried | result |
+| --- | --- |
+| the cross-attention KV cache in fp16 — the third round's top remaining candidate | **worth ~2% here, for a real approximation.** Probed by reading the float cache through `readHalf2` (wrong answers, right access pattern, half the bytes): 21.6 → 19.0 us a dispatch. The kernel is not bandwidth-bound — 18.4 MB a step at 213 GB/s on a ~546 GB/s machine — but bound by the shared-memory transpose of its partial rows. Not taken |
+| a column-parallel `SingleQueryAttentionPartial`, one kernel for both key counts | 21.3 → 36.0 us: a lane owning a column walks the whole chunk serially. Two kernels it is |
+| the partial at 16 or 32 lanes; a hybrid with 1 kB of shared memory | 12.07 / 11.38 ms against 11.04 at 64 lanes; the hybrid's best loses to the register form's best. The transpose through 16 kB beats a serial walk even at the occupancy it costs |
+| `logitsSplitCount` above 32 | 64 is 4% slower over the decode, 128 12%: 51864 outputs fill the device at any count and more lanes only lengthen the fold |
+| a serial decode pass | 11.23 against 11.12 ms concurrent: under the noise, and the more variable of the two |
+| a joined q/k/v, the layernorms folded into their projections | still not attempted: the eight dispatches are independent and cost 0.013 us, and a 384-wide projection now dispatches 384 groups, so a folded layernorm would do its reductions in 384 places instead of one |
+| a fused (flash) attention for the encoder out of `SimdMatrix` | **not attempted, for a number.** The chain's arithmetic is 4 x 3.6 GFLOP: 1.7 ms at the 8.6 TFLOPS fc1 reaches, 2.7 at the apply's 5.3. The chain now costs 2.81 ms, so the fused kernel is worth between 0.1 and 1.1 ms, all of it decided by what the interleaved softmax costs in registers — sixteen live fragments a SIMD group is the shape the fourth round measured collapsing, a 32-query tile halves it, and the per-row rescale has to go through threadgroup memory or a product against a diagonal fragment. Recorded here with the shared-memory budget worked out (K staged transposed, 16 kB; S/P 8 kB; Q and V straight from the buffer) for whoever does it |
+| the row maxima at one lane per tile row, scanning 64 columns | +0.58 ms on the scores product, as much as the pass it replaced; four lanes a row with sixteen unrolled columns, the stored value held in a `var`, is +0.19 |
+| folding the maxima once per row through threadgroup memory instead of each of a row's four staging threads folding for itself | +0.015 ms: two barriers cost more than the redundant cache hits |
+| the mel filterbank | left, and the best small target: 0.11 ms at 0.9 TFLOPS from a thread per (frame, mel) with stride-201 reads. It is `forLinear(80, 201, 3000)` with the filterbank as A, but for the `log10(max(x, 1e-10))` and the tiny test shapes; worth about 0.08 ms |
+| the mel over a frame prefix | not done, for the reason under lever 1 |
+
+### What this surfaced in eacp
+
+- **Float literals are emitted with `%g`**, six significant digits, so a
+  constant does not round-trip: `std::numeric_limits<float>::lowest()` reaches
+  the shader as `-3.40282e+38`, a different float. It silently perturbs any
+  constant with more than six digits and makes `lowest()` unusable as a
+  reduction identity the host then compares against exactly; it cost a
+  debugging cycle on the maxima test's fully-outside tiles. `%.9g`, or
+  `std::to_chars`.
+- **No SIMD-group reduction in the EDSL.** `groupMax`/`groupSum` fold a
+  whole threadgroup; a fold across the 32 or 64 lanes that share one row of a
+  tile goes through threadgroup memory and two barriers, or is given up on as
+  the maxima pass did. `simd_max`/`simd_sum` on Metal, `WaveActiveMax` on
+  SM6, subgroup ops on Vulkan. About 0.19 ms of the encode here.
+- **Passes are timed, dispatches are not**, and a pass has a ~2.7 us floor.
+  A stage profile of a chain recorded as one concurrent pass means
+  re-recording it as sixty, which removes the overlap being measured and
+  inflates a 445 us step to 509. A per-dispatch timestamp inside a pass, or
+  at least the floor reported once so a caller can subtract it.
+- **`EACP_SHADER(...)` defines the whole reflection**, so a program whose
+  bindings depend on a template parameter writes `reflectMembers` out by hand
+  — seventeen `visitor(...)` lines in each product here, to keep the maxima
+  buffers off the instantiations that do not read them. A conditional tail on
+  the macro would remove it.
+- `whisper_full_params.audio_ctx` is the only public way into whisper.cpp's
+  encoder context, and it stays armed on the state — not an eacp gap, but the
+  thing to know before writing an oracle test at a reduced context.
+
+### What is still on the table after this
+
+The step is 445 us, the encode 6.4 ms at the window and 3.0 at 704 positions.
+
+- **The mel is now the encode** at a reduced context: 1.9 of the 3.0 ms.
+  The STFT product is 0.14 ms and fine; the filterbank is the 0.11 ms above;
+  the rest is the framing, power, peak and normalise passes over 3000 frames.
+- **The logits projection** is 85 us of the step and reads its 39.8 MB of
+  fp16 weight at 504 GB/s, the machine's bandwidth; there is no third halving.
+- **The cross attention** is 115 us, bound by the partial's transpose, which
+  neither fp16 nor the column-parallel form improved.
+- **Chained dispatch overhead** is the largest bucket left, ~140 us across
+  61 dispatches at 3.14 us, and the only lever this machine rewards is
+  making dispatches independent rather than removing them.
+- **A run at live cadence still costs twice a warm one.** Nothing here
+  changes the clock the GPU idles at; less work per run is the whole answer,
+  and the live benchmark is where it shows.
+- **The fused encoder attention**, with its budget worked out above.

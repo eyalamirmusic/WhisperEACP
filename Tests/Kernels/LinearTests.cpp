@@ -1,5 +1,7 @@
 #include "Common.h"
+#include "TiledProduct.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 
@@ -302,6 +304,184 @@ auto tHalfWeightLinearMatchesCpu = test("Kernels/halfWeightLinearMatchesCpu") = 
     kernel.outputWidth = (unsigned) outputs;
 
     auto result = runOverGrid(kernel, output, outputs, rows);
+    auto expected = linearReference(input, weight, bias, rows, inner, outputs);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], 1e-5));
+};
+
+namespace
+{
+// SplitLinear's own runner: it decides its grid from the shape, so this
+// dispatches through the kernel rather than over a grid the test names, and
+// reads back the buffer the caller bound — which for a residual store is the
+// one it was seeded with.
+template <typename Kernel>
+Vector<float> runSplitLinear(Kernel& kernel,
+                             const eacp::GPU::Buffer& output,
+                             int outputWidth,
+                             int rowCount)
+{
+    kernel.prepare();
+
+    auto commands = Device::shared().makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        kernel.dispatch(pass, outputWidth, rowCount);
+    }
+
+    commands.commit();
+    return readBack(output, rowCount * outputWidth);
+}
+
+// The reference the split form answers to, with the two folded stages applied
+// where the kernel applies them: gelu on the result, and the residual added to
+// whatever the target already held.
+Vector<float> splitReference(const Vector<float>& input,
+                             const Vector<float>& weight,
+                             const Vector<float>& bias,
+                             const Vector<float>& carried,
+                             int rowCount,
+                             int innerCount,
+                             int outputWidth,
+                             bool gelu,
+                             bool residual)
+{
+    auto expected =
+        linearReference(input, weight, bias, rowCount, innerCount, outputWidth);
+
+    for (auto index = 0; index < expected.size(); ++index)
+    {
+        auto value = expected[index];
+
+        if (gelu)
+            value = 0.5f * value * (1.f + std::erf(value / std::sqrt(2.f)));
+
+        expected[index] = value + (residual ? carried[index] : 0.f);
+    }
+
+    return expected;
+}
+
+void checkSplitLinearMatchesCpu(int splitCount,
+                                int rowCount,
+                                int innerCount,
+                                int outputWidth,
+                                bool gelu = false,
+                                bool residual = false)
+{
+    auto input = spreadValues(rowCount * innerCount, 314159u, 2.f);
+    auto weight = spreadValues(outputWidth * innerCount, 271828u, 3.f);
+    auto bias = spreadValues(outputWidth, 161803u, 1.f);
+    auto carried = spreadValues(rowCount * outputWidth, 141421u, 1.f);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = storageOf(weight);
+    auto biasBuffer = storageOf(bias);
+    auto output = storageOf(carried);
+
+    auto kernel = SplitLinear {splitCount};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) innerCount;
+    kernel.outputWidth = (unsigned) outputWidth;
+    kernel.rowCount = (unsigned) rowCount;
+    kernel.gelu = gelu ? 1u : 0u;
+    kernel.residual = residual ? 1u : 0u;
+
+    auto result = runSplitLinear(kernel, output, outputWidth, rowCount);
+    auto expected = splitReference(input,
+                                   weight,
+                                   bias,
+                                   carried,
+                                   rowCount,
+                                   innerCount,
+                                   outputWidth,
+                                   gelu,
+                                   residual);
+
+    check(result.size() == expected.size());
+
+    // The inner sum's own error, not the answer's: a 1536-term product's
+    // partial sums reach far past what it cancels to. See dotProductTolerance.
+    const auto tolerance = TiledProduct::dotProductTolerance(innerCount);
+
+    for (auto i = 0; i < result.size(); ++i)
+        check(isClose(result[i], expected[i], tolerance));
+}
+} // namespace
+
+// The split form at the four split counts that pick out its two folds: below
+// the group width, where a group holds several outputs and folds them through
+// a shared array, and at and above it, where a group holds one and folds it
+// with groupSum. The decoder dispatches it at 32 and at 96.
+auto tSplitLinearMatchesCpu = test("Kernels/splitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto splits: {8, 32, 64, 96})
+    {
+        checkSplitLinearMatchesCpu(splits, rowCount, innerCount, outputWidth);
+        checkSplitLinearMatchesCpu(splits, 2, 384, 384);
+        checkSplitLinearMatchesCpu(splits, 1, 1536, 384);
+    }
+};
+
+// The two stages folded into the store, and the reason the fold has to happen
+// on exactly one lane of the group: the residual is a read-modify-write, so a
+// kernel that stored it from every lane holding the folded value would add it
+// as many times as the group has lanes.
+auto tSplitLinearFoldsGeluAndResidual =
+    test("Kernels/splitLinearFoldsGeluAndResidual") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    for (const auto splits: {8, 96})
+    {
+        checkSplitLinearMatchesCpu(splits, 2, 384, 1536, true, false);
+        checkSplitLinearMatchesCpu(splits, 2, 1536, 384, false, true);
+        checkSplitLinearMatchesCpu(splits, 3, 41, 17, true, true);
+    }
+};
+
+// The packed-half split form, which is what the logits projection runs, over
+// the same widened halves the dense one is checked against.
+auto tHalfWeightSplitLinearMatchesCpu =
+    test("Kernels/halfWeightSplitLinearMatchesCpu") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    constexpr auto inner = 8;
+    constexpr auto outputs = 5;
+    constexpr auto rows = 2;
+
+    auto input = spreadValues(rows * inner, 424242u, 2.f);
+    auto bias = spreadValues(outputs, 242424u, 1.f);
+    auto weight = widenedHalves(outputs * inner);
+
+    auto inputBuffer = storageOf(input);
+    auto weightBuffer = packedHalfBuffer(outputs * inner);
+    auto biasBuffer = storageOf(bias);
+    auto output = outputFor(rows * outputs);
+
+    auto kernel = HalfWeightSplitLinear {32};
+    kernel.input = inputBuffer;
+    kernel.weights = weightBuffer;
+    kernel.bias = biasBuffer;
+    kernel.output = output;
+    kernel.innerCount = (unsigned) inner;
+    kernel.outputWidth = (unsigned) outputs;
+    kernel.rowCount = (unsigned) rows;
+    kernel.gelu = 0u;
+    kernel.residual = 0u;
+
+    auto result = runSplitLinear(kernel, output, outputs, rows);
     auto expected = linearReference(input, weight, bias, rows, inner, outputs);
 
     for (auto i = 0; i < result.size(); ++i)

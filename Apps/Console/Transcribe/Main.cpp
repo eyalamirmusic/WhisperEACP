@@ -8,8 +8,10 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <string>
+#include <string_view>
 
 // The whole runtime as a binary, in three forms: with no arguments it runs the
 // model the build copied beside it on the recording it carries inside itself,
@@ -35,6 +37,9 @@ constexpr auto usage =
     "                   preprocessor_config.json, model.safetensors and\n"
     "                   tokenizer.json\n"
     "  wav file         16 kHz mono, at most 30 seconds\n"
+    "  --audio-ctx=N    encode N of the encoder's 1500 positions rather than\n"
+    "                   the whole 30 s window, or 'audio' for the count the\n"
+    "                   recording itself fills\n"
     "\n"
     "The built-in sample is 11 s of Kennedy's inaugural address. The bundled\n"
     "model is whisper-tiny.en, copied beside this binary by a build configured\n"
@@ -86,6 +91,12 @@ struct Request
     std::string modelDirectory;
     std::string wavFile;
 
+    // 0 is the whole window and -1 is the count the samples fill; anything
+    // else is that many encoder positions.
+    int audioContext = 0;
+
+    static constexpr int fromTheAudio = -1;
+
     bool usesBundledModel() const { return modelDirectory.empty(); }
     bool usesEmbeddedSample() const { return wavFile.empty(); }
 
@@ -98,20 +109,63 @@ struct Request
     void announce() const
     {
         std::printf("model: %s\n", modelPath().c_str());
-        std::printf("audio: %s\n\n",
+        std::printf("audio: %s\n",
                     usesEmbeddedSample() ? "built-in jfk.wav" : wavFile.c_str());
+
+        if (audioContext == fromTheAudio)
+            std::printf("context: the positions the recording fills\n");
+        else if (audioContext > 0)
+            std::printf("context: %d of 1500 encoder positions\n", audioContext);
+
+        std::printf("\n");
     }
 };
 
-Request requestFor(const WSP::Vector<std::string>& arguments)
+// Each argument is the audio context if it is that flag, and a path otherwise,
+// in the order the two forms above take them.
+bool parse(const WSP::Vector<std::string>& arguments, Request& request)
 {
-    if (arguments.size() == 3)
-        return {arguments[1], arguments[2]};
+    constexpr auto flag = std::string_view {"--audio-ctx="};
+    auto paths = WSP::Vector<std::string> {};
 
-    if (arguments.size() == 2)
-        return {{}, arguments[1]};
+    for (auto index = 1; index < arguments.size(); ++index)
+    {
+        const auto& argument = arguments[index];
 
-    return {};
+        if (!std::string_view {argument}.starts_with(flag))
+        {
+            paths.add(argument);
+            continue;
+        }
+
+        const auto value = argument.substr(flag.size());
+
+        if (value == "audio")
+        {
+            request.audioContext = Request::fromTheAudio;
+            continue;
+        }
+
+        request.audioContext = std::atoi(value.c_str());
+
+        if (request.audioContext < 1 || request.audioContext > WSP::encoderPositions)
+            return false;
+    }
+
+    if (paths.size() > 2)
+        return false;
+
+    if (paths.size() == 2)
+    {
+        request.modelDirectory = paths[0];
+        request.wavFile = paths[1];
+    }
+    else if (paths.size() == 1)
+    {
+        request.wavFile = paths[0];
+    }
+
+    return true;
 }
 
 void run(const Request& request)
@@ -131,6 +185,12 @@ void run(const Request& request)
                              ? readEmbeddedSample()
                              : WSP::readWavFile(request.wavFile);
 
+    if (request.audioContext == Request::fromTheAudio)
+        whisper.setAudioContext(
+            WSP::Whisper::audioContextForSamples(samples.size()));
+    else
+        whisper.setAudioContext(request.audioContext);
+
     const auto loading = secondsSince(start);
     const auto tokens = whisper.transcribe(samples);
 
@@ -141,15 +201,14 @@ void run(const Request& request)
 void transcribe()
 {
     const auto& arguments = Apps::getAppEnvironment().commandLineArgs;
+    auto request = Request {};
 
-    if (arguments.size() > 3)
+    if (!parse(arguments, request))
     {
         std::printf("%s", usage);
         Apps::setReturnValue(2);
         return;
     }
-
-    const auto request = requestFor(arguments);
 
     if (request.usesBundledModel() && !WSP::Whisper::hasBundledModel())
     {

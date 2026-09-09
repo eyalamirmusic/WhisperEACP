@@ -632,7 +632,8 @@ inline std::vector<double> referenceEncode(const ReferenceModel& model,
 
 inline Vector<float> runEncoder(const EncoderShape& shape,
                                 const SafeTensors& file,
-                                const Vector<float>& mel)
+                                const Vector<float>& mel,
+                                int positionCount = 0)
 {
     auto& device = eacp::GPU::Device::shared();
 
@@ -647,12 +648,31 @@ inline Vector<float> runEncoder(const EncoderShape& shape,
 
     {
         auto pass = commands.beginCompute();
-        encoder.encode(pass, melBuffer, weights, output);
+        encoder.encode(pass, melBuffer, weights, output, positionCount);
     }
 
     commands.commit();
 
-    return readBack(output, shape.elementCount());
+    const auto rows = positionCount == 0 ? shape.positions() : positionCount;
+
+    return readBack(output, rows * shape.width);
+}
+
+// The first frameCount frames of every band, which is what an encoder over a
+// reduced context reads out of a window-sized mel — and what a shape built at
+// that length reads out of one of its own.
+inline Vector<float>
+    melPrefix(const Vector<float>& mel, const EncoderShape& shape, int frameCount)
+{
+    auto prefix = Vector<float> {};
+    prefix.resize(shape.melBins * frameCount);
+
+    for (auto band = 0; band < shape.melBins; ++band)
+        for (auto frame = 0; frame < frameCount; ++frame)
+            prefix[band * frameCount + frame] =
+                mel[band * shape.inputFrames + frame];
+
+    return prefix;
 }
 
 // The same mixed absolute-and-relative measure isClose asserts on, reported as

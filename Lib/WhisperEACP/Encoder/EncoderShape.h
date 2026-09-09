@@ -41,9 +41,18 @@ struct EncoderShape
     // conv1 keeps the frame count (stride 1, and the padding covers the
     // kernel); conv2 halves it. Both go through the rule in Conv1d.h rather
     // than restating it, so a buffer sized here and a dispatch sized there
-    // cannot disagree.
-    int convolutionFrames() const;
-    int positions() const;
+    // cannot disagree. The overloads take the mel frames a run over a prefix
+    // of the window reads — whisper.cpp's audio_ctx — where the no-argument
+    // pair takes the shape's own.
+    int convolutionFrames() const { return convolutionFrames(inputFrames); }
+    int positions() const { return positions(inputFrames); }
+    int convolutionFrames(int frameCount) const;
+    int positions(int frameCount) const;
+
+    // The inverse, which conv2's stride of two makes exact: positionCount rows
+    // come out of the first 2 * positionCount frames, and a count past the
+    // window is the window.
+    int framesForPositions(int positionCount) const;
 
     int melElementCount() const { return melBins * inputFrames; }
     int convolutionElementCount() const { return width * convolutionFrames(); }
@@ -51,7 +60,7 @@ struct EncoderShape
     int feedForwardElementCount() const { return positions() * feedForwardWidth; }
 
     // [heads, positions, positions] row-major, which is heads * positions rows
-    // of positions — exactly what Softmax normalises with no reshaping.
+    // of positions — the row a softmax is over, whoever applies it.
     int scoreElementCount() const { return heads * positions() * positions(); }
     int scoreRowCount() const { return heads * positions(); }
 

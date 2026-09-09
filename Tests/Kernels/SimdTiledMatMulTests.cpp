@@ -139,6 +139,29 @@ auto tSimdTiledAttentionApplyModelHeads =
     TiledProduct::checkAttentionApply<SimdTiledMatMul>(70, 45, 2, 64, 610u);
 };
 
+// The softmax the pair does between them, at a shape whose keys are ragged in
+// both the scores' column tiles and the apply's inner extent, and at the model
+// head width, where the apply's columns are exactly one tile.
+auto tSimdSoftmaxAttention = test("Kernels/simdSoftmaxAttention") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkSoftmaxAttention<MaximaSimdTiledLinear,
+                                        SoftmaxSimdTiledMatMul>(41, 37, 2, 9, 700u);
+};
+
+auto tSimdSoftmaxAttentionModelHeads =
+    test("Kernels/simdSoftmaxAttentionModelHeads") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkSoftmaxAttention<MaximaSimdTiledLinear,
+                                        SoftmaxSimdTiledMatMul>(
+        70, 150, 2, 64, 710u);
+};
+
 auto tSimdTiledLinearOneProgramTwoShapes =
     test("Kernels/simdTiledLinearOneProgramTwoShapes") = []
 {

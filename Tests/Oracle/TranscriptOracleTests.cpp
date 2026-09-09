@@ -56,11 +56,12 @@ Whisper& ourRuntime()
 // Greedy, one segment, no timestamps, English, no translation — and no
 // temperature fallback, since a run that retried at a higher temperature would
 // no longer be the greedy search this is compared against.
-whisper_full_params greedyParameters()
+whisper_full_params greedyParameters(int audioContext = 0)
 {
     auto parameters = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
 
     parameters.n_threads = oracleThreads;
+    parameters.audio_ctx = audioContext;
     parameters.language = "en";
     parameters.translate = false;
     parameters.no_timestamps = true;
@@ -82,10 +83,13 @@ whisper_full_params greedyParameters()
 // where our loop stops on it instead, and that is a difference about where the
 // marker is stored rather than about what was decoded.
 std::vector<whisper_token> oracleTranscript(whisper_context& context,
-                                            const std::vector<float>& samples)
+                                            const std::vector<float>& samples,
+                                            int audioContext = 0)
 {
-    if (whisper_full(
-            &context, greedyParameters(), samples.data(), (int) samples.size())
+    if (whisper_full(&context,
+                     greedyParameters(audioContext),
+                     samples.data(),
+                     (int) samples.size())
         != 0)
         return {};
 
@@ -162,4 +166,62 @@ auto tTranscriptAgreesWithTheOracle =
     // implementations and Tests/Oracle already found one string they segment
     // differently.
     check(ourText == theirText);
+};
+
+// The same comparison at a reduced audio context, which is the assertion the
+// whole option rests on: both sides encode 576 of the 1500 positions and both
+// have to produce the same tokens.
+//
+// 576 is chosen because it is where the answer *changes* — a tile above the
+// 550 positions jfk.wav fills, and the count at which the comma after "for
+// you" disappears. Agreeing at 1500 says the truncation is unused; agreeing
+// here, on a transcript neither side produces at the window, says the two
+// truncate the same way.
+auto tTranscriptAgreesAtAReducedContext =
+    test("Oracle/transcriptAgreesWithTheOracleAtAReducedContext") = []
+{
+    if (!canRun())
+        return;
+
+    const auto context = loadOracle();
+
+    if (context == nullptr)
+        return;
+
+    const auto samples = paddedToWindow(readPcm16Wav(WHISPER_EACP_JFK_WAV));
+
+    if (samples.empty())
+        return;
+
+    constexpr auto audioContext = 576;
+
+    auto& whisper = ourRuntime();
+    const auto atTheWindow = whisper.transcribe(samples);
+
+    whisper.setAudioContext(audioContext);
+    const auto mine = whisper.transcribe(samples);
+    whisper.setAudioContext(0);
+
+    const auto reference = oracleTranscript(*context, samples, audioContext);
+    check(!reference.empty());
+
+    const auto ourText = whisper.textForTokens(mine);
+    const auto theirText = joinedText(*context, reference);
+
+    std::cout << "  at " << audioContext << " positions, ours (" << mine.size()
+              << " tokens):" << ourText << "\n";
+    std::cout << "  at " << audioContext << " positions, whisper.cpp ("
+              << reference.size() << " tokens):" << theirText << "\n";
+
+    check(mine.size() == (int) reference.size());
+
+    for (auto index = 0; index < mine.size(); ++index)
+        check(mine[index] == reference[(std::size_t) index]);
+
+    check(ourText == theirText);
+
+    // And this is a different transcript from the window's, so the agreement
+    // above is about the truncation rather than about a context large enough
+    // to make no difference.
+    check(mine.size() != atTheWindow.size());
 };

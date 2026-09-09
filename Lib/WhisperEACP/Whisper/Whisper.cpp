@@ -243,6 +243,30 @@ void Whisper::setPacksLogitsWeight(bool shouldPack)
     packedLogitsWeight = shouldPack;
 }
 
+void Whisper::setAudioContext(int positions)
+{
+    if (positions < 0 || positions > encoderPositions)
+        throw ModelError {"an audio context is between 1 and "
+                          + std::to_string(encoderPositions)
+                          + " encoder positions, or zero for the whole window, "
+                            "and this one is "
+                          + std::to_string(positions)};
+
+    audioContextPositions = positions;
+}
+
+int Whisper::audioContextForSamples(int sampleCount, double marginSeconds)
+{
+    constexpr auto samplesPerPosition =
+        hopSize * EncoderShape::secondConvolutionStride;
+
+    const auto wanted = std::max(0, sampleCount) + samplesForSeconds(marginSeconds);
+    const auto positions = (wanted + samplesPerPosition - 1) / samplesPerPosition;
+    const auto tiles = (positions + audioContextTile - 1) / audioContextTile;
+
+    return std::clamp(tiles * audioContextTile, audioContextFloor, encoderPositions);
+}
+
 void Whisper::prepare(Device& device)
 {
     requireLoaded();
@@ -342,7 +366,11 @@ double Whisper::encodeAudio()
         auto pass = commands.beginCompute({}, DispatchOrder::Concurrent);
         frontEnd.encode(pass, *sampleBuffer, *filterBank, *melBuffer);
         pass.barrier();
-        encoder->encode(pass, *melBuffer, *encoderWeights, *encodedBuffer);
+        encoder->encode(pass,
+                        *melBuffer,
+                        *encoderWeights,
+                        *encodedBuffer,
+                        audioContextPositions);
     }
 
     const auto start = Clock::now();
@@ -385,7 +413,8 @@ void Whisper::encodeStep(ComputePass& pass, int step)
 
     if (step == 0)
     {
-        decoder->beginSequence(pass, *encodedBuffer, *decoderWeights);
+        decoder->beginSequence(
+            pass, *encodedBuffer, *decoderWeights, audioContextPositions);
         pass.barrier();
 
         decoder->step(pass,

@@ -56,6 +56,27 @@ auto tTiledAttentionScores = test("Kernels/tiledAttentionScores") = []
     TiledProduct::checkAttentionScores<TiledLinear>(35, 39, 3, 5, 500u);
 };
 
+// The register-tiled pair's softmax, which is the same assertion at that
+// kernel's own tile and part counts.
+auto tTiledSoftmaxAttention = test("Kernels/tiledSoftmaxAttention") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkSoftmaxAttention<MaximaTiledLinear, SoftmaxTiledMatMul>(
+        41, 37, 2, 9, 700u);
+};
+
+auto tTiledSoftmaxAttentionModelHeads =
+    test("Kernels/tiledSoftmaxAttentionModelHeads") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    TiledProduct::checkSoftmaxAttention<MaximaTiledLinear, SoftmaxTiledMatMul>(
+        70, 150, 2, 64, 710u);
+};
+
 auto tTiledAttentionApply = test("Kernels/tiledAttentionApply") = []
 {
     if (!Device::shared().isValid())

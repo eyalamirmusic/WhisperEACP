@@ -132,6 +132,8 @@ void Decoder::prepare(Device& device)
     packedProjection.prepare(device);
     splitProjection.prepare(device);
     packedSplitProjection.prepare(device);
+    splitLogits.prepare(device);
+    packedSplitLogits.prepare(device);
     scores.prepare(device);
     softmax.prepare(device);
     attention.prepare(device);
@@ -166,6 +168,7 @@ void Decoder::prepare(Device& device)
     zeroLogitBias.emplace(allocateZeroed(device, decoderShape.vocabularySize));
 
     decodedPositions = 0;
+    activeCrossPositions = decoderShape.crossPositions;
 }
 
 void Decoder::prepare()
@@ -216,8 +219,13 @@ void Decoder::encodeLinear(ComputePass& pass,
 {
     const auto fewRows = rowCount <= splitRowLimit;
 
+    // The vocabulary projection is the one shape a step takes whose output
+    // fills the device on its own; everything else it projects is at most the
+    // feed-forward width. See logitsSplitCount.
+    const auto vocabularyWide = outputWidth > decoderShape.feedForwardWidth;
+
     if (weight.isPackedHalf() && fewRows)
-        dispatchLinear(packedSplitProjection,
+        dispatchLinear(vocabularyWide ? packedSplitLogits : packedSplitProjection,
                        pass,
                        input,
                        weight.buffer,
@@ -241,7 +249,7 @@ void Decoder::encodeLinear(ComputePass& pass,
                        gelu,
                        residual);
     else if (fewRows)
-        dispatchLinear(splitProjection,
+        dispatchLinear(vocabularyWide ? splitLogits : splitProjection,
                        pass,
                        input,
                        weight.buffer,
@@ -438,7 +446,7 @@ void Decoder::encodeCrossAttention(ComputePass& pass,
                              crossValues[layerIndex],
                              *crossScores,
                              tokenCount,
-                             decoderShape.crossPositions,
+                             activeCrossPositions,
                              false);
 }
 
@@ -551,12 +559,20 @@ void Decoder::encodeLayer(ComputePass& pass,
 // which the caller orders.
 void Decoder::beginSequence(ComputePass& pass,
                             const Buffer& encoderOutput,
-                            const DecoderWeights& weights)
+                            const DecoderWeights& weights,
+                            int crossPositionCount)
 {
     requireMatchingWeights(weights);
 
+    if (crossPositionCount < 0 || crossPositionCount > decoderShape.crossPositions)
+        throw ModelError {"a decoder built for "
+                          + std::to_string(decoderShape.crossPositions)
+                          + " encoder rows was asked to attend to "
+                          + std::to_string(crossPositionCount)};
+
     const auto width = decoderShape.width;
-    const auto rows = decoderShape.crossPositions;
+    const auto rows =
+        crossPositionCount == 0 ? decoderShape.crossPositions : crossPositionCount;
 
     for (auto index = 0; index < decoderShape.layers; ++index)
     {
@@ -582,6 +598,7 @@ void Decoder::beginSequence(ComputePass& pass,
     }
 
     decodedPositions = 0;
+    activeCrossPositions = rows;
 }
 
 void Decoder::step(ComputePass& pass,
