@@ -4,6 +4,8 @@
 #include "KernelTypes.h"
 #include "MatMul.h"
 
+#include <algorithm>
+
 namespace WSP
 {
 // y = x W^T + b, which is every projection in a transformer, with W stored the
@@ -87,12 +89,26 @@ using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
 
 // The same product for a handful of rows — a decode step's one token, or the
 // prompt's two — where a thread per output is a thread per 384 or 1536 serial
-// multiply-adds and the GPU is nearly idle. The inner sum is split eight ways
-// across a group instead: the grid is [8, rowCount * outputWidth], the eight
-// threads of a group row take every eighth run of four inputs of one output,
-// and the group folds the eight partial sums in shared memory before the one
-// store. Adjacent threads read adjacent words of the same weight row, which
-// is the access the memory system serves whole.
+// multiply-adds and the GPU is nearly idle. The inner sum is split across
+// splitCount lanes instead: the grid is [splitCount, rowCount * outputWidth],
+// each lane of a group row takes every splitCount'th run of four inputs of one
+// output, and the group folds the partial sums before the one store. Adjacent
+// lanes read adjacent words of the same weight row, which is the access the
+// memory system serves whole.
+//
+// **The split count is the shape's, and it is what makes this kernel fast.**
+// It sets both how much of the inner sum a lane walks and how many groups the
+// dispatch has, and the second is what a decode step is short of: a 384-wide
+// projection of one row is 590 kB of weight read by 48 groups at the stock 8,
+// which is a few thousand threads on a device sized for tens of thousands.
+// The caller names the count its shapes want — Decoder::stepSplitCount and
+// logitsSplitCount are the two this model uses, both measured — the way
+// ReducingProgram takes its lane count.
+//
+// A group is splitCount lanes by however many outputs 64 threads then hold,
+// and one output at or past 64. At one output the fold is groupSum(), which is
+// a SIMD reduction rather than the shared array and the serial walk of it a
+// group holding several outputs still needs.
 //
 // dispatch(pass, outputWidth, rowCount), which rounds the height up to whole
 // groups since the fold is a barrier; a thread past the last output computes
@@ -105,20 +121,28 @@ using HalfWeightLinear = LinearProgram<WeightStorage::PackedHalf>;
 // size: gelu applies the activation to the result, which is what follows fc1,
 // and residual adds the result to what the output already holds, which is
 // what follows every out_proj and fc2 — in place on the residual stream, the
-// element read and stored by the one thread that owns it.
+// element read and stored by the one lane that stores it. That one lane
+// matters: the residual is a read-modify-write, so every path here stores from
+// a single lane of the group rather than from all of them holding the same
+// folded value.
 template <WeightStorage weightStorage>
 struct SplitLinearProgram final : ComputeProgram
 {
-    static constexpr auto splits = (unsigned) groupSize2D;
-
-    SplitLinearProgram() { compile(); }
+    explicit SplitLinearProgram(int splitCount = groupSize2D)
+        : ComputeProgram({splitCount, std::max(1, groupWidth / splitCount)})
+        , splits((unsigned) groupShape().x)
+        , outputsPerGroup(groupShape().y)
+    {
+        compile();
+    }
 
     void dispatch(ComputePass& pass, int outputWidth, int rowCount)
     {
         const auto outputs = outputWidth * rowCount;
-        const auto height = (outputs + groupSize2D - 1) / groupSize2D * groupSize2D;
+        const auto height =
+            (outputs + outputsPerGroup - 1) / outputsPerGroup * outputsPerGroup;
 
-        pass.dispatch(*this, groupSize2D, height);
+        pass.dispatch(*this, (int) splits, height);
     }
 
     void define() override
@@ -162,20 +186,39 @@ struct SplitLinearProgram final : ComputeProgram
             });
 
         auto local = localPosition();
-        auto tile = shared<Float>(groupSize2D * groupSize2D);
+
+        if (outputsPerGroup == 1)
+        {
+            auto sum = var(groupSum(total.get()));
+
+            ifThen(local.x == 0u, [&] { store(sum.get(), element, column, row); });
+            return;
+        }
+
+        auto tile = shared<Float>((int) splits * outputsPerGroup);
 
         write(tile, local.y * splits + local.x, total.get());
         barrier();
 
-        ifThen(local.x == 0u && row < rowCount,
+        auto sum = var(0.f);
+
+        for (auto part = 0u; part < splits; ++part)
+            sum += tile[local.y * splits + part];
+
+        ifThen(local.x == 0u, [&] { store(sum.get(), element, column, row); });
+    }
+
+    // The one store, behind the row test a rounded-up dispatch height needs:
+    // the bias, then the two stages folded into it.
+    void store(const Float& sum,
+               const UInt& element,
+               const UInt& column,
+               const UInt& row)
+    {
+        ifThen(row < rowCount,
                [&]
                {
-                   auto sum = var(0.f);
-
-                   for (auto part = 0u; part < splits; ++part)
-                       sum += tile[local.y * splits + part];
-
-                   auto value = sum.get() + bias[column];
+                   auto value = sum + bias[column];
                    auto activated = select(gelu != 0u, exactGelu(value), value);
                    auto carried = select(residual != 0u, output[element], 0.f);
 
@@ -211,6 +254,12 @@ struct SplitLinearProgram final : ComputeProgram
     Uniform<UInt> rowCount;
     Uniform<UInt> gelu;
     Uniform<UInt> residual;
+
+    // How many lanes share one output's inner sum, and how many outputs one
+    // group therefore holds: the group is [splits, groupWidth / splits] below
+    // the group width, so it stays 64 threads, and [splits, 1] at or above it.
+    const unsigned splits;
+    const int outputsPerGroup;
 
     EACP_SHADER(input,
                 weights,

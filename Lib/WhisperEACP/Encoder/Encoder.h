@@ -39,6 +39,9 @@ namespace WSP
 // program — held twice, the float-weight form and the packed-half one, so a
 // weight that arrived fp16 is dispatched through the program that reads it as
 // fp16 — and the attention apply reads its values along n through the other.
+//
+// The softmax between the two attention products is not a dispatch. See the
+// scores and apply members below.
 class Encoder
 {
 public:
@@ -53,12 +56,30 @@ public:
     // receives shape().elementCount() of them, [positions, width] row-major.
     // The weights must have been loaded against the same shape; a mismatch is a
     // ModelError rather than a dispatch at the wrong stride.
+    //
+    // positionCount is whisper.cpp's audio_ctx: the run computes that many
+    // rows out of the first shape().framesForPositions(positionCount) mel
+    // frames and writes them into the front of output, the rest of which it
+    // neither reads nor touches. Zero, the default, is the whole window.
+    // Nothing is allocated here — prepare() sized every intermediate for the
+    // window and a shorter run dispatches over a prefix of each — and nothing
+    // outside the audio is read: the convolutions see zero past the frames
+    // they were given, exactly as the model's own padding does at the end of
+    // the window.
     void encode(eacp::GPU::ComputePass& pass,
                 const eacp::GPU::Buffer& mel,
                 const EncoderWeights& weights,
-                const eacp::GPU::Buffer& output);
+                const eacp::GPU::Buffer& output,
+                int positionCount = 0);
 
 private:
+    // The extents of the run being recorded, which are the shape's own unless
+    // encode() was given a shorter context. Every dispatch below reads them
+    // rather than the shape, so the prefix reaches all of them from one place.
+    int positions() const { return runPositions; }
+    int convolutionFrames() const { return runConvolutionFrames; }
+    int inputFrames() const { return runInputFrames; }
+
     void encodeFrontEnd(eacp::GPU::ComputePass& pass,
                         const eacp::GPU::Buffer& mel,
                         const EncoderWeights& weights);
@@ -106,6 +127,10 @@ private:
 
     EncoderShape encoderShape;
 
+    int runPositions = 0;
+    int runConvolutionFrames = 0;
+    int runInputFrames = 0;
+
     Unfold unfold;
     Add sum;
 
@@ -113,14 +138,26 @@ private:
     LayerNorm normalisation {LayerNorm::manyRowLanes};
     LinearProduct projection;
     HalfWeightLinearProduct packedProjection;
-    Softmax softmax;
 
     // The scores are the same product shape as a projection and were dispatched
     // through the same program, but the two roles pick their kernel separately
     // — a [1500, 1500] product over a head's 64 columns is not the shape a
     // projection is — so each holds its own.
     AttentionScoresProduct scores;
-    AttentionApplyProduct attention;
+    SoftmaxAttentionApplyProduct attention;
+
+    // A layer's 54 MB of scores are written once and read once. The scores
+    // product reports the largest score in each row of each of its column
+    // tiles as it stores them, and the apply folds a row's tiles into the
+    // maximum it exponentiates against, sums what it stages and divides the
+    // row by that sum on the store — so the softmax between the two costs no
+    // pass, where the pass it replaces read the matrix twice more and wrote it
+    // twice.
+    static constexpr int scoreColumnTiles(int positions)
+    {
+        return (positions + AttentionScoresProduct::tile - 1)
+               / AttentionScoresProduct::tile * AttentionScoresProduct::maximaPerRow;
+    }
 
     // The residual stream is hidden, added to in place by every sublayer's
     // last projection; the GELUs are on the stores that feed them and the
@@ -135,6 +172,7 @@ private:
     std::optional<eacp::GPU::Buffer> keys;
     std::optional<eacp::GPU::Buffer> values;
     std::optional<eacp::GPU::Buffer> attentionScores;
+    std::optional<eacp::GPU::Buffer> attentionTileMaxima;
     std::optional<eacp::GPU::Buffer> attended;
     std::optional<eacp::GPU::Buffer> feedForward;
 

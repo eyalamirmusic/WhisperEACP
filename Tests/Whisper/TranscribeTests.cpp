@@ -211,3 +211,98 @@ auto tLongerThanAWindowIsAnError = test("Whisper/longerThanAWindowIsAnError") = 
     check(
         mentions(modelErrorFrom([&] { whisper.transcribe(tooMuch); }), "chunking"));
 };
+
+// The arithmetic of sizing a context to a recording, which needs no device: a
+// position is 320 samples — a 160-sample hop through a convolution of stride
+// two — and the count is rounded up to the 64 the products tile at and held
+// inside the window.
+auto tAudioContextForSamples = test("Whisper/audioContextForSamples") = []
+{
+    check(Whisper::audioContextTile == 64);
+
+    // jfk.wav is 176000 samples, which is 550 positions: 576 with no margin,
+    // 640 with a second of it, and 704 with the default 2.5 s.
+    check(Whisper::audioContextForSamples(176000, 0.0) == 576);
+    check(Whisper::audioContextForSamples(176000, 1.0) == 640);
+    check(Whisper::audioContextForSamples(176000) == 704);
+
+    // The floor holds a short segment up and the window is the ceiling however
+    // much is asked for. A second of audio and a second of margin is 100
+    // positions, and 100 positions is where the decoder loops.
+    check(Whisper::audioContextForSamples(0, 0.0) == Whisper::audioContextFloor);
+    check(Whisper::audioContextForSamples(sampleRate, 1.0)
+          == Whisper::audioContextFloor);
+    check(Whisper::audioContextForSamples(sampleRate) == Whisper::audioContextFloor);
+    check(Whisper::audioContextForSamples(windowSamples) == encoderPositions);
+    check(Whisper::audioContextForSamples(windowSamples, 0.0) == encoderPositions);
+};
+
+auto tAudioContextIsValidated = test("Whisper/audioContextIsValidated") = []
+{
+    if (!canRun())
+        return;
+
+    auto& whisper = preparedModel();
+
+    check(whisper.audioContext() == 0);
+    check(throwsModelError([&] { whisper.setAudioContext(-1); }));
+    check(throwsModelError([&] { whisper.setAudioContext(encoderPositions + 1); }));
+    check(whisper.audioContext() == 0);
+
+    whisper.setAudioContext(640);
+    check(whisper.audioContext() == 640);
+
+    whisper.setAudioContext(0);
+    check(whisper.audioContext() == 0);
+};
+
+// The transcript at every context worth reading, against the full window's.
+// The numbers this prints are the measurement the option rests on, and the
+// assertion is where they stop being the same sentence: jfk.wav is 11 s, which
+// is 550 positions, and a context of 640 — the 550 plus the default second of
+// margin, rounded to a tile — reproduces the full window's 24 tokens exactly.
+//
+// 576 does not. It is a tile above the audio and 0.5 s of margin, and it drops
+// the comma after "for you". That is the transcript the model produces when it
+// is asked to encode less silence than it was trained on, not a bug in the
+// truncation: whisper.cpp at the same audio_ctx produces the same tokens, which
+// is what Tests/Oracle asserts.
+auto tAudioContextTranscripts = test("Whisper/audioContextTranscripts") = []
+{
+    if (!canRun())
+        return;
+
+    auto& whisper = preparedModel();
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    for (auto context: {1500, 1024, 768, 640, 576, 512})
+    {
+        whisper.setAudioContext(context);
+
+        const auto tokens = whisper.transcribe(samples);
+        const auto text = trimmed(whisper.textForTokens(tokens));
+
+        std::cout << "  " << context << " positions, " << tokens.size()
+                  << " tokens: " << text << "\n";
+
+        if (context >= 640)
+        {
+            check(tokens.size() == jfkTokenCount);
+            check(text == jfkTranscript);
+        }
+    }
+
+    whisper.setAudioContext(0);
+
+    const auto whole = whisper.transcribe(samples);
+    check(whole.size() == jfkTokenCount);
+    check(trimmed(whisper.textForTokens(whole)) == jfkTranscript);
+};
+
+// The default is off, and off is what every other test in this module runs
+// under: a run with no context set encodes the window whatever the audio is.
+auto tAudioContextIsOffByDefault = test("Whisper/audioContextIsOffByDefault") = []
+{
+    auto whisper = Whisper {};
+    check(whisper.audioContext() == 0);
+};

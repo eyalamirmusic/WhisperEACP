@@ -85,7 +85,7 @@ public:
 
     // The encoder over the caller's mel, then a fresh decoder sequence over its
     // output. One command buffer, committed, which is what the runtime does.
-    void beginFrom(const std::vector<float>& mel)
+    void beginFrom(const std::vector<float>& mel, int audioContext = 0)
     {
         auto& device = Device::shared();
         const auto melBuffer = melTest::upload(device, mel);
@@ -94,8 +94,8 @@ public:
 
         {
             auto pass = commands.beginCompute();
-            encoder.encode(pass, melBuffer, encoderWeights, *encoded);
-            decoder.beginSequence(pass, *encoded, decoderWeights);
+            encoder.encode(pass, melBuffer, encoderWeights, *encoded, audioContext);
+            decoder.beginSequence(pass, *encoded, decoderWeights, audioContext);
         }
 
         commands.commit();
@@ -320,4 +320,71 @@ auto tDecoderFollowsTheOracle = test("Oracle/decoderFollowsTheOracle") = []
     std::cout << "  " << followOnSteps + 1 << " steps: argmax agrees " << agreements
               << " times, worst |a - e| " << worstOverall << " ("
               << worstOverall / resolution << "x the reference's resolution)\n";
+};
+
+// The same comparison at a reduced audio context — whisper.cpp's audio_ctx,
+// and our Encoder::encode over a prefix — which is the only reference there is
+// for a truncated encoder. Both sides read the same 3000-frame mel of ours and
+// both truncate it the same way: whisper.cpp copies the first 2 * n_ctx frames
+// into a tensor of that width (whisper_encode_internal, "set the input"), and
+// ours dispatches the convolutions over the same prefix with zero past it.
+//
+// 576 positions is the interesting count rather than a safe one: it is where
+// jfk.wav's transcript changes, so a run at it is one where the truncation is
+// doing something the full window does not, and agreeing there is a claim
+// about the arithmetic rather than about a margin big enough to hide it.
+auto tDecoderAgreesWithTheOracleAtAReducedContext =
+    test("Oracle/decoderAgreesWithTheOracleAtAReducedContext") = []
+{
+    if (!canRun())
+        return;
+
+    const auto context = loadOracle();
+
+    if (context == nullptr)
+        return;
+
+    const auto samples = paddedToWindow(readPcm16Wav(WHISPER_EACP_JFK_WAV));
+
+    if (samples.empty())
+        return;
+
+    const auto mel = ourMelSpectrogram(Device::shared(), samples);
+    const auto prompt = std::vector<whisper_token> {startOfTranscript, noTimestamps};
+    const auto atTheWindow = oracleLogitsForMel(*context, mel, prompt);
+
+    auto& ours = ourDecoding();
+
+    for (auto audioContext: {1024, 768, 576})
+    {
+        check(armOracleAudioContext(*context, samples, audioContext));
+
+        const auto reference = oracleLogitsForMel(*context, mel, prompt);
+        check(!reference.empty());
+
+        // The parameter took: a reference encoding this many positions is not
+        // one encoding 1500, and every number below would be meaningless if it
+        // were.
+        check(maximumAbsoluteDifference(atTheWindow, reference) > 0.5f);
+
+        ours.beginFrom(mel, audioContext);
+        const auto mine = ours.step({startOfTranscript, noTimestamps});
+
+        check((int) mine.size() == (int) reference.size());
+
+        const auto resolution =
+            oracleLogitResolution(*context, mel, reference, prompt);
+        const auto worst = maximumAbsoluteDifference(mine, reference);
+        const auto rms = rootMeanSquareDifference(mine, reference);
+
+        check(resolution > 0.0f);
+        check(worst <= 100.0f * resolution);
+        check(argmaxOf(mine) == argmaxOf(reference));
+
+        std::cout << "  prompt logits at " << audioContext
+                  << " positions: max |a - e| " << worst << ", rms " << rms
+                  << ", over a range of " << largestMagnitude(reference)
+                  << "; the reference's own one-ulp resolution is " << resolution
+                  << " (" << worst / resolution << "x)\n";
+    }
 };

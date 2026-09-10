@@ -275,6 +275,40 @@ inline std::vector<float>
     return oracleLogitsForPrompt(context, prompt);
 }
 
+// whisper.cpp's audio_ctx reaches a state only through whisper_full, which
+// copies it out of the parameters and leaves it there — there is no setter and
+// no getter for it, and whisper_encode takes no context of its own. So arming
+// the reference is one full run at that context, after which whisper_set_mel,
+// whisper_encode and whisper_decode all run at it, and a stage of ours can be
+// dropped into a reduced-context reference run exactly as it is into a full
+// one.
+//
+// The arming is checked rather than assumed at every call site here: the
+// logits the reference gives at a reduced context differ from the ones it
+// gives at the window, and a test that could not tell the two apart would pass
+// whether or not the parameter took.
+inline bool armOracleAudioContext(whisper_context& context,
+                                  const std::vector<float>& samples,
+                                  int positions)
+{
+    auto parameters = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
+
+    parameters.n_threads = oracleThreads;
+    parameters.language = "en";
+    parameters.no_timestamps = true;
+    parameters.single_segment = true;
+    parameters.temperature = 0.0f;
+    parameters.temperature_inc = 0.0f;
+    parameters.audio_ctx = positions;
+    parameters.print_progress = false;
+    parameters.print_realtime = false;
+    parameters.print_special = false;
+    parameters.print_timestamps = false;
+
+    return whisper_full(&context, parameters, samples.data(), (int) samples.size())
+           == 0;
+}
+
 inline float maximumAbsoluteDifference(const std::vector<float>& a,
                                        const std::vector<float>& b)
 {

@@ -2,6 +2,7 @@
 
 #include "Common.h"
 
+#include <algorithm>
 #include <cstring>
 
 namespace WSP
@@ -270,6 +271,135 @@ void checkAttentionApply(
                            shape,
                            OperandLayout::ContiguousN,
                            outputs));
+}
+
+// The softmax an attention's two products do between them rather than in a
+// pass of its own: the scores product reports the largest score in each part
+// of each of its column tiles as it stores them, and the apply folds a row's
+// parts into the maximum it exponentiates against, sums what it stages and
+// divides the row by that sum.
+//
+// Both halves are asserted here — the maxima against a scalar scan of the
+// scores the same run produced, and the output against a scalar softmax
+// followed by a scalar apply, which is what the pair replaces. The two
+// programs are run into one command buffer because the second reads what the
+// first wrote.
+template <typename ScoresProgram, typename ApplyProgram>
+void checkSoftmaxAttention(
+    int queries, int keys, int heads, int headWidth, unsigned seed)
+{
+    const auto width = heads * headWidth;
+    const auto scoreCount = heads * queries * keys;
+    const auto outputs = queries * width;
+
+    constexpr auto tile = ScoresProgram::tile;
+    constexpr auto parts = ScoresProgram::maximaPerRow;
+    constexpr auto partWidth = tile / parts;
+
+    const auto columnTiles = (keys + tile - 1) / tile;
+    const auto maximaStride = columnTiles * parts;
+
+    auto queryRows = spreadValues(queries * width, seed, 2.f);
+    auto keyRows = spreadValues(keys * width, seed + 1u, 2.f);
+    auto valueRows = spreadValues(keys * width, seed + 2u, 2.f);
+    auto keyBias = zeroes(keys);
+    auto valueBias = zeroes(headWidth);
+
+    auto scoreShape = TiledMatMulShape::forAttentionScores(
+        queries, keys, heads, headWidth, width, 0.37f, false);
+    auto applyShape =
+        TiledMatMulShape::forAttentionApply(queries, keys, heads, headWidth, width);
+
+    auto queryBuffer = storageOf(queryRows);
+    auto keyBuffer = storageOf(keyRows);
+    auto valueBuffer = storageOf(valueRows);
+    auto keyBiasBuffer = storageOf(keyBias);
+    auto valueBiasBuffer = storageOf(valueBias);
+    auto scoreBuffer = storageOf(zeroes(scoreCount));
+    auto maximaBuffer = storageOf(zeroes(heads * queries * maximaStride));
+    auto outputBuffer = storageOf(zeroes(outputs));
+
+    auto scoresKernel = ScoresProgram {};
+    auto applyKernel = ApplyProgram {};
+
+    scoresKernel.a = queryBuffer;
+    scoresKernel.b = keyBuffer;
+    scoresKernel.bias = keyBiasBuffer;
+    scoresKernel.output = scoreBuffer;
+    scoresKernel.tileMaxima = maximaBuffer;
+    scoresKernel.prepare();
+
+    applyKernel.a = scoreBuffer;
+    applyKernel.b = valueBuffer;
+    applyKernel.bias = valueBiasBuffer;
+    applyKernel.output = outputBuffer;
+    applyKernel.rowMaxima = maximaBuffer;
+    applyKernel.prepare();
+
+    auto commands = eacp::GPU::Device::shared().makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        scoresKernel.dispatch(pass, scoreShape);
+        pass.barrier();
+        applyKernel.dispatch(pass, applyShape);
+    }
+
+    commands.commit();
+
+    auto scores = readBack(scoreBuffer, scoreCount);
+    auto maxima = readBack(maximaBuffer, heads * queries * maximaStride);
+    auto result = readBack(outputBuffer, outputs);
+
+    for (auto head = 0; head < heads; ++head)
+        for (auto query = 0; query < queries; ++query)
+            for (auto tileIndex = 0; tileIndex < columnTiles; ++tileIndex)
+                for (auto part = 0; part < parts; ++part)
+                {
+                    auto best = causalMaskScore;
+
+                    for (auto i = 0; i < partWidth; ++i)
+                    {
+                        auto key = tileIndex * tile + part * partWidth + i;
+
+                        if (key < keys)
+                            best = std::max(
+                                best, scores[(head * queries + query) * keys + key]);
+                    }
+
+                    nano::check(maxima[(head * queries + query) * maximaStride
+                                       + tileIndex * parts + part]
+                                == best);
+                }
+
+    for (auto head = 0; head < heads; ++head)
+        for (auto query = 0; query < queries; ++query)
+        {
+            const auto row = (head * queries + query) * keys;
+            auto largest = (double) scores[row];
+
+            for (auto key = 1; key < keys; ++key)
+                largest = std::max(largest, (double) scores[row + key]);
+
+            auto total = 0.0;
+
+            for (auto key = 0; key < keys; ++key)
+                total += std::exp((double) scores[row + key] - largest);
+
+            for (auto column = 0; column < headWidth; ++column)
+            {
+                auto weighted = 0.0;
+
+                for (auto key = 0; key < keys; ++key)
+                    weighted += std::exp((double) scores[row + key] - largest)
+                                * valueRows[key * width + head * headWidth + column];
+
+                nano::check(
+                    isClose(result[query * width + head * headWidth + column],
+                            weighted / total,
+                            1e-5));
+            }
+        }
 }
 
 // The two stages folded into the store: the GELU after fc1, and the residual

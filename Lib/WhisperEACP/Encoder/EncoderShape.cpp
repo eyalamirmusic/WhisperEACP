@@ -1,5 +1,6 @@
 #include "EncoderShape.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace WSP
@@ -14,20 +15,25 @@ EncoderShape EncoderShape::fromConfig(const ModelConfig& config, int frameCount)
             frameCount};
 }
 
-int EncoderShape::convolutionFrames() const
+int EncoderShape::convolutionFrames(int frameCount) const
 {
-    return conv1dOutputLength(inputFrames,
+    return conv1dOutputLength(frameCount,
                               convolutionKernelSize,
                               firstConvolutionStride,
                               convolutionPadding);
 }
 
-int EncoderShape::positions() const
+int EncoderShape::positions(int frameCount) const
 {
-    return conv1dOutputLength(convolutionFrames(),
+    return conv1dOutputLength(convolutionFrames(frameCount),
                               convolutionKernelSize,
                               secondConvolutionStride,
                               convolutionPadding);
+}
+
+int EncoderShape::framesForPositions(int positionCount) const
+{
+    return std::min(positionCount * secondConvolutionStride, inputFrames);
 }
 
 // D^-0.5, applied to the scores rather than folded into the query projection,

@@ -73,6 +73,88 @@ int chunkCount(int sampleCount, int chunk)
 {
     return (sampleCount + chunk - 1) / chunk;
 }
+
+// The same 100 ms over and over, a block at a time with a turn between them,
+// which is the drive the run policy is written against.
+void pushRepeatedBlock(LiveTranscriber& live,
+                       const std::vector<float>& block,
+                       int count)
+{
+    for (auto index = 0; index < count; ++index)
+    {
+        live.push(block);
+        live.update();
+    }
+}
+
+// Speech, a pause shorter than the silence hold, then speech again: the runs
+// the policy took in each of the three stretches.
+struct PauseDrive
+{
+    int overSpeech = 0;
+    int overThePause = 0;
+    int total = 0;
+};
+
+PauseDrive driveAPause(double minNewSpeechSeconds)
+{
+    auto options = LiveOptions {};
+    options.minNewSpeechSeconds = minNewSpeechSeconds;
+
+    auto live = LiveTranscriber {preparedModel(), options};
+    const auto speech = toneBlock(0.1f);
+    const auto silence = silentChunk(blockSamples);
+
+    auto drive = PauseDrive {};
+
+    pushRepeatedBlock(live, speech, 15);
+    drive.overSpeech = live.stats().runs;
+
+    pushRepeatedBlock(live, silence, 9);
+    drive.overThePause = live.stats().runs - drive.overSpeech;
+
+    pushRepeatedBlock(live, speech, 10);
+    drive.total = live.stats().runs;
+
+    return drive;
+}
+
+// jfk.wav, then silence a block at a time until the hold closes the segment.
+struct TrailingSilenceDrive
+{
+    int overSpeech = 0;
+    int overTheSilence = 0;
+    std::string committedLine;
+};
+
+TrailingSilenceDrive driveJfkThenSilence(double minNewSpeechSeconds)
+{
+    auto options = LiveOptions {};
+    options.minNewSpeechSeconds = minNewSpeechSeconds;
+
+    auto live = LiveTranscriber {preparedModel(), options};
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    pushChunked(live, samples, blockSamples);
+
+    auto drive = TrailingSilenceDrive {};
+    drive.overSpeech = live.stats().runs;
+
+    const auto silence = silentChunk(blockSamples);
+
+    for (auto block = 0; block < 20 && live.committed().size() == 0; ++block)
+    {
+        live.push(silence);
+        live.update();
+    }
+
+    drive.overTheSilence = live.stats().runs - drive.overSpeech;
+
+    if (live.committed().size() > 0)
+        drive.committedLine = trimmed(live.committed()[0]);
+
+    return drive;
+}
 } // namespace
 
 // No device, no model, no sample: the classifier is arithmetic over a block.
@@ -198,6 +280,57 @@ auto tLengthCutCommitsSeveralSegments =
         std::cout << "    \"" << line << "\"\n";
 };
 
+// A pause the speaker takes mid-sentence is audio the model has nothing to say
+// about, and under an unconditional step it costs a run every stepSeconds until
+// they carry on. minNewSpeechSeconds is what makes those runs not happen, and
+// setting it to zero here is what the policy used to be, so the two drives are
+// the before and the after of one change.
+auto tAPauseInsideASegmentTakesNoRun =
+    test("Live/aPauseInsideASegmentTakesNoRun") = []
+{
+    if (!canRun())
+        return;
+
+    const auto gated = driveAPause(LiveOptions {}.minNewSpeechSeconds);
+    const auto unconditional = driveAPause(0.0);
+
+    check(gated.overThePause == 0);
+    check(unconditional.overThePause > 0);
+
+    check(gated.overSpeech == unconditional.overSpeech);
+    check(gated.total < unconditional.total);
+
+    std::cout << "  a 0.9 s pause: " << gated.total << " runs, "
+              << unconditional.total << " on an unconditional step\n";
+};
+
+// The other half of the same policy: the run that closes a segment is due on
+// audio the last run did not cover, speech or not, since the silence after the
+// last word is what Whisper writes that word against. So the hold is never
+// re-run and always closed, and the transcript is the one the one-shot runtime
+// produces either way.
+auto tTheClosingRunStillSeesTheSilence =
+    test("Live/theClosingRunStillSeesTheSilence") = []
+{
+    if (!canRun())
+        return;
+
+    const auto gated = driveJfkThenSilence(LiveOptions {}.minNewSpeechSeconds);
+    const auto unconditional = driveJfkThenSilence(0.0);
+
+    check(gated.committedLine == jfkTranscript);
+    check(gated.committedLine == unconditional.committedLine);
+
+    check(gated.overTheSilence >= 1);
+    check(gated.overTheSilence < unconditional.overTheSilence);
+    check(gated.overSpeech < unconditional.overSpeech);
+
+    std::cout << "  jfk then its silence hold: " << gated.overSpeech << " + "
+              << gated.overTheSilence << " runs, " << unconditional.overSpeech
+              << " + " << unconditional.overTheSilence
+              << " on an unconditional step\n";
+};
+
 // The Stop button: everything pushed and no silence after it still commits, and
 // clear() puts the object back where it started.
 auto tFlushCommitsAndClearEmpties = test("Live/flushCommitsAndClearEmpties") = []
@@ -226,4 +359,67 @@ auto tFlushCommitsAndClearEmpties = test("Live/flushCommitsAndClearEmpties") = [
     check(live.stats().pendingSeconds == 0.0);
     check(live.stats().speechSeconds == 0.0);
     check(!live.stats().pendingHasSpeech);
+};
+
+// The option this layer is the case for: every run encodes the segment it has
+// rather than the 30 s window. What it must not change is the answer — the same
+// eleven seconds of jfk.wav come out as the same committed line — and what it
+// must change is the context the model was left holding, which is the closing
+// segment's own length plus the margin.
+//
+// The runtime is shared by every test in this module, so the context goes back
+// to the window at the end; a run that left it set would quietly transcribe
+// every test after this one at a reduced context.
+auto tLiveEncodesOnlyTheAudioThereIs = test("Live/encodesOnlyTheAudioThereIs") = []
+{
+    if (!canRun())
+        return;
+
+    auto options = LiveOptions {};
+    options.encodeOnlyTheAudioThereIs = true;
+
+    auto& whisper = preparedModel();
+    auto live = LiveTranscriber {whisper, options};
+
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto trailingSilence = silentChunk(2 * sampleRate);
+
+    pushChunked(live, samples, blockSamples);
+    pushChunked(live, trailingSilence, blockSamples);
+
+    const auto context = whisper.audioContext();
+    whisper.setAudioContext(0);
+
+    check(live.committed().size() == 1);
+
+    if (live.committed().size() == 1)
+        check(trimmed(live.committed()[0]) == jfkTranscript);
+
+    // The segment that closed held the recording and the silence the hold
+    // needed, and no more: eleven seconds of speech plus about a second of it,
+    // which is a long way short of the window's 1500.
+    check(context > Whisper::audioContextForSamples(samples.size(), 0.0));
+    check(context < encoderPositions);
+
+    std::cout << "  live at the segment's own length: " << context << " positions, "
+              << live.stats().runs << " runs, last run "
+              << live.stats().lastRunSeconds << " s\n";
+};
+
+// And with the option off — the default — the model is never told anything.
+auto tLiveLeavesTheContextAloneByDefault =
+    test("Live/leavesTheContextAloneByDefault") = []
+{
+    if (!canRun())
+        return;
+
+    auto& whisper = preparedModel();
+    auto live = LiveTranscriber {whisper};
+
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    live.push(samples);
+    live.flush();
+
+    check(whisper.audioContext() == 0);
 };

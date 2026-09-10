@@ -227,3 +227,87 @@ auto tEncoderShapeMismatchIsAnError = test("Encoder/shapeMismatchIsAnError") = [
 
     check(throwsModelError([&] { encoder.encode(pass, mel, weights, output); }));
 };
+
+// A context shorter than the shape — whisper.cpp's audio_ctx — against the
+// same scalar reference. What the reduced run has to equal is not the full
+// run's first rows, which are a different answer because the model attends to
+// the whole window; it is a shape built at that length in the first place,
+// over that many mel frames. That is the claim, and the reference is computed
+// from the shorter shape's own definition rather than from the reduced run.
+auto tEncoderReducedContextMatchesTheShorterShape =
+    test("Encoder/reducedContextMatchesTheShorterShape") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto shape = smallShape();
+    const auto context = shape.positions() / 2;
+
+    auto shorter = shape;
+    shorter.inputFrames = shape.framesForPositions(context);
+
+    check(shorter.inputFrames == 6);
+    check(shorter.positions() == context);
+
+    const auto file = syntheticEncoderFile(shape, ProjectionStorage::Float);
+    const auto mel = syntheticMel(shape);
+
+    auto result = runEncoder(shape, file, mel, context);
+    const auto expected =
+        referenceEncode(readReferenceModel(file, shorter),
+                        shorter,
+                        melPrefix(mel, shape, shorter.inputFrames));
+
+    check(result.size() == context * shape.width);
+    check((int) expected.size() == context * shape.width);
+
+    const auto worst = worstError(result, expected);
+    std::cout << "  " << context << " of " << shape.positions()
+              << " positions: worst error " << worst << "\n";
+
+    check(worst <= 5e-6);
+
+    // And the full run is still the full run: the same encoder, asked for
+    // every position again, answers what it always did.
+    const auto whole = runEncoder(shape, file, mel);
+    const auto reference =
+        referenceEncode(readReferenceModel(file, shape), shape, mel);
+
+    check(worstError(whole, reference) <= 5e-6);
+};
+
+// The two ends of the range and the rounding in between, none of which needs a
+// device: a count is the frames it reads and the frames are the count again.
+auto tEncoderContextFrames = test("Encoder/contextFrames") = []
+{
+    const auto shape = smallShape();
+
+    check(shape.framesForPositions(3) == 6);
+    check(shape.positions(6) == 3);
+    check(shape.framesForPositions(shape.positions()) == shape.inputFrames);
+
+    // A count past the window is the window rather than a longer run.
+    check(shape.framesForPositions(shape.positions() + 4) == shape.inputFrames);
+
+    auto whisper = smallShape();
+    whisper.inputFrames = 3000;
+
+    check(whisper.framesForPositions(768) == 1536);
+    check(whisper.positions(1536) == 768);
+    check(whisper.positions(2 * 64) == 64);
+};
+
+auto tEncoderTooLongAContextIsAnError = test("Encoder/tooLongAContextIsAnError") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto shape = smallShape();
+    const auto file = syntheticEncoderFile(shape, ProjectionStorage::Float);
+    const auto mel = syntheticMel(shape);
+
+    const auto message =
+        modelErrorText([&] { runEncoder(shape, file, mel, shape.positions() + 1); });
+
+    check(mentions(message, "was asked to run over 7"));
+};

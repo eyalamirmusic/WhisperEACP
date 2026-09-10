@@ -282,3 +282,74 @@ auto tDecoderStepPastTheWindowIsAnError =
     check(run.stepThrowsLeavingLogitsUntouched({1}));
     check(run.position() == shape.maxPositions);
 };
+
+// A sequence over fewer encoder rows than the decoder was built for, which is
+// what an encoder run at a reduced audio context leaves behind. The reference
+// is the shorter shape's own decoding over the rows that were actually
+// written, not the full one's — a decoder attending to three rows is a
+// different answer from one attending to six, and asserting it against the
+// full reference would only say the option does nothing.
+//
+// The rows past the context are poisoned before the run, so a cross attention
+// that read the whole buffer would come back with numbers no reference could
+// match rather than with something close.
+auto tDecoderReducedCrossPositions =
+    test("Decoder/reducedCrossPositionsMatchTheShorterShape") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto shape = smallDecoderShape();
+    const auto context = shape.crossPositions / 2;
+
+    auto shorter = shape;
+    shorter.crossPositions = context;
+
+    const auto file = syntheticDecoderFile(shape, ProjectionStorage::Float);
+    const auto encoderOutput = syntheticEncoderOutput(shorter);
+    const auto tokens = promptTokens();
+
+    auto padded = encoderOutput;
+    padded.resize(shape.crossElementCount(), -1234.f);
+
+    auto run = DecoderRun {shape, file};
+    run.begin(padded, context);
+
+    check(run.crossPositions() == context);
+
+    auto continued = tokens;
+    continued.push_back(tokens.front());
+
+    const auto model = readReferenceDecoderModel(file, shorter);
+    const auto expected = referenceDecode(model, shorter, encoderOutput, continued);
+
+    const auto result = run.step(tokens);
+    const auto worst = checkStepAgainstReference(
+        result, expected, shape, 0, (int) tokens.size(), 5e-6);
+
+    std::cout << "  " << context << " of " << shape.crossPositions
+              << " encoder rows: worst error " << worst << "\n";
+
+    // And a single-token step after the prompt, which is the shape every step
+    // of a real run takes and the one that goes through the fused
+    // single-query attention rather than the three-dispatch chain.
+    const auto next = run.step({continued.back()});
+
+    checkStepAgainstReference(next, expected, shape, (int) tokens.size(), 1, 5e-6);
+};
+
+auto tDecoderTooManyCrossPositionsIsAnError =
+    test("Decoder/tooManyCrossPositionsIsAnError") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    const auto shape = smallDecoderShape();
+    const auto file = syntheticDecoderFile(shape, ProjectionStorage::Float);
+    const auto encoderOutput = syntheticEncoderOutput(shape);
+
+    auto run = DecoderRun {shape, file};
+
+    check(throwsModelError([&]
+                           { run.begin(encoderOutput, shape.crossPositions + 1); }));
+};
