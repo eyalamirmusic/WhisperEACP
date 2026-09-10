@@ -149,16 +149,6 @@ or D3D12 backend, so there is no Linux target.
 | `WHISPER_EACP_UNITY_BUILD` | `OFF` | Unity builds of the libraries. Off, per-file compile commands land in `compile_commands.json` |
 | `WHISPER_EACP_CI_BUILD` | `OFF` | The unity builds CI uses, here and in eacp, MakeASound and Miro |
 
-### eacp's `simdgroup-matrix` branch
-
-The fastest products are written against eacp's SIMD-group matrix, which is on
-that branch until it lands on develop. Nothing here requires it:
-`CMake/Findeacp.cmake` asks the eacp it was handed whether `ShaderBuilder.h`
-declares `simdMatrix`, and without it the role aliases all name the
-register-tiled product and the tree builds, tests and transcribes exactly as it
-did before — 269 tests rather than 284, and a configure that says so. The
-numbers above come from a tree configured against the branch.
-
 ### Building against a local eacp
 
 For the case that is actually for — changing eacp itself alongside a change

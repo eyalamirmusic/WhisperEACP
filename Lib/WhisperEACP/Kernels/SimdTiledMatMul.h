@@ -2,14 +2,6 @@
 
 #include "TiledMatMul.h"
 
-// WHISPER_EACP_HAS_SIMD_MATRIX is set by CMake/Findeacp.cmake from the eacp
-// this tree was configured against: the primitive is on a branch until it
-// lands on develop, and an eacp without it has no simdMatrix() to compile.
-// Without it the role aliases at the bottom all name the register-tiled
-// product, which is what every non-Metal backend runs regardless — so the tree
-// still builds and still transcribes, at the throughput it had before this.
-#if defined(WHISPER_EACP_HAS_SIMD_MATRIX)
-
 namespace WSP
 {
 using eacp::GPU::SimdMatrix;
@@ -464,12 +456,7 @@ using MaximaSimdTiledLinear = SimdTiledMatMulProgram<OperandLayout::ContiguousK,
                                                      WeightStorage::Float,
                                                      AFold::None,
                                                      RowMaxima::PerColumnTile>;
-} // namespace WSP
 
-#endif
-
-namespace WSP
-{
 // Which program each of the tree's product roles dispatches through. Both
 // compute the same TiledMatMulShape, so a role is switched by its alias and
 // nothing at the call site moves.
@@ -480,7 +467,7 @@ namespace WSP
 // is what every other backend gets, and what a role goes back to if it ever
 // measures no better on it. Every role here measured better; what each was
 // worth is in plan.md's fourth performance round.
-#if defined(__APPLE__) && defined(WHISPER_EACP_HAS_SIMD_MATRIX)
+#if defined(__APPLE__)
 using LinearProduct = SimdTiledLinear;
 using HalfWeightLinearProduct = HalfWeightSimdTiledLinear;
 using AttentionScoresProduct = MaximaSimdTiledLinear;

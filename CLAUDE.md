@@ -128,16 +128,11 @@ suppressed inside quotes — `-DCPM_eacp_SOURCE="~/Code/eacp"` will silently
 configure against a non-existent path and fail later with an error about a
 missing `eacp-gpu` target.
 
-**The SIMD-group matrix is on eacp's develop, and nothing here requires it.**
+**The SIMD-group matrix is on eacp's develop, and this tree requires it.**
 `Kernels/SimdTiledMatMul.h` is written against eacp's `SimdMatrix`, which
-landed on develop as `07ee972b`, so the plain fetch has it.
-`CMake/Findeacp.cmake` still asks the eacp it was handed whether
-`ShaderBuilder.h` declares `simdMatrix` and defines
-`WHISPER_EACP_HAS_SIMD_MATRIX` from the answer; against an older eacp the
-header declares no program, the role aliases at its foot all name the
-register-tiled `TiledMatMul`, and the tree builds, tests and transcribes as it
-did before the fourth performance round, with fifteen fewer tests and a
-configure that says so.
+landed on develop as `07ee972b`, so the plain fetch has it. A build directory
+configured against an older eacp fails to compile that header; reconfigure so
+CPM fetches the current develop.
 
 ## Architecture
 
