@@ -543,6 +543,60 @@ auto tHalfTensorStaysPacked = test("Model/SafeTensors/halfTensorStaysPacked") = 
     check(deviceBytesEqual(weight.buffer, bits));
 };
 
+// The other upload of the same tensor, for a program that has no packed read:
+// makeFloatBuffer widens F16 on the way to the device, so a norm, a bias or a
+// convolution out of an fp16 repo binds floats instead of being refused. Bit
+// for bit against readFloats, since the two widen the same way.
+auto tHalfTensorWidensOnTheFloatPath =
+    test("Model/SafeTensors/halfTensorWidensOnTheFloatPath") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(
+        assemble(R"({"w":{"dtype":"F16","shape":[4],"data_offsets":[0,8]}})",
+                 toBytes<std::uint16_t>({0x3C00, 0xC000, 0x0000, 0x3555})));
+
+    const auto weight = file.makeFloatBuffer("w");
+
+    check(weight.storage == TensorType::F32);
+    check(!weight.isPackedHalf());
+    check(weight.buffer.size() == 16);
+
+    auto readBack = Vector<float> {};
+    readBack.resize(4);
+    weight.buffer.read(readBack.data(), weight.buffer.size());
+
+    const auto widened = file.readFloats("w");
+
+    for (auto index = 0; index < widened.size(); ++index)
+        check(readBack[index] == widened[index]);
+
+    check(readBack[0] == 1.0f);
+    check(readBack[1] == -2.0f);
+    check(readBack[2] == 0.0f);
+
+    // 0x3555 is fp16's nearest to a third, which no float literal spells: the
+    // point of comparing against readFloats rather than against numbers.
+    check(readBack[3] != 1.0f / 3.0f);
+};
+
+// An F32 tensor takes the same path it takes through makeBuffer — straight
+// from the blob, no widened copy of itself.
+auto tFloatTensorIsTheBlobOnTheFloatPath =
+    test("Model/SafeTensors/floatTensorIsTheBlobOnTheFloatPath") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(singleTensorFile());
+    const auto weight = file.makeFloatBuffer("weight");
+
+    check(weight.storage == TensorType::F32);
+    check(weight.buffer.size() == 24);
+    check(deviceBytesEqual(weight.buffer, file.rawBytes("weight")));
+};
+
 // readHalf(i) fetches word i / 2 whether or not the last word is whole, so an
 // odd count of halves is padded up rather than read one element past the end.
 auto tOddHalfCountIsPadded = test("Model/SafeTensors/oddHalfCountIsPadded") = []

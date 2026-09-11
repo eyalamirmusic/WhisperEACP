@@ -155,14 +155,52 @@ inline Vector<float> shiftedValues(int count, unsigned seed, float range)
     return values;
 }
 
-// Which tensors go in packed, for the two runs of the same comparison: none of
-// them, or every projection weight — the only ones a program in Kernels/ can
-// read as halves.
+// Which tensors go in packed, for the three runs of the same comparison: none
+// of them; every projection weight, which is the set a program in Kernels/ can
+// read as halves; or the whole file, which is what HuggingFace ships for
+// whisper-base and everything above it and what the loader has to widen for
+// the norms, the biases, the convolutions and the two embedding tables.
 enum class ProjectionStorage
 {
     Float,
-    PackedHalf
+    PackedHalf,
+    EveryTensorHalf
 };
+
+// True where even the tensors no kernel can read packed are stored as halves,
+// so the loader is the one that has to widen them.
+inline bool storesEveryTensorAsHalves(ProjectionStorage storage)
+{
+    return storage == ProjectionStorage::EveryTensorHalf;
+}
+
+inline bool storesProjectionsAsHalves(ProjectionStorage storage)
+{
+    return storage != ProjectionStorage::Float;
+}
+
+// A tensor the loader widened rather than refused: the float buffer a subscript
+// reads, holding exactly what readFloats makes of the same tensor. Bit for bit
+// rather than close, since fp16 to fp32 loses nothing and the two sides widen
+// the same way.
+inline bool holdsWidenedFloats(const TensorBuffer& tensor,
+                               const SafeTensors& file,
+                               const std::string& name)
+{
+    const auto expected = file.readFloats(name);
+
+    if (!tensor.buffer.isValid() || tensor.isPackedHalf()
+        || tensor.buffer.size() != (int) sizeof(float) * expected.size())
+        return false;
+
+    const auto values = readBack(tensor.buffer, expected.size());
+
+    for (auto index = 0; index < expected.size(); ++index)
+        if (values[index] != expected[index])
+            return false;
+
+    return true;
+}
 
 inline SafeTensors syntheticEncoderFile(const EncoderShape& shape,
                                         ProjectionStorage projectionStorage)
@@ -173,13 +211,26 @@ inline SafeTensors syntheticEncoderFile(const EncoderShape& shape,
     auto next = [&](int count, float range)
     { return spreadValues(count, seed++, range); };
 
+    // Everything that is not a projection weight, so this is the one that says
+    // whether the file is the mixed one a packed-projection run reads or the
+    // all-fp16 one the widening path reads.
+    auto addTensor = [&](const std::string& name,
+                         const std::vector<int>& extents,
+                         const Vector<float>& values)
+    {
+        if (storesEveryTensorAsHalves(projectionStorage))
+            builder.addHalves(name, extents, values);
+        else
+            builder.addFloats(name, extents, values);
+    };
+
     auto addProjection =
         [&](const std::string& name, int outputWidth, int innerCount)
     {
         const auto values = next(outputWidth * innerCount, 0.5f);
         const auto extents = std::vector<int> {outputWidth, innerCount};
 
-        if (projectionStorage == ProjectionStorage::PackedHalf)
+        if (storesProjectionsAsHalves(projectionStorage))
             builder.addHalves(name, extents, values);
         else
             builder.addFloats(name, extents, values);
@@ -188,73 +239,72 @@ inline SafeTensors syntheticEncoderFile(const EncoderShape& shape,
     const auto width = shape.width;
     const auto kernelSize = EncoderShape::convolutionKernelSize;
 
-    builder.addFloats(encoderTensor("conv1.weight"),
-                      {width, shape.melBins, kernelSize},
-                      next(width * shape.melBins * kernelSize, 0.4f));
-    builder.addFloats(encoderTensor("conv1.bias"), {width}, next(width, 0.2f));
+    addTensor(encoderTensor("conv1.weight"),
+              {width, shape.melBins, kernelSize},
+              next(width * shape.melBins * kernelSize, 0.4f));
+    addTensor(encoderTensor("conv1.bias"), {width}, next(width, 0.2f));
 
-    builder.addFloats(encoderTensor("conv2.weight"),
-                      {width, width, kernelSize},
-                      next(width * width * kernelSize, 0.4f));
-    builder.addFloats(encoderTensor("conv2.bias"), {width}, next(width, 0.2f));
+    addTensor(encoderTensor("conv2.weight"),
+              {width, width, kernelSize},
+              next(width * width * kernelSize, 0.4f));
+    addTensor(encoderTensor("conv2.bias"), {width}, next(width, 0.2f));
 
-    builder.addFloats(encoderTensor("embed_positions.weight"),
-                      {shape.positions(), width},
-                      next(shape.positions() * width, 0.3f));
+    addTensor(encoderTensor("embed_positions.weight"),
+              {shape.positions(), width},
+              next(shape.positions() * width, 0.3f));
 
     for (auto layer = 0; layer < shape.layers; ++layer)
     {
-        builder.addFloats(encoderLayerTensor(layer, "self_attn_layer_norm.weight"),
-                          {width},
-                          shiftedValues(width, seed++, 0.2f));
-        builder.addFloats(encoderLayerTensor(layer, "self_attn_layer_norm.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "self_attn_layer_norm.weight"),
+                  {width},
+                  shiftedValues(width, seed++, 0.2f));
+        addTensor(encoderLayerTensor(layer, "self_attn_layer_norm.bias"),
+                  {width},
+                  next(width, 0.2f));
 
         addProjection(
             encoderLayerTensor(layer, "self_attn.q_proj.weight"), width, width);
-        builder.addFloats(encoderLayerTensor(layer, "self_attn.q_proj.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "self_attn.q_proj.bias"),
+                  {width},
+                  next(width, 0.2f));
 
         addProjection(
             encoderLayerTensor(layer, "self_attn.k_proj.weight"), width, width);
 
         addProjection(
             encoderLayerTensor(layer, "self_attn.v_proj.weight"), width, width);
-        builder.addFloats(encoderLayerTensor(layer, "self_attn.v_proj.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "self_attn.v_proj.bias"),
+                  {width},
+                  next(width, 0.2f));
 
         addProjection(
             encoderLayerTensor(layer, "self_attn.out_proj.weight"), width, width);
-        builder.addFloats(encoderLayerTensor(layer, "self_attn.out_proj.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "self_attn.out_proj.bias"),
+                  {width},
+                  next(width, 0.2f));
 
-        builder.addFloats(encoderLayerTensor(layer, "final_layer_norm.weight"),
-                          {width},
-                          shiftedValues(width, seed++, 0.2f));
-        builder.addFloats(encoderLayerTensor(layer, "final_layer_norm.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "final_layer_norm.weight"),
+                  {width},
+                  shiftedValues(width, seed++, 0.2f));
+        addTensor(encoderLayerTensor(layer, "final_layer_norm.bias"),
+                  {width},
+                  next(width, 0.2f));
 
         addProjection(
             encoderLayerTensor(layer, "fc1.weight"), shape.feedForwardWidth, width);
-        builder.addFloats(encoderLayerTensor(layer, "fc1.bias"),
-                          {shape.feedForwardWidth},
-                          next(shape.feedForwardWidth, 0.2f));
+        addTensor(encoderLayerTensor(layer, "fc1.bias"),
+                  {shape.feedForwardWidth},
+                  next(shape.feedForwardWidth, 0.2f));
 
         addProjection(
             encoderLayerTensor(layer, "fc2.weight"), width, shape.feedForwardWidth);
-        builder.addFloats(
-            encoderLayerTensor(layer, "fc2.bias"), {width}, next(width, 0.2f));
+        addTensor(encoderLayerTensor(layer, "fc2.bias"), {width}, next(width, 0.2f));
     }
 
-    builder.addFloats(encoderTensor("layer_norm.weight"),
-                      {width},
-                      shiftedValues(width, seed++, 0.2f));
-    builder.addFloats(encoderTensor("layer_norm.bias"), {width}, next(width, 0.2f));
+    addTensor(encoderTensor("layer_norm.weight"),
+              {width},
+              shiftedValues(width, seed++, 0.2f));
+    addTensor(encoderTensor("layer_norm.bias"), {width}, next(width, 0.2f));
 
     return builder.parse();
 }

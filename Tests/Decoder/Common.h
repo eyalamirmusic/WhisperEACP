@@ -58,10 +58,11 @@ inline DecoderShape smallDecoderShape()
 // mapping is under test alongside the arithmetic.
 // ---------------------------------------------------------------------------
 
-// embed_tokens stays F32 in both variants, because the loader rejects a packed
-// one outright: it is the gather's table as well as the logits projection's
-// weight, and the gather subscripts floats. Only the projections change storage
-// here, which is exactly the set Linear can read either way.
+// Under PackedHalf only the projections change storage, which is exactly the
+// set Linear can read either way; embed_tokens stays F32 there because that is
+// the mixed file the packed-projection runs are about. EveryTensorHalf is the
+// fp16 repo: the gather's table goes in packed too, and the loader is what
+// widens it.
 inline SafeTensors syntheticDecoderFile(const DecoderShape& shape,
                                         ProjectionStorage projectionStorage)
 {
@@ -71,13 +72,23 @@ inline SafeTensors syntheticDecoderFile(const DecoderShape& shape,
     auto next = [&](int count, float range)
     { return spreadValues(count, seed++, range); };
 
+    auto addTensor = [&](const std::string& name,
+                         const std::vector<int>& extents,
+                         const Vector<float>& values)
+    {
+        if (storesEveryTensorAsHalves(projectionStorage))
+            builder.addHalves(name, extents, values);
+        else
+            builder.addFloats(name, extents, values);
+    };
+
     auto addProjection =
         [&](const std::string& name, int outputWidth, int innerCount)
     {
         const auto values = next(outputWidth * innerCount, 0.5f);
         const auto extents = std::vector<int> {outputWidth, innerCount};
 
-        if (projectionStorage == ProjectionStorage::PackedHalf)
+        if (storesProjectionsAsHalves(projectionStorage))
             builder.addHalves(name, extents, values);
         else
             builder.addFloats(name, extents, values);
@@ -85,13 +96,13 @@ inline SafeTensors syntheticDecoderFile(const DecoderShape& shape,
 
     const auto width = shape.width;
 
-    builder.addFloats(decoderTensor("embed_tokens.weight"),
-                      {shape.vocabularySize, width},
-                      next(shape.vocabularySize * width, 0.3f));
+    addTensor(decoderTensor("embed_tokens.weight"),
+              {shape.vocabularySize, width},
+              next(shape.vocabularySize * width, 0.3f));
 
-    builder.addFloats(decoderTensor("embed_positions.weight"),
-                      {shape.maxPositions, width},
-                      next(shape.maxPositions * width, 0.3f));
+    addTensor(decoderTensor("embed_positions.weight"),
+              {shape.maxPositions, width},
+              next(shape.maxPositions * width, 0.3f));
 
     for (auto layer = 0; layer < shape.layers; ++layer)
     {
@@ -99,63 +110,60 @@ inline SafeTensors syntheticDecoderFile(const DecoderShape& shape,
         {
             const auto prefix = std::string {attention} + ".";
 
-            builder.addFloats(
-                decoderLayerTensor(layer, std::string {norm} + ".weight"),
-                {width},
-                shiftedValues(width, seed++, 0.2f));
-            builder.addFloats(
-                decoderLayerTensor(layer, std::string {norm} + ".bias"),
-                {width},
-                next(width, 0.2f));
+            addTensor(decoderLayerTensor(layer, std::string {norm} + ".weight"),
+                      {width},
+                      shiftedValues(width, seed++, 0.2f));
+            addTensor(decoderLayerTensor(layer, std::string {norm} + ".bias"),
+                      {width},
+                      next(width, 0.2f));
 
             addProjection(
                 decoderLayerTensor(layer, prefix + "q_proj.weight"), width, width);
-            builder.addFloats(decoderLayerTensor(layer, prefix + "q_proj.bias"),
-                              {width},
-                              next(width, 0.2f));
+            addTensor(decoderLayerTensor(layer, prefix + "q_proj.bias"),
+                      {width},
+                      next(width, 0.2f));
 
             addProjection(
                 decoderLayerTensor(layer, prefix + "k_proj.weight"), width, width);
 
             addProjection(
                 decoderLayerTensor(layer, prefix + "v_proj.weight"), width, width);
-            builder.addFloats(decoderLayerTensor(layer, prefix + "v_proj.bias"),
-                              {width},
-                              next(width, 0.2f));
+            addTensor(decoderLayerTensor(layer, prefix + "v_proj.bias"),
+                      {width},
+                      next(width, 0.2f));
 
             addProjection(
                 decoderLayerTensor(layer, prefix + "out_proj.weight"), width, width);
-            builder.addFloats(decoderLayerTensor(layer, prefix + "out_proj.bias"),
-                              {width},
-                              next(width, 0.2f));
+            addTensor(decoderLayerTensor(layer, prefix + "out_proj.bias"),
+                      {width},
+                      next(width, 0.2f));
         };
 
         addAttention("self_attn", "self_attn_layer_norm");
         addAttention("encoder_attn", "encoder_attn_layer_norm");
 
-        builder.addFloats(decoderLayerTensor(layer, "final_layer_norm.weight"),
-                          {width},
-                          shiftedValues(width, seed++, 0.2f));
-        builder.addFloats(decoderLayerTensor(layer, "final_layer_norm.bias"),
-                          {width},
-                          next(width, 0.2f));
+        addTensor(decoderLayerTensor(layer, "final_layer_norm.weight"),
+                  {width},
+                  shiftedValues(width, seed++, 0.2f));
+        addTensor(decoderLayerTensor(layer, "final_layer_norm.bias"),
+                  {width},
+                  next(width, 0.2f));
 
         addProjection(
             decoderLayerTensor(layer, "fc1.weight"), shape.feedForwardWidth, width);
-        builder.addFloats(decoderLayerTensor(layer, "fc1.bias"),
-                          {shape.feedForwardWidth},
-                          next(shape.feedForwardWidth, 0.2f));
+        addTensor(decoderLayerTensor(layer, "fc1.bias"),
+                  {shape.feedForwardWidth},
+                  next(shape.feedForwardWidth, 0.2f));
 
         addProjection(
             decoderLayerTensor(layer, "fc2.weight"), width, shape.feedForwardWidth);
-        builder.addFloats(
-            decoderLayerTensor(layer, "fc2.bias"), {width}, next(width, 0.2f));
+        addTensor(decoderLayerTensor(layer, "fc2.bias"), {width}, next(width, 0.2f));
     }
 
-    builder.addFloats(decoderTensor("layer_norm.weight"),
-                      {width},
-                      shiftedValues(width, seed++, 0.2f));
-    builder.addFloats(decoderTensor("layer_norm.bias"), {width}, next(width, 0.2f));
+    addTensor(decoderTensor("layer_norm.weight"),
+              {width},
+              shiftedValues(width, seed++, 0.2f));
+    addTensor(decoderTensor("layer_norm.bias"), {width}, next(width, 0.2f));
 
     return builder.parse();
 }
@@ -524,10 +532,9 @@ class DecoderRun
 public:
     DecoderRun(const DecoderShape& shapeToUse,
                const SafeTensors& file,
-               DecoderWeights::LogitsWeight logitsWeight =
-                   DecoderWeights::LogitsWeight::Tied)
+               WeightPacking packing = WeightPacking::Float)
         : decoderShape(shapeToUse)
-        , weights(file, shapeToUse, logitsWeight)
+        , weights(file, shapeToUse, packing)
         , decoder(shapeToUse)
     {
         decoder.prepare(eacp::GPU::Device::shared());

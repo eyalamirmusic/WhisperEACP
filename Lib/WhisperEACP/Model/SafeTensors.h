@@ -108,11 +108,24 @@ public:
     Vector<float> readFloats(std::string_view name) const;
     void readFloats(std::string_view name, Span<float> destination) const;
 
-    // F32 and F16 go to the device as they lie in the blob — the first is the
-    // float buffer a kernel subscripts, the second the packed one readHalf
-    // reads — so neither costs a widened copy. BF16 and F64 have no shader
-    // read of their own and are widened here.
+    // The two uploads, and the caller picks by what the program bound to the
+    // buffer can read rather than by what the file happens to hold.
+    //
+    // makeBuffer keeps the file's own layout wherever a kernel has a read for
+    // it: F32 as the floats a subscript reads and F16 as the packed halves
+    // readHalf reads, both straight from the blob. BF16 and F64 have no shader
+    // read of their own and are widened. So the storage that comes back is the
+    // file's, and TensorBuffer::isPackedHalf is what a caller dispatches on —
+    // which is what the projections do, since Linear exists in both forms.
+    //
+    // makeFloatBuffer always answers the float buffer a subscript reads: F32
+    // straight from the blob, and every other type — F16 included — widened
+    // here, once, rather than in every kernel that could not have done it. So
+    // a program with no packed read binds this one and an fp16 repo costs it a
+    // widened copy rather than a refusal. Widening is exact, so the values are
+    // the file's to the bit either way.
     TensorBuffer makeBuffer(std::string_view name) const;
+    TensorBuffer makeFloatBuffer(std::string_view name) const;
 
     // The same tensor as packed halves — but only when that is the same
     // tensor, which is to say when every value narrows and widens back to the

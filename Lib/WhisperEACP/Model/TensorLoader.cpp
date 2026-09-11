@@ -1,5 +1,7 @@
 #include "TensorLoader.h"
 
+#include <utility>
+
 namespace WSP
 {
 namespace
@@ -58,33 +60,24 @@ void TensorLoader::checkPositionalWidth(const TensorInfo& tensor, int width) con
                           + "]"};
 }
 
-void TensorLoader::rejectPackedHalf(const TensorBuffer& loaded,
-                                    const std::string& name,
-                                    std::string_view reader) const
-{
-    if (loaded.isPackedHalf())
-        throw ModelError {"tensor '" + name + "' is fp16, and this "
-                          + std::string {component} + " binds it to "
-                          + std::string {reader}
-                          + ", which has no packed-half read: ship the tensor "
-                            "as F32"};
-}
-
 TensorBuffer TensorLoader::loadFloatTensor(const std::string& name,
-                                           TensorShape expected,
-                                           std::string_view reader) const
+                                           TensorShape expected) const
 {
     checkShape(require(name), expected);
-    auto loaded = file.makeBuffer(name);
-    rejectPackedHalf(loaded, name, reader);
 
-    return loaded;
+    return file.makeFloatBuffer(name);
 }
 
 TensorBuffer TensorLoader::loadProjectionWeight(const std::string& name,
-                                                TensorShape expected) const
+                                                TensorShape expected,
+                                                WeightPacking packing) const
 {
     checkShape(require(name), expected);
+
+    if (packing == WeightPacking::ExactHalf)
+        if (auto packed = file.makeExactHalfBuffer(name))
+            return std::move(*packed);
+
     return file.makeBuffer(name);
 }
 } // namespace WSP

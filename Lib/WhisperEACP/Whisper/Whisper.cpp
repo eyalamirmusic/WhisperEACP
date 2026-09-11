@@ -238,9 +238,9 @@ void Whisper::setMaximumTokens(int count)
     maximumTokenCount = count;
 }
 
-void Whisper::setPacksLogitsWeight(bool shouldPack)
+void Whisper::setPacksWeights(bool shouldPack)
 {
-    packedLogitsWeight = shouldPack;
+    packedWeights = shouldPack;
 }
 
 void Whisper::setAudioContext(int positions)
@@ -284,12 +284,11 @@ void Whisper::prepare(Device& device)
     decoder->prepare(device);
     selection.prepare(device, 1, decoder->shape().logitElementCount());
 
-    encoderWeights.emplace(*weightsFile, encoder->shape());
-    decoderWeights.emplace(*weightsFile,
-                           decoder->shape(),
-                           packedLogitsWeight
-                               ? DecoderWeights::LogitsWeight::PackedHalfCopy
-                               : DecoderWeights::LogitsWeight::Tied);
+    const auto packing =
+        packedWeights ? WeightPacking::ExactHalf : WeightPacking::Float;
+
+    encoderWeights.emplace(*weightsFile, encoder->shape(), packing);
+    decoderWeights.emplace(*weightsFile, decoder->shape(), packing);
 
     filterBank.emplace(preprocessor.makeMelFilterBuffer());
 

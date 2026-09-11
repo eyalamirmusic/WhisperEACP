@@ -164,3 +164,48 @@ auto tTinyEnReducedContextMatchesReference =
 
     check(worst <= 1e-4);
 };
+
+// What WeightPacking::ExactHalf actually did to the real weights: tiny.en's
+// tensors are fp16 values in an F32 container, so every one of the six
+// projections of every layer narrows exactly and none of them falls back to
+// the float upload. 28 MB of encoder weights read as 14.
+//
+// The fallback is the thing worth asserting against. It is silent by design —
+// a weight that would lose something keeps the float it shipped — so a bug
+// that stopped the packing from ever firing would leave every other assertion
+// in this suite passing and the bandwidth exactly where it was.
+auto tTinyEnEncoderPacksEveryProjection =
+    test("Encoder/TinyEn/exactHalfPacksEveryProjection") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, shortInputFrames);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto weights = EncoderWeights {file, shape, WeightPacking::ExactHalf};
+
+    for (const auto& layer: weights.layers)
+    {
+        check(layer.queryWeight.isPackedHalf());
+        check(layer.keyWeight.isPackedHalf());
+        check(layer.valueWeight.isPackedHalf());
+        check(layer.attentionOutputWeight.isPackedHalf());
+        check(layer.feedForwardWeight.isPackedHalf());
+        check(layer.feedForwardOutputWeight.isPackedHalf());
+
+        // The biases and the norms are subscripted inside Linear and
+        // LayerNorm, neither of which has a packed read, so the policy leaves
+        // them alone.
+        check(!layer.queryBias.isPackedHalf());
+        check(!layer.attentionNormWeight.isPackedHalf());
+    }
+
+    // The convolutions and the positional rows are float as well: the policy
+    // is over the projections, and those three go through the loader's float
+    // path whatever it is set to.
+    check(!weights.firstConvolutionWeight.isPackedHalf());
+    check(!weights.secondConvolutionWeight.isPackedHalf());
+    check(!weights.positionalEmbedding.isPackedHalf());
+};

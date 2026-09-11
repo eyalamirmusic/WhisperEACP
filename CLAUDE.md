@@ -244,12 +244,15 @@ two a buffer holds and the projections pick the matching program.
 **And F32 is the container, not the precision.** OpenAI's checkpoints are fp16
 and HuggingFace's conversion only widens them, so every one of those 167 tensors
 round-trips through fp16 unchanged — asserted over all 37,760,256 values in
-`Tests/Model`. That is why `DecoderWeights::LogitsWeight` defaults to keeping an
-fp16 copy of `embed_tokens` for the logits projection: it halves the largest
-read a decode step makes and the logits come out bit identical.
+`Tests/Model`. That is why `Whisper::setPacksWeights` is on by default: under
+`WeightPacking::ExactHalf` every projection weight of the encoder and the
+decoder goes to the device narrowed, and the logits projection reads an fp16
+copy of `embed_tokens` beside the float table the gather reads. It halves the
+weight bytes a step reads, and the transcript and the logits come out bit
+identical.
 `SafeTensors::makeExactHalfBuffer` is what enforces the "bit identical" — it
 returns nothing when a file would lose something, so a repo genuinely saved in
-fp32 keeps its float weight.
+fp32 keeps the float weights it shipped.
 
 ### Fetching the model
 

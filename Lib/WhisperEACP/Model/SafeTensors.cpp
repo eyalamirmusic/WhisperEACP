@@ -234,6 +234,21 @@ eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
     return uploadBytes(padded);
 }
 
+TensorBuffer uploadWidenedFloats(const Vector<float>& values,
+                                 const std::string& name)
+{
+    const auto byteCount = static_cast<std::int64_t>(values.size())
+                           * static_cast<std::int64_t>(sizeof(float));
+
+    if (byteCount > std::numeric_limits<int>::max())
+        throw ModelError {"tensor '" + name + "' is too large for a GPU buffer"};
+
+    return {eacp::GPU::Device::shared().makeBuffer(values.data(),
+                                                   static_cast<int>(byteCount),
+                                                   eacp::GPU::BufferUsage::Storage),
+            TensorType::F32};
+}
+
 // float32 to IEEE binary16, round to nearest even, overflowing to infinity —
 // the same rule Metal's own narrowing follows, so a value packed here is the
 // value a shader would have packed. Written out rather than taken from _Float16
@@ -516,18 +531,21 @@ TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
 
     // BF16 and F64 have no shader read of their own, so the conversion has to
     // happen somewhere and doing it once here beats doing it in every kernel.
-    const auto values = readFloats(name);
-    const auto byteCount = static_cast<std::int64_t>(values.size())
-                           * static_cast<std::int64_t>(sizeof(float));
+    return uploadWidenedFloats(readFloats(name), tensor.name);
+}
 
-    if (byteCount > std::numeric_limits<int>::max())
-        throw ModelError {"tensor '" + tensor.name
-                          + "' is too large for a GPU buffer"};
+TensorBuffer SafeTensors::makeFloatBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
 
-    return {eacp::GPU::Device::shared().makeBuffer(values.data(),
-                                                   static_cast<int>(byteCount),
-                                                   eacp::GPU::BufferUsage::Storage),
-            TensorType::F32};
+    if (tensor.type == TensorType::F32)
+        return {uploadBytes(rawBytes(tensor)), tensor.type};
+
+    // F16 joins BF16 and F64 on the widening path here, rather than going up
+    // packed as makeBuffer would have it: the caller binds this to a program
+    // that subscripts floats, and a packed buffer there would be read at half
+    // the stride it was written at, silently, on both backends.
+    return uploadWidenedFloats(readFloats(name), tensor.name);
 }
 
 std::optional<TensorBuffer>

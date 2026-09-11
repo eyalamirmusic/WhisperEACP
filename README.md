@@ -202,8 +202,13 @@ files: `model.safetensors`, `config.json`, `tokenizer.json` and
 `preprocessor_config.json`, the last of which carries the mel filterbank
 already built. `tiny.en` ships F32, but every value in it round-trips through
 fp16 unchanged — OpenAI's checkpoints are fp16 and the conversion only widens
-them — so the logits projection keeps an fp16 copy of the vocabulary and comes
-out bit identical for half the bandwidth.
+them — so `Whisper::setPacksWeights`, on by default, sends every projection
+weight of the encoder and the decoder to the device narrowed, the logits
+projection among them, for half the bandwidth and arithmetic that is bit
+identical to what the float weights produce. A repo that ships fp16 in the
+first place loads just as well: the tensors no program reads packed — the
+norms, the biases, the convolutions and the embedding tables — are widened on
+upload.
 
 `Samples/jfk.wav` is 11 seconds of President Kennedy's inaugural address,
 20 January 1961, at 16 kHz mono PCM16 — byte-identical to whisper.cpp v1.9.3's

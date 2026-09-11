@@ -2,6 +2,7 @@
 
 #include <WhisperEACP/Encoder/EncoderShape.h>
 #include <WhisperEACP/Model/SafeTensors.h>
+#include <WhisperEACP/Model/TensorLoader.h>
 
 namespace WSP
 {
@@ -18,7 +19,8 @@ struct EncoderLayerWeights
 {
     EncoderLayerWeights(const SafeTensors& file,
                         const EncoderShape& shape,
-                        int index);
+                        int index,
+                        WeightPacking packing);
 
     TensorBuffer attentionNormWeight;
     TensorBuffer attentionNormBias;
@@ -46,14 +48,24 @@ struct EncoderLayerWeights
 // **fp16 storage.** A projection weight may stay packed: Linear has a
 // half-reading variant and the Encoder picks it by TensorBuffer::storage. Every
 // other tensor here is bound to a program that has no half read — Conv1d,
-// LayerNorm and Add subscript a float buffer — so a packed one there would be
-// wrong by a factor of two in every index while staying silent, and is rejected
-// with a ModelError naming the tensor and saying which kernel reads it. That is
-// the whole rule: half where a program can read half, an error everywhere else,
-// and never a silent bind.
+// LayerNorm and Add subscript a float buffer — so an fp16 one is widened on the
+// way to the device, which is what lets a repo shipped in fp16 load at all.
+// That is the whole rule: half where a program can read half, floats everywhere
+// else whatever the file holds, and never a packed buffer under a float
+// subscript, which would be wrong in every index while staying silent.
+//
+// Which of the two a *projection* is uploaded as is `packing`, and it is a
+// policy rather than the file's answer: under WeightPacking::ExactHalf the six
+// projections of every layer are narrowed to fp16 wherever narrowing is
+// bit-exact — 28 MB of tiny.en's weights read at half the bytes for the same
+// values — and uploaded as the file holds them wherever it is not. Nothing
+// else here moves: the convolutions, the norms, the biases and the positional
+// embedding are float whatever is asked for.
 struct EncoderWeights
 {
-    EncoderWeights(const SafeTensors& file, const EncoderShape& shapeToUse);
+    EncoderWeights(const SafeTensors& file,
+                   const EncoderShape& shapeToUse,
+                   WeightPacking packingToUse = WeightPacking::Float);
 
     EncoderShape shape;
 

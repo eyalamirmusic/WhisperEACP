@@ -29,8 +29,9 @@
 // Metal, Accelerate and BLAS on, on a Mac; the root CMakeLists makes that
 // choice whenever this target is in the tree — and runs twice, once on its GPU
 // backend and once without it. Both sides load the tiny.en weights: ours from
-// the HuggingFace safetensors the build copied beside this binary, F32; theirs
-// from the GGML conversion of the same, F16.
+// the HuggingFace safetensors the build copied beside this binary, F32 on disk
+// and its projections packed back to the fp16 values that container holds;
+// theirs from the GGML conversion of the same, F16.
 //
 // `--live` is the other thing this measures, and it has no second side: the
 // recording streamed through `LiveTranscriber` at the pace a microphone
@@ -154,9 +155,20 @@ public:
         return whisper.textForTokens(tokens);
     }
 
+    bool packsWeights() const { return whisper.packsWeights(); }
+
 private:
     WSP::Whisper whisper;
 };
+
+// What the storage line says after "F32": the file on disk is F32 either way,
+// and this is whether the projections reached the device narrowed to the fp16
+// values that container holds. Read off the runtime that ran rather than
+// assumed.
+const char* packedProjections(bool packed)
+{
+    return packed ? ", projections packed fp16" : "";
+}
 
 struct ContextDeleter
 {
@@ -397,6 +409,18 @@ std::string cell(double value, const char* unit, int decimals)
     return text;
 }
 
+// A change worth keeping is tens of microseconds on a step and a few hundred
+// on an encode, so the times print at a resolution that can show one.
+std::string milliseconds(double seconds)
+{
+    return cell(1000.0 * seconds, "ms", 2);
+}
+
+std::string microseconds(double seconds)
+{
+    return cell(1e6 * seconds, "us", 0);
+}
+
 void printRow(const std::string& label, const std::vector<std::string>& cells)
 {
     std::printf("  %-*s", labelWidth, label.c_str());
@@ -428,11 +452,11 @@ void printTable(const std::vector<Summary>& summaries)
 
     printRow("transcribe, median",
              summaries,
-             [](const Summary& s) { return cell(s.wallMedian, "s", 3); });
+             [](const Summary& s) { return milliseconds(s.wallMedian); });
 
     printRow("transcribe, best",
              summaries,
-             [](const Summary& s) { return cell(s.wallBest, "s", 3); });
+             [](const Summary& s) { return milliseconds(s.wallBest); });
 
     printRow("x real time, 30 s window",
              summaries,
@@ -441,17 +465,16 @@ void printTable(const std::vector<Summary>& summaries)
 
     printRow("encode, median",
              summaries,
-             [](const Summary& s) { return cell(s.encodeMedian, "s", 3); });
+             [](const Summary& s) { return milliseconds(s.encodeMedian); });
 
     printRow("decode, median",
              summaries,
-             [](const Summary& s) { return cell(s.decodeMedian, "s", 3); });
+             [](const Summary& s) { return milliseconds(s.decodeMedian); });
 
-    printRow(
-        "decode per step, median",
-        summaries,
-        [](const Summary& s)
-        { return cell(1000.0 * s.decodeMedian / std::max(1, s.steps), "ms", 1); });
+    printRow("decode per step, median",
+             summaries,
+             [](const Summary& s)
+             { return microseconds(s.decodeMedian / std::max(1, s.steps)); });
 
     printRow("steps",
              summaries,
@@ -793,8 +816,9 @@ void runLive(const Request& request)
                 request.wavFile.c_str(),
                 (double) recording.size() / WSP::sampleRate,
                 request.gapSeconds);
-    std::printf("  model tiny.en: %s, F32\n",
-                WSP::Whisper::bundledModelDirectory().string().c_str());
+    std::printf("  model tiny.en: %s, F32%s\n",
+                WSP::Whisper::bundledModelDirectory().string().c_str(),
+                packedProjections(whisper.packsWeights()));
     std::printf("  stream %.0f s at %d ms ticks, on %s\n",
                 request.liveSeconds,
                 liveTickMilliseconds,
@@ -829,15 +853,20 @@ void run(const Request& request)
                   (int) std::lround(audioSeconds * WSP::sampleRate))
             : request.audioContext;
 
+    // Loaded before the header rather than with the other contestants, since
+    // what it packed its weights as is part of what the header says ran.
+    auto ours = std::make_unique<OurRuntime>(audioContext);
+
     std::printf("WhisperEACP benchmark\n");
     std::printf("  audio %s: %.1f s, zero-filled to the %d s window on both "
                 "sides\n",
                 request.wavFile.c_str(),
                 audioSeconds,
                 WSP::windowSeconds);
-    std::printf("  model tiny.en: %s for WhisperEACP, F32; %s for whisper.cpp, "
-                "F16\n",
+    std::printf("  model tiny.en: %s for WhisperEACP, F32%s; %s for "
+                "whisper.cpp, F16\n",
                 WSP::Whisper::bundledModelDirectory().string().c_str(),
+                packedProjections(ours->packsWeights()),
                 ggmlModel);
     std::printf("  runs  %d timed after %d warm-up, per contestant\n",
                 request.runs,
@@ -852,7 +881,7 @@ void run(const Request& request)
     std::printf("\n");
 
     auto contestants = std::vector<std::unique_ptr<Contestant>> {};
-    contestants.push_back(std::make_unique<OurRuntime>(audioContext));
+    contestants.push_back(std::move(ours));
 
     if (const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
         contestants.push_back(

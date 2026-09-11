@@ -96,7 +96,7 @@ auto tEncoderShapeCounts = test("Encoder/shapeCounts") = []
 // went through a real safetensors header — so the loader's name and shape
 // mapping is under test alongside the arithmetic.
 //
-// The two runs below measure 3.3e-7 and 2.5e-7, so 5e-6 is a factor of fifteen
+// The three runs below measure 3.3e-7 or less, so 5e-6 is a factor of fifteen
 // of room: the GPU accumulates every sum in float32 where the reference
 // accumulates in double, and exp, rsqrt and the erf helper are each a float32
 // intrinsic whose last digits are the backend's rather than libm's. A
@@ -122,6 +122,23 @@ auto tEncoderMatchesScalarReferenceWithPackedWeights =
         return;
 
     checkAgainstReference(ProjectionStorage::PackedHalf, "packed halves", 5e-6);
+};
+
+// And again over a file that is fp16 end to end, which is how HuggingFace ships
+// whisper-base and everything above it. The projections are dispatched packed
+// as above; the norms, the biases, both convolutions and the positional table
+// are bound to programs that subscript floats, so the loader widens those
+// rather than refusing the file. Nothing is rounded twice — the reference reads
+// the same halves back through readFloats — so the tolerance is the float32
+// accumulation one for the third time.
+auto tEncoderMatchesScalarReferenceWithAnAllHalfFile =
+    test("Encoder/matchesScalarReferenceWithAnAllHalfFile") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    checkAgainstReference(
+        ProjectionStorage::EveryTensorHalf, "every tensor half", 5e-6);
 };
 
 auto tEncoderMissingTensorIsAnError = test("Encoder/missingTensorIsAnError") = []
@@ -176,28 +193,39 @@ auto tEncoderShortEmbeddingIsAnError = test("Encoder/shortEmbeddingIsAnError") =
     check(mentions(text, "carries 6 positions"));
 };
 
-// The half of the fp16 rule that is a refusal: Conv1d subscripts a float
-// buffer, so a packed weight bound to it would be read at half the stride it
-// was written at, silently, on both backends.
-auto tEncoderPackedConvolutionIsAnError =
-    test("Encoder/packedConvolutionIsAnError") = []
+// The half of the fp16 rule that is a widening: Conv1d subscripts a float
+// buffer, so a packed convolution weight is uploaded widened rather than bound
+// at half the stride it was written at — which is silent on both backends, and
+// is what the widening is there to make impossible.
+auto tEncoderPackedConvolutionIsWidened =
+    test("Encoder/packedConvolutionIsWidened") = []
 {
     if (!Device::shared().isValid())
         return;
 
     const auto shape = smallShape();
+    const auto file =
+        syntheticEncoderFile(shape, ProjectionStorage::EveryTensorHalf);
+    const auto weights = EncoderWeights {file, shape};
 
-    auto builder = TensorFileBuilder {};
-    builder.addHalves(encoderTensor("conv1.weight"),
-                      {shape.width, shape.melBins, 3},
-                      spreadValues(shape.width * shape.melBins * 3, 9u, 0.4f));
+    check(holdsWidenedFloats(
+        weights.firstConvolutionWeight, file, encoderTensor("conv1.weight")));
+    check(holdsWidenedFloats(
+        weights.firstConvolutionBias, file, encoderTensor("conv1.bias")));
+    check(holdsWidenedFloats(
+        weights.positionalEmbedding, file, encoderTensor("embed_positions.weight")));
+    check(holdsWidenedFloats(
+        weights.finalNormWeight, file, encoderTensor("layer_norm.weight")));
+    check(holdsWidenedFloats(weights.layers[0].attentionNormWeight,
+                             file,
+                             encoderLayerTensor(0, "self_attn_layer_norm.weight")));
+    check(holdsWidenedFloats(weights.layers[0].queryBias,
+                             file,
+                             encoderLayerTensor(0, "self_attn.q_proj.bias")));
 
-    const auto file = builder.parse();
-    const auto text = modelErrorText([&] { EncoderWeights {file, shape}; });
-
-    check(mentions(text, "model.encoder.conv1.weight"));
-    check(mentions(text, "fp16"));
-    check(mentions(text, "Conv1d"));
+    // And the projections in the same file stayed packed, since Linear reads
+    // them that way: the widening is per binding, not per file.
+    check(weights.layers[0].queryWeight.isPackedHalf());
 };
 
 // Weights loaded against one shape and dispatched against another: nothing

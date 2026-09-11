@@ -162,19 +162,26 @@ public:
     int maximumTokens() const { return maximumTokenCount; }
     void setMaximumTokens(int count);
 
-    // Whether the logits projection may read an fp16 copy of embed_tokens
-    // rather than the float matrix the gather reads. It is the one dispatch of
-    // a step that moves real bandwidth — 80 MB of vocabulary a step, 133 us of
-    // the 590 a step takes — and halving the bytes nearly halves it.
+    // Whether the weights go to the device as packed fp16 wherever that is
+    // bit-exact: every projection weight of the encoder and of the decoder,
+    // and the fp16 copy of embed_tokens the logits projection reads instead of
+    // the float matrix the gather reads. It is the bytes a run moves, which is
+    // what it is bound by — 33 MB of layer projections a decode step read as
+    // 16.5, and the vocabulary projection's 80 MB read as 40, which alone was
+    // 133 us of a 590 us step.
     //
-    // On by default, because it costs no accuracy: the copy is built only
+    // On by default, because it costs no accuracy: a weight is packed only
     // where narrowing is bit-exact, and a Whisper repo's weights are fp16
-    // values in an F32 container (DecoderWeights::LogitsWeight says why). A
-    // model that would lose something keeps the tied weight and this reads
-    // back true having changed nothing. Set it before prepare(), which is
-    // where the copy is built.
-    bool packsLogitsWeight() const { return packedLogitsWeight; }
-    void setPacksLogitsWeight(bool shouldPack);
+    // values in an F32 container — OpenAI's checkpoints are fp16 and
+    // HuggingFace's conversion only widens them, which Tests/Model asserts over
+    // every value of tiny.en. The same numbers are read through readHalf
+    // instead of a subscript and accumulated in float32 either way, so the
+    // logits come out bit for bit what the float weights produce. A model that
+    // would lose something keeps the weights it shipped, and this reads back
+    // true having changed nothing there. Set it before prepare(), which is
+    // where the weights are uploaded.
+    bool packsWeights() const { return packedWeights; }
+    void setPacksWeights(bool shouldPack);
 
     // whisper.cpp's audio_ctx: how many of the encoder's 1500 positions a run
     // computes. Zero, the default, is the whole 30 s window, and every
@@ -329,7 +336,7 @@ private:
     Vector<float> firstStepSuppression;
     Vector<float> laterStepSuppression;
     int maximumTokenCount = 0;
-    bool packedLogitsWeight = true;
+    bool packedWeights = true;
     int audioContextPositions = 0;
 
     MelSpectrogram frontEnd;
