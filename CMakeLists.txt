@@ -62,7 +62,6 @@ if (WHISPER_EACP_CI_BUILD)
 endif ()
 
 include(WhisperTargetSetup)
-include(WhisperResources)
 
 if (PROJECT_IS_TOP_LEVEL)
     whisper_default_setup()
@@ -77,13 +76,14 @@ find_package(eacp REQUIRED)
 find_package(MakeASound REQUIRED)
 
 # The recording the end-to-end tests and Transcribe run on: 352 kB of committed
-# audio, unlike the model, which is a download.
+# audio, unlike the model, which is a download — at runtime, through
+# Model/ModelFetch.h, and no longer by this configure.
 #
-# Its own directory rather than the model's, and the reason is what
-# WHISPER_MODEL_DIR is for: that variable points at a HuggingFace repo, whether
-# fetched by Model/ or a checkout somebody already has, and jfk.wav is not in
-# one. A sample dropped in beside the four files would be missing from every
-# such checkout and present only in ours.
+# Its own directory rather than the model's, and the reason is what the model
+# directory is: a HuggingFace repo, whether the one ModelFetch fetched or a
+# checkout somebody already has, and jfk.wav is in neither. A sample dropped in
+# beside the four files would be missing from every such checkout and present
+# only in ours.
 #
 # 11 seconds of President Kennedy's inaugural address, 20 January 1961, at
 # 16 kHz mono PCM16. Byte-identical to whisper.cpp v1.9.3's samples/jfk.wav,

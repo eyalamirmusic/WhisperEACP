@@ -19,21 +19,12 @@ target_sources(whisper-runtime PRIVATE
         LiveTranscriber.cpp
         Whisper.cpp)
 
-# Where the build's post-build copy put what this binary ships — see
-# whisper_copy_resources in CMake/WhisperResources.cmake. One answer per
-# platform: CoreFoundation's on Apple, which is the bundle's Resources for a
-# bundle and the executable's directory for anything else, and the executable's
-# directory on Windows.
-if (APPLE)
-    target_sources(whisper-runtime PRIVATE
-            ResourcesDirectory-Apple.cpp)
-
-    target_link_libraries(whisper-runtime PRIVATE "-framework CoreFoundation")
-elseif (WIN32)
-    target_sources(whisper-runtime PRIVATE
-            ResourcesDirectory-Windows.cpp)
-endif ()
-
+# No platform sources here any more. There used to be one per platform
+# answering "where did the build copy what this binary ships" — the bundle's
+# Resources on Apple, the executable's own directory elsewhere — for a model
+# copied beside every binary at link time. The model is fetched at runtime now
+# (Model/ModelFetch.h) into one directory eacp's FilePath resolves on every
+# platform, so the question no longer comes up.
 whisper_set_default_target_setting(whisper-runtime)
 whisper_enable_unity_build(whisper-runtime)
 whisper_add_ide_sources(whisper-runtime)

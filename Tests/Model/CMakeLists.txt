@@ -16,13 +16,9 @@ nano_add_executable(ModelTests
         SOURCES
         ConfigTests.cpp
         HalfWeightMatMulTests.cpp
+        ModelFetchTests.cpp
         ModelIOTests.cpp
         SafeTensorsTests.cpp
         TinyEnTests.cpp
-        ${WHISPER_GPU_TEST_MAIN}
+        ${WHISPER_MODEL_TEST_MAIN}
         TARGETS whisper-model whisper-audio whisper-kernels)
-
-# Set whether or not the fetch ran, so the tests against the real files compile
-# either way and skip on the file's absence rather than on an #ifdef.
-target_compile_definitions(ModelTests PRIVATE
-        WHISPER_EACP_MODEL_DIR="${WHISPER_EACP_MODEL_DIR}")

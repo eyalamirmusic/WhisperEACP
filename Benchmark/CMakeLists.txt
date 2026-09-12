@@ -19,10 +19,10 @@ set(CMAKE_FOLDER Benchmark)
 add_executable(Benchmark Main.cpp)
 target_link_libraries(Benchmark PRIVATE WhisperEACP whisper)
 
-# The HuggingFace model beside the binary, for Whisper::loadBundled(). The
-# GGML one and the sample are compile-time paths into the build and source
-# trees: this is a tool of the build, not something that ships.
-whisper_bundle_model(Benchmark)
+# No model is copied beside this binary: ours is fetched at startup
+# (Model/ModelFetch.h) into a directory every binary in this tree shares. The
+# GGML one and the sample are still compile-time paths into the build and source
+# trees — this is a tool of the build, not something that ships.
 
 target_compile_definitions(Benchmark PRIVATE
         WHISPER_EACP_GGML_MODEL="${WHISPER_EACP_GGML_MODEL}"

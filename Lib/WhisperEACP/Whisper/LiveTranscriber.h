@@ -2,6 +2,7 @@
 
 #include <WhisperEACP/Whisper/Whisper.h>
 
+#include <functional>
 #include <string>
 
 namespace WSP
@@ -74,6 +75,16 @@ struct LiveStats
 class LiveTranscriber
 {
 public:
+    // The open segment's samples in, its transcript out. Whatever transcribes
+    // is the caller's: the policy below is written against audio time and the
+    // text a run answers, and neither is a question about the model.
+    using TranscribeFunction = std::function<std::string(Span<const float>)>;
+
+    explicit LiveTranscriber(TranscribeFunction transcriber,
+                             LiveOptions options = {});
+
+    // The runtime, which is that function over Whisper::transcribe with
+    // encodeOnlyTheAudioThereIs applied to the segment before each run.
     explicit LiveTranscriber(Whisper& whisper, LiveOptions options = {});
 
     // Any block size. Buffers only; no GPU work happens here.
@@ -112,7 +123,7 @@ private:
 
     int maximumSegmentSamples() const;
 
-    Whisper& model;
+    TranscribeFunction transcribeSegment;
     LiveOptions liveOptions;
 
     // What push() took and no block has claimed yet, and the open segment the

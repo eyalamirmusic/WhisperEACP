@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <utility>
 
 namespace WSP
 {
@@ -39,6 +40,25 @@ double secondsForSamples(int samples)
 {
     return (double) samples / sampleRate;
 }
+
+// The runtime as a transcriber. The context is set per run rather than once,
+// because the segment grows: a run over 2 s of it encodes fewer positions than
+// the run over 6 s that closes it, and the count each one wants is the one its
+// own audio fills.
+LiveTranscriber::TranscribeFunction whisperTranscriber(Whisper& whisper,
+                                                       LiveOptions options)
+{
+    return [&whisper, options](Span<const float> segment)
+    {
+        if (options.encodeOnlyTheAudioThereIs)
+            whisper.setAudioContext(Whisper::audioContextForSamples(
+                segment.size(), options.audioContextMarginSeconds));
+
+        const auto tokens = whisper.transcribe(segment);
+
+        return whisper.textForTokens(tokens);
+    };
+}
 } // namespace
 
 float blockLevelDb(Span<const float> block)
@@ -64,9 +84,15 @@ bool isSpeechBlock(Span<const float> block, float thresholdDb)
     return blockLevelDb(block) > thresholdDb;
 }
 
-LiveTranscriber::LiveTranscriber(Whisper& whisper, LiveOptions optionsToUse)
-    : model(whisper)
+LiveTranscriber::LiveTranscriber(TranscribeFunction transcriber,
+                                 LiveOptions optionsToUse)
+    : transcribeSegment(std::move(transcriber))
     , liveOptions(optionsToUse)
+{
+}
+
+LiveTranscriber::LiveTranscriber(Whisper& whisper, LiveOptions optionsToUse)
+    : LiveTranscriber(whisperTranscriber(whisper, optionsToUse), optionsToUse)
 {
 }
 
@@ -220,18 +246,10 @@ bool LiveTranscriber::runIsDue() const
                   >= samplesForSeconds(liveOptions.minNewSpeechSeconds);
 }
 
-// The context is set per run rather than once, because the segment grows: a
-// run over 2 s of it encodes fewer positions than the run over 6 s that closes
-// it, and the count each one wants is the one its own audio fills.
 bool LiveTranscriber::runModel()
 {
-    if (liveOptions.encodeOnlyTheAudioThereIs)
-        model.setAudioContext(Whisper::audioContextForSamples(
-            segment.size(), liveOptions.audioContextMarginSeconds));
-
     const auto start = std::chrono::steady_clock::now();
-    const auto tokens = model.transcribe(segment);
-    const auto text = withoutSurroundingSpace(model.textForTokens(tokens));
+    const auto text = withoutSurroundingSpace(transcribeSegment(segment));
     const auto elapsed = std::chrono::steady_clock::now() - start;
 
     lastRun = std::chrono::duration<double>(elapsed).count();

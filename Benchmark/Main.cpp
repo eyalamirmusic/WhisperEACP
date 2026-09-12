@@ -29,14 +29,18 @@
 // Metal, Accelerate and BLAS on, on a Mac; the root CMakeLists makes that
 // choice whenever this target is in the tree — and runs twice, once on its GPU
 // backend and once without it. Both sides load the tiny.en weights: ours from
-// the HuggingFace safetensors the build copied beside this binary, F32; theirs
-// from the GGML conversion of the same, F16.
+// the HuggingFace safetensors, fetched at startup into this machine's own
+// resource directory, F32; theirs from the GGML conversion of the same, which
+// the configure fetched, F16.
 //
-// `--live` is the other thing this measures, and it has no second side: the
-// recording streamed through `LiveTranscriber` at the pace a microphone
-// delivers it, so the number that comes out is what the runtime costs a machine
-// that is listening rather than what one transcription costs. The live section
-// of README.md says why the two are not comparable.
+// `--live` is the other thing this measures: the recording streamed through
+// `LiveTranscriber` at the pace a microphone delivers it, so the number that
+// comes out is what a machine that is listening pays rather than what one
+// transcription costs. All three contestants take that stream, one after
+// another — `LiveTranscriber` drives a std::function, so whisper.cpp goes
+// through the same policy ours does, and the schedule is audio time and
+// therefore identical across the three. The live section of README.md says why
+// its numbers are not the comparison's.
 //
 // Inside eacp::Apps::run for the reason every GPU-touching thing here is — the
 // Metal backend is written against the run loop and autorelease pool that
@@ -50,7 +54,8 @@ constexpr auto buildType = WHISPER_EACP_BUILD_TYPE;
 
 constexpr auto usage =
     "usage: Benchmark [runs] [wav file] [--audio-ctx=positions|audio]\n"
-    "       Benchmark --live [seconds] [gap seconds] [wav file]\n"
+    "       Benchmark --live [seconds] [gap seconds] [wav file] [--step=seconds]\n"
+    "                 [--audio-ctx=audio]\n"
     "\n"
     "  runs        timed runs per contestant after one warm-up, 10 by default\n"
     "  wav file    16 kHz mono, at most 30 seconds; Samples/jfk.wav by default\n"
@@ -60,15 +65,15 @@ constexpr auto usage =
     "              default. \"audio\" sizes it to the recording the way the\n"
     "              live loop does, and in --live turns that option on\n"
     "\n"
-    "  --live      our runtime alone, through LiveTranscriber, streamed at real\n"
-    "              time: the recording on repeat with a gap of silence between\n"
-    "              passes. The numbers, in order, are how long to stream for -\n"
-    "              30 s by default - and the gap, 1.5 s. The recording may be\n"
-    "              any length here, since the segments are the policy's\n";
-
-constexpr auto missingBundledModel =
-    "this build copied no model beside the binary. Configure with\n"
-    "-DWHISPER_EACP_FETCH_MODEL=ON to get one.\n";
+    "  --live      every contestant through LiveTranscriber, one after another,\n"
+    "              streamed at real time: the recording on repeat with a gap of\n"
+    "              silence between passes. The numbers, in order, are how long\n"
+    "              to stream for - 30 s by default - and the gap, 1.5 s. The\n"
+    "              recording may be any length here, since the segments are the\n"
+    "              policy's\n"
+    "  --step      LiveOptions::stepSeconds: how much new audio the open\n"
+    "              segment takes before it is transcribed again, 0.5 s by\n"
+    "              default. --live only\n";
 
 constexpr auto defaultRuns = 10;
 constexpr auto warmUpRuns = 1;
@@ -116,6 +121,11 @@ public:
     virtual std::string column() const = 0;
     virtual Run transcribe(WSP::Span<const float> samples) = 0;
     virtual std::string text(const WSP::Vector<int>& tokens) const = 0;
+
+    // The encoder positions the next run computes, which the live loop sets per
+    // run out of the segment it holds. Whisper::setAudioContext on our side and
+    // whisper_full_params::audio_ctx on theirs, as in the constructors.
+    virtual void setAudioContext(int positions) = 0;
 };
 
 class OurRuntime final : public Contestant
@@ -123,7 +133,7 @@ class OurRuntime final : public Contestant
 public:
     explicit OurRuntime(int audioContext)
     {
-        whisper.loadBundled();
+        whisper.load(WSP::ModelFetch::directory());
         whisper.prepare();
         whisper.setAudioContext(audioContext);
     }
@@ -152,6 +162,11 @@ public:
     std::string text(const WSP::Vector<int>& tokens) const override
     {
         return whisper.textForTokens(tokens);
+    }
+
+    void setAudioContext(int positions) override
+    {
+        whisper.setAudioContext(positions);
     }
 
 private:
@@ -272,6 +287,8 @@ public:
 
         return joined;
     }
+
+    void setAudioContext(int positions) override { audioContext = positions; }
 
 private:
     // Every text token of every segment, in order, the special tokens
@@ -407,9 +424,9 @@ void printRow(const std::string& label, const std::vector<std::string>& cells)
     std::printf("\n");
 }
 
-template <typename Cell>
+template <typename Row, typename Cell>
 void printRow(const std::string& label,
-              const std::vector<Summary>& summaries,
+              const std::vector<Row>& summaries,
               Cell cellFor)
 {
     auto cells = std::vector<std::string> {};
@@ -514,6 +531,7 @@ struct Request
     int runs = defaultRuns;
     double liveSeconds = defaultLiveSeconds;
     double gapSeconds = defaultLiveGapSeconds;
+    double stepSeconds = WSP::LiveOptions {}.stepSeconds;
     std::string wavFile = defaultSample;
 
     // Encoder positions on both sides; 0 is the whole window, and
@@ -540,11 +558,22 @@ bool parse(const WSP::Vector<std::string>& arguments, Request& request)
     auto numbers = std::vector<double> {};
 
     constexpr auto audioContextFlag = std::string_view {"--audio-ctx="};
+    constexpr auto stepFlag = std::string_view {"--step="};
 
     for (auto index = 1; index < arguments.size(); ++index)
     {
         const auto& argument = arguments[index];
         auto value = 0.0;
+
+        if (std::string_view {argument}.starts_with(stepFlag))
+        {
+            if (!parseNumber(argument.substr(stepFlag.size()), value)
+                || value <= 0.0)
+                return false;
+
+            request.stepSeconds = value;
+            continue;
+        }
 
         if (std::string_view {argument}.starts_with(audioContextFlag))
         {
@@ -625,15 +654,19 @@ void silenceWhisperCpp()
 }
 
 // The live mode: the recording on repeat, at the pace a microphone delivers
-// it, through the policy the demo app runs.
+// it, through the policy the demo app runs, and every contestant through the
+// same one.
 //
-// What comes out is a duty cycle — model seconds per wall second — rather than
-// the cost of one transcription, because that is the number a machine that is
-// listening pays. Nothing else can report it: macOS's own GPU utilisation
+// What comes out is a duty cycle — model seconds per second of audio — rather
+// than the cost of one transcription, because that is the number a machine that
+// is listening pays. Nothing else can report it: macOS's own GPU utilisation
 // counter is a short-window snapshot, so a 26 ms burst every 500 ms reads
 // there as most of a core when the true share is a twentieth of one.
 struct LiveSummary
 {
+    std::string name;
+    std::string column;
+    double audioSeconds = 0.0;
     double wallSeconds = 0.0;
     int runs = 0;
     int runsThatChangedTheText = 0;
@@ -644,6 +677,7 @@ struct LiveSummary
     int steps = 0;
     int segments = 0;
     std::string firstLine;
+    std::string transcript;
 };
 
 // What the run that just happened made of the open segment: the pending text,
@@ -674,28 +708,52 @@ WSP::Vector<float> withGap(const WSP::Vector<float>& recording, double gapSecond
     return stream;
 }
 
-LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
+// One tick's worth of samples, so the audio the policy sees advances with the
+// tick count rather than with the wall clock. A contestant that keeps up sleeps
+// between ticks and streams at real time; one that does not falls behind the
+// clock but is handed the same blocks at the same audio times, which is what
+// makes the run schedule the same for all three.
+constexpr auto tickSamples = WSP::sampleRate * liveTickMilliseconds / 1000;
+
+LiveSummary streamThroughTheTranscriber(Contestant& contestant,
                                         const WSP::LiveOptions& options,
                                         const WSP::Vector<float>& stream,
                                         double seconds)
 {
-    auto live = WSP::LiveTranscriber {whisper, options};
     auto summary = LiveSummary {};
+    summary.name = contestant.name();
+    summary.column = contestant.column();
+
+    auto live = WSP::LiveTranscriber {
+        [&contestant, &options, &summary](WSP::Span<const float> segment)
+        {
+            if (options.encodeOnlyTheAudioThereIs)
+                contestant.setAudioContext(WSP::Whisper::audioContextForSamples(
+                    segment.size(), options.audioContextMarginSeconds));
+
+            const auto run = contestant.transcribe(segment);
+
+            summary.encodeSeconds += run.encodeSeconds;
+            summary.decodeSeconds += run.decodeSeconds;
+            summary.steps += run.steps;
+
+            return contestant.text(run.tokens);
+        },
+        options};
+
     auto chunk = WSP::Vector<float> {};
     auto cursor = 0;
     auto pushed = (long long) 0;
 
+    const auto streamSamples = (long long) (seconds * WSP::sampleRate);
     const auto start = Clock::now();
 
-    for (auto tick = 1; secondsSince(start) < seconds; ++tick)
+    for (auto tick = 1; pushed < streamSamples; ++tick)
     {
         std::this_thread::sleep_until(
             start + std::chrono::milliseconds(liveTickMilliseconds * tick));
 
-        // Whatever the elapsed audio time asks for, which is a run that
-        // overran its tick handing the next one a larger block — exactly what
-        // a capture queue does while the model has the thread.
-        const auto due = (long long) (secondsSince(start) * WSP::sampleRate);
+        const auto due = std::min(streamSamples, (long long) tick * tickSamples);
 
         chunk.clear();
 
@@ -722,16 +780,17 @@ LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
         ++summary.runs;
         summary.modelSeconds += runSeconds;
         summary.longestRunSeconds = std::max(summary.longestRunSeconds, runSeconds);
-        summary.encodeSeconds += whisper.lastEncodeSeconds();
-        summary.decodeSeconds += whisper.lastDecodeSeconds();
-        summary.steps += whisper.lastStepCount();
 
         if (openSegmentText(live, segmentsBefore) != textBefore)
             ++summary.runsThatChangedTheText;
     }
 
     summary.wallSeconds = secondsSince(start);
+    summary.audioSeconds = (double) pushed / WSP::sampleRate;
     summary.segments = live.committed().size();
+
+    for (const auto& line: live.committed())
+        summary.transcript += line + "\n";
 
     if (summary.segments > 0)
         summary.firstLine = live.committed()[0];
@@ -739,33 +798,89 @@ LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
     return summary;
 }
 
-void printLiveTable(const LiveSummary& summary)
+void printLiveTable(const std::vector<LiveSummary>& summaries)
 {
-    const auto perRun = [&summary](double total)
-    { return 1000.0 * total / std::max(1, summary.runs); };
+    const auto& reference = summaries.front();
 
-    printRow("stream, wall clock", {cell(summary.wallSeconds, "s", 1)});
-    printRow("runs", {std::to_string(summary.runs)});
+    const auto perRun = [](const LiveSummary& s, double total)
+    { return 1000.0 * total / std::max(1, s.runs); };
+
+    printRow("", summaries, [](const LiveSummary& s) { return s.column; });
+
+    printRow("stream, audio",
+             summaries,
+             [](const LiveSummary& s) { return cell(s.audioSeconds, "s", 1); });
+
+    printRow("stream, wall clock",
+             summaries,
+             [](const LiveSummary& s) { return cell(s.wallSeconds, "s", 1); });
+
+    printRow("runs",
+             summaries,
+             [](const LiveSummary& s) { return std::to_string(s.runs); });
+
     printRow("runs that changed the text",
-             {std::to_string(summary.runsThatChangedTheText)});
-    printRow("model", {cell(summary.modelSeconds, "s", 3)});
-    printRow("duty",
-             {cell(100.0 * summary.modelSeconds / summary.wallSeconds, "%", 1)});
-    printRow("per run, mean", {cell(perRun(summary.modelSeconds), "ms", 1)});
-    printRow("per run, longest",
-             {cell(1000.0 * summary.longestRunSeconds, "ms", 1)});
-    printRow("encode, mean", {cell(perRun(summary.encodeSeconds), "ms", 1)});
-    printRow("decode, mean", {cell(perRun(summary.decodeSeconds), "ms", 1)});
-    printRow("steps per run",
-             {cell((double) summary.steps / std::max(1, summary.runs), "", 1)});
-    printRow("segments committed", {std::to_string(summary.segments)});
+             summaries,
+             [](const LiveSummary& s)
+             { return std::to_string(s.runsThatChangedTheText); });
 
-    std::printf("\n  a run at this cadence costs about twice what the "
-                "comparison above measures:\n  the GPU clocks down between "
-                "bursts half a second apart.\n");
+    printRow("model",
+             summaries,
+             [](const LiveSummary& s) { return cell(s.modelSeconds, "s", 3); });
+
+    printRow("duty",
+             summaries,
+             [](const LiveSummary& s)
+             { return cell(100.0 * s.modelSeconds / s.audioSeconds, "%", 1); });
+
+    printRow("per run, mean",
+             summaries,
+             [&perRun](const LiveSummary& s)
+             { return cell(perRun(s, s.modelSeconds), "ms", 1); });
+
+    printRow("per run, longest",
+             summaries,
+             [](const LiveSummary& s)
+             { return cell(1000.0 * s.longestRunSeconds, "ms", 1); });
+
+    printRow("encode, mean",
+             summaries,
+             [&perRun](const LiveSummary& s)
+             { return cell(perRun(s, s.encodeSeconds), "ms", 1); });
+
+    printRow("decode, mean",
+             summaries,
+             [&perRun](const LiveSummary& s)
+             { return cell(perRun(s, s.decodeSeconds), "ms", 1); });
+
+    printRow("steps per run",
+             summaries,
+             [](const LiveSummary& s)
+             { return cell((double) s.steps / std::max(1, s.runs), "", 1); });
+
+    printRow("segments committed",
+             summaries,
+             [](const LiveSummary& s) { return std::to_string(s.segments); });
+
+    printRow("transcript",
+             summaries,
+             [&reference](const LiveSummary& s)
+             {
+                 if (&s == &reference)
+                     return std::string {"reference"};
+
+                 return std::string {
+                     s.transcript == reference.transcript ? "same" : "DIFFERS"};
+             });
+
+    std::printf("\n  a run at this cadence costs more than the comparison "
+                "measures: the GPU clocks\n  down between bursts half a second "
+                "apart. whisper.cpp has no live layer, so its\n  columns are "
+                "this policy driving whisper_full - the runs, the segments and "
+                "the\n  audio each run saw are ours.\n");
 }
 
-void printLivePolicy(const WSP::LiveOptions& options)
+void printLivePolicy(const WSP::LiveOptions& options, int positions)
 {
     std::printf("  policy step %.2f s, new speech %.2f s, silence hold %.2f s, "
                 "segment cut %.1f s\n",
@@ -773,50 +888,89 @@ void printLivePolicy(const WSP::LiveOptions& options)
                 options.minNewSpeechSeconds,
                 options.silenceHoldSeconds,
                 options.maxSegmentSeconds);
-    std::printf("  audio context %s\n",
-                options.encodeOnlyTheAudioThereIs
-                    ? "the segment's audio plus the margin"
-                    : "the whole window, 1500 positions");
+
+    if (options.encodeOnlyTheAudioThereIs)
+        std::printf("  audio context the segment's audio plus the margin, on "
+                    "every side\n");
+    else if (positions > 0)
+        std::printf("  audio context %d encoder positions on every side\n",
+                    positions);
+    else
+        std::printf("  audio context the whole window, 1500 positions, on every "
+                    "side\n");
+}
+
+// Our runtime, then whisper.cpp on its GPU backend if this build has one, then
+// whisper.cpp without one. Each loaded once, and the audio context they start
+// on is the one the mode asked for.
+std::vector<std::unique_ptr<Contestant>> makeContestants(int audioContext)
+{
+    auto contestants = std::vector<std::unique_ptr<Contestant>> {};
+    contestants.push_back(std::make_unique<OurRuntime>(audioContext));
+
+    if (const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
+        contestants.push_back(
+            std::make_unique<WhisperCpp>(true, describe(gpu), audioContext));
+    else
+        std::printf("  whisper.cpp has no GPU backend in this build, so it "
+                    "runs without one only\n\n");
+
+    contestants.push_back(std::make_unique<WhisperCpp>(false, "CPU", audioContext));
+
+    return contestants;
 }
 
 void runLive(const Request& request)
 {
-    auto whisper = WSP::Whisper {};
-    whisper.loadBundled();
-    whisper.prepare();
-
     const auto recording = WSP::readWavFile(request.wavFile);
     const auto stream = withGap(recording, request.gapSeconds);
+
+    auto options = WSP::LiveOptions {};
+    options.stepSeconds = request.stepSeconds;
+    options.encodeOnlyTheAudioThereIs =
+        request.audioContext == Request::fromTheAudio;
 
     std::printf("WhisperEACP live benchmark\n");
     std::printf("  audio %s: %.1f s, on repeat with a %.1f s silence gap\n",
                 request.wavFile.c_str(),
                 (double) recording.size() / WSP::sampleRate,
                 request.gapSeconds);
-    std::printf("  model tiny.en: %s, F32\n",
-                WSP::Whisper::bundledModelDirectory().string().c_str());
+    std::printf("  model tiny.en: %s for WhisperEACP, F32; %s for whisper.cpp, "
+                "F16\n",
+                WSP::ModelFetch::directory().string().c_str(),
+                ggmlModel);
     std::printf("  stream %.0f s at %d ms ticks, on %s\n",
                 request.liveSeconds,
                 liveTickMilliseconds,
                 GPU::Device::shared().name().c_str());
-    auto options = WSP::LiveOptions {};
-    options.encodeOnlyTheAudioThereIs =
-        request.audioContext == Request::fromTheAudio;
 
-    printLivePolicy(options);
+    // A fixed context is the one every run starts on and keeps; "audio" is the
+    // option above, which sets it per run out of the segment instead.
+    const auto positions =
+        options.encodeOnlyTheAudioThereIs ? 0 : request.audioContext;
+
+    printLivePolicy(options, positions);
     printBuildType();
+    printBackends();
     std::printf("\n");
 
-    const auto summary =
-        streamThroughTheTranscriber(whisper, options, stream, request.liveSeconds);
+    auto contestants = makeContestants(positions);
+    auto summaries = std::vector<LiveSummary> {};
 
-    printLiveTable(summary);
+    for (auto& contestant: contestants)
+    {
+        summaries.push_back(streamThroughTheTranscriber(
+            *contestant, options, stream, request.liveSeconds));
 
-    if (summary.segments > 0)
-        std::printf("\n  first committed line\n   %s\n", summary.firstLine.c_str());
-    else
-        std::printf("\n  nothing committed: the stream ended before a segment "
-                    "closed\n");
+        std::printf("  %s\n   %s\n\n",
+                    summaries.back().name.c_str(),
+                    summaries.back().segments > 0
+                        ? summaries.back().firstLine.c_str()
+                        : "nothing committed: the stream ended before a segment "
+                          "closed");
+    }
+
+    printLiveTable(summaries);
 }
 
 void run(const Request& request)
@@ -837,7 +991,7 @@ void run(const Request& request)
                 WSP::windowSeconds);
     std::printf("  model tiny.en: %s for WhisperEACP, F32; %s for whisper.cpp, "
                 "F16\n",
-                WSP::Whisper::bundledModelDirectory().string().c_str(),
+                WSP::ModelFetch::directory().string().c_str(),
                 ggmlModel);
     std::printf("  runs  %d timed after %d warm-up, per contestant\n",
                 request.runs,
@@ -851,18 +1005,7 @@ void run(const Request& request)
     printBackends();
     std::printf("\n");
 
-    auto contestants = std::vector<std::unique_ptr<Contestant>> {};
-    contestants.push_back(std::make_unique<OurRuntime>(audioContext));
-
-    if (const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
-        contestants.push_back(
-            std::make_unique<WhisperCpp>(true, describe(gpu), audioContext));
-    else
-        std::printf("  whisper.cpp has no GPU backend in this build, so it "
-                    "runs without one only\n\n");
-
-    contestants.push_back(std::make_unique<WhisperCpp>(false, "CPU", audioContext));
-
+    auto contestants = makeContestants(audioContext);
     auto summaries = std::vector<Summary> {};
 
     for (auto& contestant: contestants)
@@ -876,32 +1019,49 @@ void run(const Request& request)
     printTable(summaries);
 }
 
+// At file scope because the command line is parsed and the model fetched in
+// main, before the loop this runs inside opens.
+Request request;
+
+// The HuggingFace weights on disk before anything else happens. Called from main
+// rather than from here for the reason the comment at the top of this file gives:
+// ModelFetch::fetch pumps the event loop, and a callback running inside that loop
+// may not.
+bool fetchOurModel()
+{
+    const auto announce = !WSP::ModelFetch::isAvailable();
+
+    if (announce)
+        std::printf("fetching %s into %s\n",
+                    WSP::ModelFetch::repository,
+                    WSP::ModelFetch::directory().string().c_str());
+
+    const auto outcome = WSP::ModelFetch::fetch(
+        WSP::ModelFetch::Freshness::trust,
+        [](const WSP::ModelFetch::Progress& progress)
+        {
+            using Stage = eacp::OnlineResource::Progress::Stage;
+
+            if (progress.file.stage != Stage::downloading)
+                return;
+
+            std::printf("\r  %-58s",
+                        WSP::ModelFetch::progressText(progress).c_str());
+            std::fflush(stdout);
+        });
+
+    if (announce)
+        std::printf("\n");
+
+    if (!outcome.ok)
+        std::printf("the tiny.en weights could not be fetched: %s\n",
+                    outcome.error.c_str());
+
+    return outcome.ok;
+}
+
 void benchmarkMain()
 {
-    auto request = Request {};
-
-    if (!parse(Apps::getAppEnvironment().commandLineArgs, request))
-    {
-        std::printf("%s", usage);
-        Apps::setReturnValue(2);
-        return;
-    }
-
-    if (!WSP::Whisper::hasBundledModel())
-    {
-        std::printf("%s", missingBundledModel);
-        Apps::setReturnValue(2);
-        return;
-    }
-
-    if (!request.live && !std::filesystem::is_regular_file(ggmlModel))
-    {
-        std::printf("the GGML model the configure fetched is not at %s\n",
-                    ggmlModel);
-        Apps::setReturnValue(2);
-        return;
-    }
-
     if (!GPU::Device::shared().isValid())
     {
         std::printf("no GPU device available - nothing here can run\n");
@@ -929,5 +1089,25 @@ void benchmarkMain()
 int main(int argc, char* argv[])
 {
     Apps::setCommandLineArgs(argc, argv);
+
+    if (!parse(Apps::getAppEnvironment().commandLineArgs, request))
+    {
+        std::printf("%s", usage);
+        return 2;
+    }
+
+    // Both downloads before the loop: ours pumps the loop to do it, and theirs
+    // is a path the configure fixed, so a missing one is worth saying before a
+    // window of work opens.
+    if (!fetchOurModel())
+        return 2;
+
+    if (!std::filesystem::is_regular_file(ggmlModel))
+    {
+        std::printf("the GGML model the configure fetched is not at %s\n",
+                    ggmlModel);
+        return 2;
+    }
+
     return Apps::run(benchmarkMain);
 }

@@ -7,10 +7,15 @@
 //
 // A published format rather than a convention read off another project's
 // source, and the reason nothing here needs a converter.
+//
+// ModelFetch is where those files come from: a HuggingFace repo at a pinned
+// revision, fetched once per machine through eacp::OnlineResource rather than
+// downloaded by the build and copied beside every binary.
 
 #include <WhisperEACP/Core/Core.h>
 #include <WhisperEACP/Model/ModelConfig.h>
 #include <WhisperEACP/Model/ModelError.h>
+#include <WhisperEACP/Model/ModelFetch.h>
 #include <WhisperEACP/Model/ModelFiles.h>
 #include <WhisperEACP/Model/PreprocessorConfig.h>
 #include <WhisperEACP/Model/SafeTensors.h>

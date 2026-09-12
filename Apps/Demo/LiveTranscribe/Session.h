@@ -2,17 +2,18 @@
 
 #include <WhisperEACP/WhisperEACP.h>
 
+#include <functional>
 #include <optional>
 #include <string>
 
 namespace LiveTranscribe
 {
-// Whether there is a model to run: none was copied beside the binary and none
-// was named, one is being loaded, one is running, or loading it failed and the
-// message says why.
+// Whether there is a model to run: the four files are arriving from
+// HuggingFace, one is being mapped and its kernels compiled, one is running, or
+// it failed and the message says why.
 enum class ModelState
 {
-    NotBundled,
+    Downloading,
     Loading,
     Ready,
     Failed
@@ -32,12 +33,23 @@ class Session
 public:
     explicit Session(std::string modelDirectoryToUse);
 
-    // Maps the weights, compiles every kernel and uploads them: about half a
-    // second, so the app posts this rather than calling it from its
-    // constructor. The window is up, saying it is loading, before it starts.
-    void loadModel();
+    // Called once the state has settled on Ready or Failed, which is what the
+    // app's autostart hangs off: the model arrives over the network now, so
+    // "after loadModel()" is no longer a place in a function.
+    std::function<void()> onModelSettled = [] {};
+
+    // The four files if they are not on disk yet, then the model. Both halves
+    // are on the message thread: the download is eacp::OnlineResource's worker
+    // thread reporting back here, and the load is the half second of mapping
+    // and kernel compilation this posts from the app's constructor so the
+    // window is up before it starts.
+    void start();
 
     ModelState state() const { return modelState; }
+
+    // What the status line says while the four files arrive — the file in
+    // flight, its place in the set and how far through it the transfer is.
+    std::string downloadText() const;
     const std::string& stateMessage() const { return message; }
     bool isReady() const { return modelState == ModelState::Ready; }
     double loadSeconds() const { return modelLoadSeconds; }
@@ -69,10 +81,12 @@ public:
     const std::string& lastError() const { return errorText; }
 
 private:
+    void loadModel();
     void failWith(std::string reason);
     bool runTranscriber();
 
     std::string modelDirectory;
+    WSP::ModelFetch::Download download;
     ModelState modelState = ModelState::Loading;
     std::string message;
     std::string errorText;

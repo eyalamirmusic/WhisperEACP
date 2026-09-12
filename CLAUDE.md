@@ -49,15 +49,10 @@ ctest --test-dir build --output-on-failure
 - `WHISPER_EACP_CI_BUILD` (default `OFF`): turns on the unity builds CI uses,
   here and in eacp, MakeASound and Miro.
 
-- `WHISPER_EACP_FETCH_MODEL` (default `ON`): the four `tiny.en` files on disk,
-  and — through `whisper_bundle_model(<target>)` — copied beside every binary
-  that asks for them, after each link. A default configure therefore downloads
-  151 MB. Off, the function is a no-op, `Whisper::hasBundledModel()` answers
-  `false` at runtime, and the tests that need a file skip.
-
-  A build directory configured before the switch flipped keeps its cached
-  `OFF`: reconfigure with `-U WHISPER_EACP_FETCH_MODEL`, or pass `ON`
-  explicitly, to get the default behaviour there.
+There is no option for the model. It is fetched at runtime, once per machine,
+and a configure downloads nothing of it — see "Fetching the model" below. A
+build directory from before that change keeps a stale `WHISPER_EACP_FETCH_MODEL`
+entry in its cache, which nothing reads.
 
 - `WHISPER_EACP_ENABLE_WHISPER_CPP` (default `OFF`): fetches whisper.cpp and
   its GGML `tiny.en`, and builds `Tests/Oracle` against it.
@@ -196,8 +191,10 @@ which of the two kernels a product runs is one decision in one place.
 **Mel/** — the front-end: Hann, a reflect-padded STFT, the 80 x 201 filterbank,
 log10 and Whisper's clamp-and-scale.
 
-**Model/** — safetensors and the two config files. **Tokenizer/** — byte-level
-BPE and Whisper's special tokens.
+**Model/** — safetensors and the two config files, and `ModelFetch`, which is
+where those files come from: four `eacp::OnlineResource`s at a pinned HuggingFace
+revision. It is why `whisper-model` links `eacp-network`. **Tokenizer/** —
+byte-level BPE and Whisper's special tokens.
 
 **Encoder/** and **Decoder/** — HF's two halves out of those kernels, the second
 over a KV cache. **Whisper/** — the whole runtime, and the greedy search the
@@ -258,61 +255,59 @@ fp32 keeps its float weight.
 
 ### Fetching the model
 
-Models are fetched with **CPM**, like every other dependency, rather than a
-hand-rolled `file(DOWNLOAD)`. CPM forwards unparsed arguments to
-`FetchContent_Declare`, so a plain URL works. Each file needs
-`DOWNLOAD_NO_EXTRACT YES` — without it FetchContent takes the download for an
-archive and fails trying to unpack it — and `DOWNLOAD_ONLY YES`, since there is
-no CMakeLists to add:
+At runtime, through **`eacp::OnlineResource`** — one resource per file, fetched
+the first time anything asks and found on disk every time after.
+`Model/ModelFetch.h` is the whole of it and is the only place the four URLs are
+written down:
 
-```cmake
-CPMAddPackage(
-        NAME whisper-tiny-en-config
-        URL https://huggingface.co/openai/whisper-tiny.en/resolve/main/config.json
-        DOWNLOAD_NO_EXTRACT YES
-        DOWNLOAD_ONLY YES)
+| member | what it is |
+| --- | --- |
+| `ModelFetch::directory()` | where the four files live |
+| `ModelFetch::resources()` | the four as `OnlineResource::Info`, weights last |
+| `ModelFetch::isAvailable()` | all four on disk at this revision, no request made |
+| `ModelFetch::fetch(freshness, onProgress)` | blocking, for a console `main` |
+| `ModelFetch::Download` | the async form: `start()`, `cancel()`, `progress()`, `onFinished` |
+| `ModelFetch::progressText(progress)` | the one sentence every caller that draws a download draws |
+
+**The URLs name a commit, not `main`.** `ModelFetch::revision` is
+`87c7102…`, which is `openai/whisper-tiny.en` as every number in `plan.md` was
+measured against, and it is the `Info::version` as well, so bumping it
+re-downloads instead of trusting the previous revision's copy. That revision is
+what replaced the four `URL_HASH` SHA256s the configure used to pin:
+`OnlineResource` has no content hash, so the integrity claim is now HTTPS plus
+an immutable URL rather than a digest the project checks — `plan.md` says what
+that costs.
+
+**`Freshness::trust` everywhere, and that is not laziness.** The bytes at a
+commit cannot change, so a revalidation can only waste a round trip — and for
+`model.safetensors` it wastes 151 MB: HuggingFace redirects an LFS file to a
+CDN, eacp records the ETag of the response it ended on, which is the CDN's
+rather than the one the origin compares against, and a conditional GET
+therefore misses and re-downloads the whole file. Measured, not assumed, and
+written up in `plan.md` as an eacp gap. The three small files revalidate
+correctly.
+
+**One directory for every binary here**, and not eacp's default. That default is
+`FilePath::appSupportDirectory() / "Resources"`, which names the folder after
+the running executable — right for an app that ships, wrong for a tree of
+eleven binaries that share one 151 MB model. So `ModelFetch::directory()`
+spells the names instead, through the two-argument overload:
+
+```
+~/Library/Application Support/eacp/WhisperEACP/Models/tiny.en
 ```
 
-Pin `URL_HASH` on each once the model choice settles.
+with eacp's own `<file>.resource.json` sidecar beside each file recording the
+URL, the version and the server's validators.
 
-Do not use `CPM_SOURCE_CACHE`.
+**The main-thread rule is why the fetch is in `main`.** `OnlineResource::fetch`
+pumps the event loop until the transfer is done, which is a console `main`'s
+privilege and not an event-loop callback's — so every console entry point here
+(`Transcribe`, `Benchmark`, the test mains) fetches *before* `eacp::Apps::run`,
+and `Apps/Demo/LiveTranscribe`, whose loop is already running, uses
+`ModelFetch::Download` instead.
 
-The fetch runs behind `WHISPER_EACP_FETCH_MODEL`, on by default, so an ordinary
-configure downloads the four files. `WHISPER_EACP_MODEL_DIR` points at the
-directory they are linked into either way, so a test compiles against a real
-path and skips on a file's absence rather than on an `#ifdef`.
-`WHISPER_EACP_MODEL_FILES` lists the four paths, and is empty when the fetch is
-off.
-
-### Bundling the model
-
-The model is **not** compiled into any binary. It used to be, through ResEmbed,
-and 151 MB as a decimal brace initializer was a 657 MB `.c`, a 42 s compile and
-a 16 GiB peak RSS; `plan.md` keeps the numbers. The build copies it instead.
-
-`whisper_copy_resources(<target> FILES ... [DESTINATION <dir>])`, in
-`CMake/WhisperResources.cmake`, is a `POST_BUILD` copy to where the binary can
-find files at runtime: `Contents/Resources` of a `MACOSX_BUNDLE` target, and
-the executable's own directory otherwise — a Windows build, or a macOS
-executable that is not a bundle, which is what the console apps and every test
-here are. `copy_if_different`, so a rebuild that changed nothing copies nothing.
-
-`whisper_bundle_model(<target>)`, defined in `Model/CMakeLists.txt` beside the
-fetch, applies that to the four fetched files under `DESTINATION WhisperModel`.
-It exists whether or not the fetch is on and does nothing when it is off, so a
-consumer calls it unconditionally and `Whisper::hasBundledModel()` answers at
-runtime.
-
-The runtime half is `WSP::resourcesDirectory()` in
-`Whisper/ResourcesDirectory.h`, one source per platform: CoreFoundation's
-`CFBundleCopyResourcesDirectoryURL` on Apple, which answers `Contents/Resources`
-for a bundle and the executable's directory for anything else, and
-`GetModuleFileNameW` on Windows. `Whisper::bundledModelDirectory()` is that plus
-`WhisperModel`, `hasBundledModel()` checks the four files are in it, and
-`loadBundled()` is `load()` on it, so the weights are mapped as for any
-directory. The directory name is spelled in `Model/CMakeLists.txt` and in
-`Whisper::bundledModelDirectoryName`, and nowhere else.
-
+Nothing is copied beside any binary, and nothing is compiled into one.
 `Whisper::load(const ModelFiles&)` and `SafeTensors::fromView` stay: they are
 the path for a model somebody already holds in memory, and `Tests/Whisper`
 exercises them.
@@ -326,16 +321,17 @@ whisper's own `tests/jfk.flac`. A US government work held by the JFK Library
 and in the public domain.
 
 `WHISPER_EACP_SAMPLE_DIR` (set in the root `CMakeLists.txt`) points at it. It
-stays separate from `WHISPER_EACP_MODEL_DIR` because that one may point at a
-HuggingFace checkout somebody already has, and jfk.wav is not in one.
+stays separate from the model directory because that one is a HuggingFace repo —
+the one `ModelFetch` fetched, or a checkout somebody already has — and jfk.wav
+is in neither.
 
 ### `Apps/Console/Transcribe`
 
 Three forms, and the app says which one it took before printing the transcript:
 
 ```bash
-./build/Apps/Console/Transcribe/Transcribe                          # built-in model, built-in sample
-./build/Apps/Console/Transcribe/Transcribe recording.wav            # built-in model
+./build/Apps/Console/Transcribe/Transcribe                          # fetched model, built-in sample
+./build/Apps/Console/Transcribe/Transcribe recording.wav            # fetched model
 ./build/Apps/Console/Transcribe/Transcribe path/to/model recording.wav
 ./build/Apps/Console/Transcribe/Transcribe --audio-ctx=audio recording.wav   # encode only the audio there is
 ```
@@ -347,8 +343,11 @@ which turns `LiveOptions::encodeOnlyTheAudioThereIs` on; plan.md's fifth
 performance round has the transcripts at each context and the floor and margin
 that keep the decoder out of a repetition loop.
 
-A form that needs the bundled model in a build that copied none prints how to
-get one and returns 2.
+The first two forms fetch `openai/whisper-tiny.en` before the run loop opens,
+printing one rewritten progress line while 151 MB arrives and nothing at all on
+every later run. A fetch that fails — no network, a machine behind a proxy —
+prints why and returns 2. Arguments are parsed first, so a usage error costs no
+download.
 
 ### `Apps/Demo/LiveTranscribe`
 
@@ -360,16 +359,22 @@ Three parts under a `UI::ComponentHost`: `MainPanel` is the tree and the layout,
 that holds and falls, and `TranscriptView` wraps the text by hand inside a
 `ScrollPanel` — eacp's painter draws one line and measures one, and there is no
 wrapped-text call or text-area widget in the tier. `Session` is the non-UI half:
-the `Whisper`, the `Capture` and the `LiveTranscriber` over the two.
+the `Whisper`, the `Capture`, the `LiveTranscriber` over the two, and the
+`ModelFetch::Download` that has to finish before any of them exists.
 
 **Everything runs on the message thread**, from one 30 Hz `Threads::Timer`, and
 that is a constraint rather than a simplification: eacp's GPU layer is
 main-thread only and `Whisper::transcribe` blocks on its own commits, so a tick
 drains the capture queue, pushes it, and lets `LiveTranscriber::update()` decide
 whether a run is due. The device callback is the only other thread and it
-reaches nothing here. The model is loaded from a `Threads::callAsync` posted in
-the app's constructor, so the window is up saying "loading model..." before the
-half second of mapping and kernel compilation starts.
+reaches nothing here. `Session::start()` is posted from a `Threads::callAsync`
+in the app's constructor, so the window is up before anything slow begins: on a
+first run it says `downloading model   model.safetensors (4 of 4)   41.2 of
+151.1 MB   27%`, polled off the same timer as the meter, and then "loading
+model..." for the half second of mapping and kernel compilation. `ModelState` is
+`Downloading`, `Loading`, `Ready` or `Failed`, and `Session::onModelSettled` is
+what the `--autostart` switch hangs off, since "after the model loaded" is no
+longer a place in a function.
 
 Two build-side requirements. The bundle needs an `Info.plist.in` of its own
 carrying `NSMicrophoneUsageDescription` — set **after**
@@ -415,10 +420,28 @@ Three tiers, in the order a failure should be diagnosed:
 
 ### Tests (`Tests`)
 
-NanoTest, one executable per module. `Tests/GPU` has an entry point of its own
-(`TestMain.cpp`): anything touching the GPU runs inside `eacp::Apps::run`, which
-owns the run loop and autorelease pool the Metal backend is written against. A
-test that needs a device returns early when `Device::shared().isValid()` is
+NanoTest, one executable per module, and two shared entry points in
+`Tests/Support/` rather than NanoTest's own:
+
+- `GpuTestMain.cpp` (`WHISPER_GPU_TEST_MAIN`) runs the suite inside
+  `eacp::Apps::run`, which owns the run loop and autorelease pool the Metal
+  backend is written against. `GPUTests`, `KernelTests` and `MelTests` take it.
+- `ModelTestMain.cpp` (`WHISPER_MODEL_TEST_MAIN`) is that with
+  `ModelFetch::fetch` in front, for the five modules that read the real tiny.en
+  files — `Model`, `Encoder`, `Decoder`, `Whisper`, `Oracle` — plus `Tokenizer`,
+  which wants `tokenizer.json` and no device. One or the other, never both: the
+  fetch has to happen outside the loop the other one opens.
+
+A module that needs the model therefore has it by the time its first test runs,
+and the first executable of a suite run is the one that pays for the download.
+Two things follow. A test that needs a file still returns early when it is
+absent — no network is the case those skips were always written for — and the
+fetch is skipped entirely for `--list-tests`, which is how NanoTest's CMake
+discovers test cases after every link: its whole stdout is the list of names, so
+a progress line there becomes a test case, and a build would otherwise download
+151 MB.
+
+A test that needs a device returns early when `Device::shared().isValid()` is
 false, so the suite still passes on a machine with no GPU.
 
 Every kernel gets a test that asserts against a scalar CPU reference computed in

@@ -29,7 +29,8 @@ inline bool hasWhisperModel()
 
 // WHISPER_EACP_SAMPLE_DIR is the repository's own Samples directory, and
 // WHISPER_SAMPLE_DIR in the environment points at a copy somebody already has —
-// the same pair as WHISPER_EACP_MODEL_DIR and WHISPER_MODEL_DIR next door.
+// the same pair as modelDirectory() next door, whose first answer is the fetch's
+// own directory rather than a configure-time path.
 inline std::filesystem::path sampleDirectory()
 {
     if (const auto* fromEnvironment = std::getenv("WHISPER_SAMPLE_DIR"))
@@ -61,9 +62,9 @@ constexpr auto jfkSample = "jfk.wav";
 // sequence whose first piece carries the word boundary; the trim below is what
 // makes this literal readable, and the leading space is asserted separately.
 //
-// Here rather than in TranscribeTests.cpp because Tests/Bundled transcribes
-// the same recording through the bundled model, and one pinned sentence read by
-// both is the point of pinning it.
+// Here rather than in TranscribeTests.cpp because LiveTranscriberTests.cpp
+// reads the same sentence out of a stream of the same recording, and one pinned
+// sentence read by both is the point of pinning it.
 constexpr auto jfkTranscript =
     "And so my fellow Americans ask not what your country can do for you, "
     "ask what you can do for your country.";

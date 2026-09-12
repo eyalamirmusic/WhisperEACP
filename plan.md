@@ -32,7 +32,9 @@ that owns both and turns 30 seconds of audio into a string.
 222 tests across the suite, with the oracle on. The ones that need a downloaded model or tokenizer
 skip without one, the same shape as a GPU test returning early when
 `Device::shared().isValid()` is false; configure with
-`-DWHISPER_EACP_FETCH_MODEL=ON` and every one of them runs.
+`-DWHISPER_EACP_FETCH_MODEL=ON` and every one of them runs. (That switch is
+gone — the model is fetched at runtime now, and the last section of this file is
+where that happened.)
 
 ### `Kernels/` — `whisper-kernels`, `Tests/Kernels`
 
@@ -1424,6 +1426,32 @@ one command buffer against a scalar scan of the scores the same run produced.
   encoder context, and it stays armed on the state — not an eacp gap, but the
   thing to know before writing an oracle test at a reduced context.
 
+### The step, across the three backends
+
+`LiveTranscriber` now drives any transcriber through a callback, so
+`Benchmark --live` pushes the same audio-time schedule through all three
+contestants and `--step=` sets the policy. Duty per step, jfk.wav with a
+1.5 s gap, 30 s of stream; runs are identical down every column:
+
+| step | runs | ours, window | whisper.cpp GPU | whisper.cpp CPU | ours, `--audio-ctx=audio` | whisper.cpp GPU | whisper.cpp CPU |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 0.5 s | 49 | 4.1% | 9.7% | 20.5% | 2.8% | 7.7% | 8.4% |
+| 1.0 s | 31 | **2.5%** | 5.2% | 12.6% | **1.7%** | 4.3% | 5.6% |
+| 1.5 s | 21 | 3.0% | 4.1% | 8.7% | 2.1% | 3.1% | 3.8% |
+| 2.0 s | 17 | 2.8% | 3.5% | 7.0% | 1.6% | 2.3% | 2.9% |
+
+Two things in it. **Our duty is not monotone in the step and theirs is.** A
+run of ours costs 25.2 ms at a 0.5 s step, 23.8 at 1 s, 42.2 at 1.5 s and
+49.8 at 2 s, encode and decode moving together, which is the GPU's clock and
+not the work: past about a second between bursts it powers down and every
+run after pays for the ramp. whisper.cpp Metal shows it only in its encode
+(14.4 → 22.6 ms) and not in its decode, which is most of its run, so its
+total moves 1.23x where ours moves 2.1x; the CPU column is flat to 2% and is
+the control. So a 1 s step is the cheapest policy for this runtime, and the
+lever "run less often" stops paying after that. And **the audio context helps
+whisper.cpp's CPU most**: its encode drops 3.2x against our 2.3x, taking it
+level with its own Metal column at a 0.5 s step.
+
 ### What is still on the table after this
 
 The step is 445 us, the encode 6.4 ms at the window and 3.0 at 704 positions.
@@ -1442,3 +1470,185 @@ The step is 445 us, the encode 6.4 ms at the window and 3.0 at 704 positions.
   changes the clock the GPU idles at; less work per run is the whole answer,
   and the live benchmark is where it shows.
 - **The fused encoder attention**, with its budget worked out above.
+
+## The model, fetched at runtime
+
+A third step in "Bundling the model" above, and it undoes the second the way
+the second undid the first. Embedded cost a 657 MB `.c` per binary; copied cost
+a 151 MB download at configure time and another 151 MB beside every target that
+asked; fetched costs one download per machine, and nothing at all to a build.
+
+`eacp::OnlineResource` landed on eacp's develop (`fcd0600`) while this tree was
+still copying, and it is exactly the shape the model wants: a file an app needs
+from the network, kept on disk, fetched at most once, with a sidecar recording
+what it fetched.
+
+### What it is
+
+`Model/ModelFetch.h`, in `whisper-model` — which is why that target now links
+`eacp-network` — and it is the only place the four HuggingFace URLs are written
+down:
+
+| member | what it is |
+| --- | --- |
+| `directory()` | `~/Library/Application Support/eacp/WhisperEACP/Models/tiny.en` |
+| `resources()` | the four as `OnlineResource::Info`, the weights last |
+| `isAvailable()` | all four on disk at this revision, no request made |
+| `fetch(freshness, onProgress)` | blocking, pumps the loop, for a console `main` |
+| `Download` | the async form: `start()`, `cancel()`, `progress()`, `onFinished` |
+| `progressText(progress)` | the sentence all three callers draw |
+
+Four decisions in it, each of which the alternative was tried or rejected for a
+reason:
+
+- **The URLs name a commit.** `87c7102498dcde7456f24cfd30239ca606ed9063` is
+  `openai/whisper-tiny.en` as everything here was measured against, and the
+  revision is the `Info::version` as well, so bumping it re-downloads rather
+  than trusting the previous revision's copy. `resolve/main` would have been a
+  moving target under a copy that never revalidates.
+- **`Freshness::trust`.** The bytes at a commit cannot change, so a
+  revalidation can only cost a round trip — and for `model.safetensors` it
+  costs 151 MB, measured, for the reason in the gaps below.
+- **One directory for the whole tree, spelled rather than discovered.**
+  `OnlineResource::defaultDirectory()` is `appSupportDirectory() / "Resources"`,
+  named after the running executable. Right for an app that ships; here it
+  would have given `Transcribe`, `Benchmark`, the demo and eight test binaries
+  a 151 MB copy each, so `directory()` goes through the two-argument
+  `appSupportDirectory(company, app)` overload instead. `Tests/Model` asserts
+  the per-binary folder is not an ancestor of it.
+- **The weights are fetched last.** A machine with no network then fails on a
+  2 kB transfer rather than part-way through 151 MB, and the three small files
+  are all a config or vocabulary test needs anyway.
+
+### Where the fetch is called from, which is all about the loop
+
+`OnlineResource::fetch` pumps the event loop until the transfer is done, which
+is a console `main`'s privilege and not an event-loop callback's. Everything
+else follows from that:
+
+- `Apps/Console/Transcribe` parses its arguments and fetches in `main`, before
+  `Apps::run`. Parsing first, so a usage error costs no download; the exit code
+  is `main`'s rather than `Apps::setReturnValue`'s, there being no loop yet.
+- `Benchmark` does the same, and checks the GGML model's path there too — that
+  one is still a configure-time download of whisper.cpp's own format, and
+  nothing about it changed.
+- `Apps/Demo/LiveTranscribe` is the one with a loop already running, so it
+  takes `ModelFetch::Download`: `Session::start()` is posted from
+  `Threads::callAsync` in the app's constructor, the 30 Hz tick that drives the
+  meter polls `progress()` into the status line, and `onFinished` loads the
+  model. `ModelState` gained `Downloading` and lost `NotBundled`, and
+  `Session::onModelSettled` is what `--autostart` hangs off now that "after the
+  model loaded" is no longer a place in a function.
+- The tests get a second shared entry point. `Tests/Support/ModelTestMain.cpp`
+  is `GpuTestMain.cpp` plus `fetchTestModel()` in front of `Apps::run`, and the
+  six modules that read the real files take it — `Model`, `Encoder`, `Decoder`,
+  `Whisper`, `Oracle` and `Tokenizer`, that last one wanting `tokenizer.json`
+  and no device. `modelDirectory()` in `Tests/Model/Common.h` answers
+  `ModelFetch::directory()` unless `WHISPER_MODEL_DIR` is set, so every skip in
+  the suite still reads "the file is not there" and no test asserts that a
+  download worked.
+
+**And the entry point says nothing when asked to list.** NanoTest's CMake
+discovers test cases by running each binary with `--list-tests` after every
+link and taking its whole stdout as the list of names. The first build with the
+fetch in `main` therefore downloaded the model *during the build* — twice,
+ninja running two discovery steps at once — and filed four progress lines as
+test cases: `ctest -N` listed `Test #33:   config.json (1 of 4)   done`. The
+guard is three lines in `ModelTestMain.cpp`, and without it this change would
+have moved the 151 MB from the configure to the build rather than out of it.
+
+### What it cost and what it bought
+
+On this machine (M4 Max, Debug build):
+
+| | cold | warm |
+| --- | --- | --- |
+| `Transcribe`, no arguments, wall clock | 5.9 s | 1.43 s |
+| of which the fetch | ~3.8 s, 151 MB at ~40 MB/s | 0 bytes, no request |
+
+`ctest` is 309 tests in 155 s, all passing, and the second run of the suite
+moves no bytes — `ModelFetch/aSecondFetchDownloadsNothing` is the assertion,
+and it reads the Outcome the entry point left behind rather than fetching from
+inside the loop.
+
+What went away with it: `WHISPER_EACP_FETCH_MODEL`, `WHISPER_EACP_MODEL_DIR` and
+`WHISPER_EACP_MODEL_FILES`; the four `CPMAddPackage` blocks and their four
+`URL_HASH` pins; `whisper_bundle_model`, `whisper_copy_resources` and
+`CMake/WhisperResources.cmake`; `Whisper::loadBundled`, `hasBundledModel`,
+`bundledModelDirectory` and `bundledModelDirectoryName`;
+`Whisper/ResourcesDirectory.h` with its Apple and Windows sources, and the
+`-framework CoreFoundation` on `whisper-runtime`; and `Tests/Bundled`, whose
+four tests were about a copy that no longer happens — its end-to-end
+transcription out of the bundled directory is now literally the same directory
+`Tests/Whisper` already transcribes from, so it is not replaced, and the fetch
+itself is tested in `Tests/Model/ModelFetchTests.cpp`.
+
+That also closes a gap this file recorded two rounds ago: `resourcesDirectory()`
+existed because eacp's `Files::getBundleResourcePath` is Apple-only and has no
+accessor for the directory itself. With the model in `appSupportDirectory()`,
+which eacp answers on every platform, the question does not come up here any
+more — the two platform sources are gone rather than upstreamed.
+
+**The one thing that got worse.** `URL_HASH SHA256=...` on four CPM downloads
+was a real integrity check: a corrupted or swapped file failed the configure.
+`OnlineResource` has no content hash, so what is left is HTTPS plus an
+immutable URL — good against a mirror serving a different file at the same
+revision, nothing against a corrupted transfer that still answers 200. The
+partial-file dance (`<path>.part`, renamed only when whole) covers an
+interrupted download and not a wrong one. It is the first gap below for that
+reason.
+
+### What this surfaced in eacp
+
+- **No content hash.** `Info` has a `version` but no expected digest, so a
+  caller that knows what the bytes should be cannot say so, and every
+  configure-time `URL_HASH` a project replaces with `OnlineResource` is an
+  integrity check it gives up. `std::string sha256;` on `Info`, checked before
+  the rename into place, would be the whole of it — and the sidecar is already
+  where the answer would be recorded.
+- **A conditional GET over a redirect re-downloads.** HuggingFace answers an
+  LFS file with a 302 to a signed CDN URL; eacp records the ETag of the
+  response it *ended* on, which is the CDN's object hash, and sends that as
+  `If-None-Match` to the original URL on the next fetch. The origin compares
+  against its own ETag, misses, and serves all 151 MB again — measured here by
+  running `Transcribe` twice with `Freshness::check`: both runs downloaded the
+  whole file, while the three small files (whose final response comes from
+  HuggingFace itself, with a weak blob-id ETag) revalidated correctly. The fix
+  is to record the validators of the *first* response in the chain, since that
+  is the URL the next conditional GET is sent to; until then `check` is a trap
+  on any CDN-backed URL and `trust` is the only safe freshness for a large
+  file.
+- **A set of files is not a unit.** A model is four files that are present or
+  absent together, and everything about that is the caller's: the loop, the
+  "are all of them there" check, the order, the error that names which one
+  failed, and progress across the set — `Progress` is one transfer's, so
+  `ModelFetch::Progress` wraps it with a file index and a name, and there is no
+  honest overall fraction to report because only the server knows a file's size
+  before it arrives. A `Group` of `Info`s with one `Result` and one `Progress`
+  would be a third tier worth having.
+- **`OnlineResources::declare()` cannot name a directory.** It takes an `Info`
+  and lists it in the registry's own directory, and the registry's directory is
+  process-global (`setDirectory`). A tree whose resources are deliberately not
+  in `defaultDirectory()` — which is this one, for the per-executable reason
+  above — therefore cannot declare them without moving every other resource in
+  the process, so nothing here declares anything and `UI::OnlineResourceMonitor`
+  lists the four only while they are being fetched. `declare(Info, FilePath)`,
+  or `Entry` keyed by the path it already is keyed by.
+- **No cross-process lock.** Two test binaries whose discovery steps ninja ran
+  in parallel both found the model absent and both downloaded it — 302 MB moved
+  for 151, and the `.part`-then-rename left the result correct, so this is waste
+  rather than corruption. eacp already has `IPC::Lock`; taking one on the path
+  for the duration of a transfer would make a second process wait and then find
+  the file.
+- **`Result` says what happened but not what it cost.** No bytes transferred
+  and no duration, so a caller that wants to report "151 MB in 3.8 s" times the
+  call itself and reads the last `Progress` for the size. Both are already
+  known inside the job.
+- **The main-thread rule needs a third option.** `fetch()` may not be called
+  from inside the loop and `fetchAsync()` does not block, which leaves a
+  library function that wants "have this file before you return" with nothing
+  to call when its caller is already in a callback — the case every test body
+  here is in. The answer was to move the call into each entry point, which is
+  the right answer, but the rule is worth stating in a compile-time or assert
+  form rather than only in a comment: the failure mode of getting it wrong is a
+  re-entrant event loop.

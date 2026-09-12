@@ -1,14 +1,12 @@
 add_executable(Transcribe Main.cpp)
 target_link_libraries(Transcribe PRIVATE WhisperEACP)
 
-# The model the first two argument forms run, copied beside the binary after
-# every link. Called unconditionally: it is a no-op when the build fetched no
-# model, and Whisper::hasBundledModel() is what tells the run which of the
-# three forms it can serve.
-whisper_bundle_model(Transcribe)
+# No model is copied beside this binary: the first two argument forms fetch
+# openai/whisper-tiny.en at startup instead (Model/ModelFetch.h), into a
+# directory every binary in this tree shares. The build downloads nothing.
 
 # The recording the no-argument run transcribes, embedded so that form needs
-# nothing on disk but the model beside it. The ResEmbed runtime key is the
+# nothing on disk at all but the fetched model. The ResEmbed runtime key is the
 # file's basename, which is the "jfk.wav" Main.cpp asks for.
 find_package(ResEmbed REQUIRED)
 res_embed_add(Transcribe

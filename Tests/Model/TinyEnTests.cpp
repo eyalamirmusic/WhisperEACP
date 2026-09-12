@@ -9,10 +9,10 @@
 #include <cstdint>
 
 // The real openai/whisper-tiny.en files, which are a download and never a
-// commit: configure with -DWHISPER_EACP_FETCH_MODEL=ON, or point
-// WHISPER_MODEL_DIR at a checkout that already has them. Every test here
-// returns early when the file it needs is absent, the same shape as a GPU test
-// returning early on an invalid device.
+// commit: this binary's entry point fetched them before the suite opened, or
+// WHISPER_MODEL_DIR points at a checkout that already has them. Every test here
+// returns early when the file it needs is absent — no network, say — the same
+// shape as a GPU test returning early on an invalid device.
 
 using namespace nano;
 using namespace WSP;

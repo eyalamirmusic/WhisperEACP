@@ -217,10 +217,12 @@ std::string MainRoot::statusText() const
 {
     switch (session.state())
     {
+        case ModelState::Downloading:
+            return "downloading model   " + session.downloadText();
+
         case ModelState::Loading:
             return "loading model...";
 
-        case ModelState::NotBundled:
         case ModelState::Failed:
             return session.stateMessage();
 

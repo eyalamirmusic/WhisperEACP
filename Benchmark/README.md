@@ -16,9 +16,10 @@ cmake --build build-release --target Benchmark
 ./build-release/Benchmark/Benchmark
 ```
 
-The option fetches whisper.cpp v1.9.3 and its `ggml-tiny.en.bin` (75 MB); the
-HuggingFace `tiny.en` is copied beside the binary as it is beside
-`Transcribe`. The binary prints the configuration it was built in above its
+The option fetches whisper.cpp v1.9.3 and its `ggml-tiny.en.bin` (75 MB) at
+configure time; the HuggingFace `tiny.en` this side loads is fetched at startup
+as it is by `Transcribe`, into a directory the two share, and the header above
+the numbers says which file each side read. The binary prints the configuration it was built in above its
 numbers, so a run out of the Debug tree says so rather than passing for a
 measurement.
 
@@ -34,6 +35,7 @@ Benchmark --live           jfk.wav on repeat, 30 s of stream, a 1.5 s gap
 Benchmark --live 60        60 s of stream
 Benchmark --live 60 4      a 4 s gap between passes; 0 is speech with no pause in it
 Benchmark --live 60 4 recording.wav
+Benchmark --live --step=2          re-transcribe the open segment every 2 s of audio
 Benchmark --live --audio-ctx=audio    the live loop encoding only the audio it holds
 ```
 
@@ -102,60 +104,98 @@ same boundaries.
 transcription, but keeping up with a microphone. `LiveTranscriber` re-runs the
 open segment every `stepSeconds` of new audio, so a machine that is listening
 pays a full transcribe several times a second, and what it costs is a *share of
-the wall clock* rather than a duration.
+the time it is listening* rather than a duration.
 
 The recording is played on repeat with a gap of silence between passes — a
 microphone left open over somebody who says the same thing again after a pause
 — pushed at a 33 ms tick, which is the timer `Apps/Demo/LiveTranscribe` runs.
-A run that overruns its tick hands the next one a larger block, exactly as the
-capture queue does while the model has the thread. No whisper.cpp on the other
-side: whisper.cpp has no equivalent of this layer, so there is nothing to put
-in a second column.
 
-Every clock in `LiveTranscriber` is audio time, so `runs` is the same number
-every time for a given recording, gap and policy, whatever the machine was
-doing. That is what makes this a before-and-after tool: the run count moves
-only when the policy does, and the seconds under it are the noise.
+**All three contestants take that stream**, one after another, each loaded once,
+and the table has the three columns the comparison has. whisper.cpp has no
+equivalent of this layer, so what its two columns measure is *our* policy
+driving `whisper_full`: `LiveTranscriber` transcribes through a
+`std::function<std::string(Span<const float>)>` rather than through a `Whisper`,
+and the constructor that takes the runtime is that function over
+`Whisper::transcribe`. So the segments, the runs and the audio each run saw are
+the policy's on every side, and only the seconds are the backend's. With
+`--audio-ctx=audio` the per-run context is set on each side from the same
+`Whisper::audioContextForSamples(segment)` — `Whisper::setAudioContext` for
+ours, `whisper_full_params::audio_ctx` for theirs.
+
+Every clock in `LiveTranscriber` is audio time, and the tick delivers a tick's
+worth of samples rather than however many the wall clock ran past, so `runs` is
+the same number for a given recording, gap and policy whatever ran the model.
+That is what makes the three columns comparable, and what makes this a
+before-and-after tool: the run count moves only when the policy does, and the
+seconds under it are the noise. A contestant that cannot keep up falls behind
+the clock rather than skipping runs, and the two stream rows are where that
+shows — `stream, wall clock` longer than `stream, audio` is a backend that took
+longer than the audio it was listening to.
 
 ```
-  stream, wall clock                       30.0 s
-  runs                                         49
-  runs that changed the text                   39
-  model                                    1.280 s
-  duty                                        4.3 %
-  per run, mean                             26.1 ms
-  per run, longest                          35.3 ms
-  encode, mean                              14.2 ms
-  decode, mean                              11.0 ms
-  steps per run                              13.0
-  segments committed                            2
+                                      WhisperEACP    whisper.cpp GPU    whisper.cpp CPU
+  stream, audio                            30.0 s             30.0 s             30.0 s
+  stream, wall clock                       30.0 s             30.0 s             30.0 s
+  runs                                         49                 49                 49
+  runs that changed the text                   39                 39                 39
+  model                                   1.234 s            2.910 s            6.155 s
+  duty                                      4.1 %              9.7 %             20.5 %
+  per run, mean                           25.2 ms            59.4 ms           125.6 ms
+  per run, longest                        50.5 ms           107.0 ms           139.9 ms
+  encode, mean                            13.9 ms            15.1 ms           102.4 ms
+  decode, mean                            10.3 ms            18.3 ms             7.8 ms
+  steps per run                              13.0               13.0               13.0
+  segments committed                            2                  2                  2
+  transcript                            reference               same               same
 ```
 
 `--audio-ctx=audio` runs the stream with `LiveOptions::encodeOnlyTheAudioThereIs`
 on, which is what `Apps/Demo/LiveTranscribe` does: each run encodes the
 segment's audio plus a margin rather than the whole window, and the policy line
 above the table says which of the two a run measured. In the comparison mode the
-same flag sizes the context to the recording, on both sides.
+same flag sizes the context to the recording, on both sides. `--step=<seconds>`
+is `LiveOptions::stepSeconds`, how much new audio the open segment takes before
+it is transcribed again, and it is the one policy knob this mode exposes because
+it is the one that decides how many runs a minute of speech costs.
 
 | row | |
 | --- | --- |
-| `runs` | `Whisper::transcribe` calls the policy asked for. This is the number the policy moves; everything under it is what one of them costs |
-| `runs that changed the text` | of those, the ones whose transcript differed from the run before — a run over audio that told the model nothing is a run that should not have happened |
+| `stream, audio` / `wall clock` | the audio the policy was handed, and how long that took. Equal while a contestant keeps up |
+| `runs` | `transcribe` calls the policy asked for — the same number in every column. This is the number the policy moves; everything under it is what one of them costs |
+| `runs that changed the text` | of those, the ones whose transcript differed from the run before — a run over audio that told the model nothing is a run that should not have happened. It may differ between columns, since it is about what each backend decoded |
 | `model` | the wall clock inside those calls, added up |
-| `duty` | that over the stream's wall clock: **the number this mode exists for**, model seconds per wall second |
+| `duty` | that over the stream's audio: **the number this mode exists for**, model seconds per second listened to. Over 100% is a backend that cannot keep up at this policy |
 | `per run` | the mean and the longest of the same calls. The longest is what a tick can be blocked for, which is the UI's latency rather than the machine's load |
-| `encode` / `decode` / `steps per run` | the same stages the table above breaks out, averaged over the runs |
-| `segments committed` | lines `LiveTranscriber` closed and handed to `committed()`, and the first of them is printed under the table so a policy change that broke the transcript says so |
+| `encode` / `decode` / `steps per run` | the same stages the table above breaks out, averaged over the runs, and read with the same caveat — ours includes the mel, whisper.cpp's does not |
+| `segments committed` | lines `LiveTranscriber` closed and handed to `committed()`, and the first of each column's is printed above the table so a policy change that broke the transcript says so |
+| `transcript` | whether a column committed the same lines ours did, as in the comparison table |
 
 Two things have to be read with it, and both are ways of being wrong about
 this number.
 
-**A run at live cadence costs about twice what the table above measures.** The
-comparison runs back to back and holds the GPU at its clock; half a second of
-idle between 26 ms bursts does not, so the same work that takes ~21 ms there
-takes ~26 ms here, and the first run after a longer gap more. That is a real
-cost of running live, not a measurement artefact, which is why this mode times
-the runs it actually took rather than reusing the median from above.
+**A run at live cadence costs more than the comparison above measures, and how
+much more is what `--step` decides.** The comparison runs back to back and holds
+the GPU at its clock; seconds of idle between 25 ms bursts do not. jfk.wav on
+repeat, a 1.5 s gap, 30 s of stream, the whole window on every side:
+
+| `--step` | 0.5 s | 1.0 s | 1.5 s | 2.0 s |
+| --- | --- | --- | --- | --- |
+| runs | 49 | 31 | 21 | 17 |
+| `WhisperEACP`, per run | 25.2 ms | 23.8 ms | 42.2 ms | 49.8 ms |
+| `whisper.cpp GPU`, per run | 59.4 ms | 50.3 ms | 58.5 ms | 61.9 ms |
+| `whisper.cpp CPU`, per run | 125.6 ms | 121.9 ms | 124.1 ms | 123.8 ms |
+
+The same transcribe costs us 1.8x more with the runs 1.5 s apart than 1 s
+apart, and 2.8x what the comparison mode's 18 ms measures — our encode and our
+decode both roughly double, which is a GPU that clocked down between bursts
+rather than anything the policy did. **whisper.cpp's Metal column barely shows
+it**: its encode does the same thing (14.4 ms to 22.6 ms across the same steps)
+but its decode is flat and its decode is most of its run, so its total moves
+1.2x. The CPU column does not move at all, which is the control. So a wider step
+buys our runtime nothing past a second — 31 runs at 23.8 ms is less model time
+than 21 at 42.2 ms — and that is a real cost of running live rather than a
+measurement artefact, which is why this mode times the runs it actually took
+instead of reusing the median from above.
 
 **macOS's GPU utilisation counter cannot see this.** The `AGXAccelerator`
 `Device Utilization %` in `ioreg`, which is what Activity Monitor shows, is a
@@ -181,7 +221,8 @@ which wall clock was its own.
   missing one with a line.
 
 - **Anything but `tiny.en`** and, by default, anything but `jfk.wav`. The
-  model is the one the build fetches; another WAV is an argument.
+  model is the one each side fetches — ours at startup, theirs at configure
+  time; another WAV is an argument.
 
 - **The microphone**, in `--live`. The samples come from a file at a timer's
   pace, so `Audio/Capture`, its device callback, its queue and its resampling

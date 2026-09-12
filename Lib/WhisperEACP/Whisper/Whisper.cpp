@@ -1,7 +1,5 @@
 #include "Whisper.h"
 
-#include "ResourcesDirectory.h"
-
 #include <WhisperEACP/Model/ModelIO.h>
 
 #include <algorithm>
@@ -49,12 +47,6 @@ std::filesystem::path requireFile(const std::filesystem::path& directory,
     return directory / name;
 }
 
-bool isDirectory(const std::filesystem::path& path)
-{
-    auto error = std::error_code {};
-    return std::filesystem::is_directory(path, error);
-}
-
 using Clock = std::chrono::steady_clock;
 
 double secondsSince(Clock::time_point start)
@@ -88,38 +80,6 @@ void Whisper::load(const ModelFiles& files)
     weightsFile.emplace(SafeTensors::fromView(files.weights));
 
     buildGenerationConfig();
-}
-
-std::filesystem::path Whisper::bundledModelDirectory()
-{
-    return resourcesDirectory() / bundledModelDirectoryName;
-}
-
-bool Whisper::hasBundledModel()
-{
-    const auto directory = bundledModelDirectory();
-
-    return hasFile(directory, configFile) && hasFile(directory, preprocessorFile)
-           && hasFile(directory, tokenizerFile)
-           && hasFile(directory, weightsFileName);
-}
-
-// No directory at all is a build that never asked for the copy, and the message
-// says how to ask. One that is there but short a file is a copy that did not
-// finish, and load() names the file the way it would for any directory.
-void Whisper::loadBundled()
-{
-    const auto directory = bundledModelDirectory();
-
-    if (!isDirectory(directory))
-        throw ModelError {"this binary ships no model: there is no "
-                          + directory.string()
-                          + "; a model is copied there by calling "
-                            "whisper_bundle_model(<target>) in the target's "
-                            "CMakeLists, in a build configured with "
-                            "-DWHISPER_EACP_FETCH_MODEL=ON"};
-
-    load(directory);
 }
 
 void Whisper::buildGenerationConfig()

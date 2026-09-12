@@ -79,8 +79,9 @@ or D3D12 backend, so there is no Linux target.
 
 ## Transcribing
 
-The build copies the `tiny.en` weights beside `Transcribe` and embeds the
-sample in it, so the first form needs nothing but the build tree:
+`Transcribe` fetches the `tiny.en` weights the first time it runs and embeds the
+sample in itself, so the first form needs nothing but the build tree and a
+network:
 
 ```bash
 ./build/Apps/Console/Transcribe/Transcribe
@@ -89,18 +90,20 @@ sample in it, so the first form needs nothing but the build tree:
 ```
 
 ```
-model: /path/to/build/Apps/Console/Transcribe/WhisperModel
+fetching openai/whisper-tiny.en into ~/Library/Application Support/eacp/WhisperEACP/Models/tiny.en
+  model.safetensors (4 of 4)   151.1 of 151.1 MB   100%
+model: ~/Library/Application Support/eacp/WhisperEACP/Models/tiny.en
 audio: built-in jfk.wav
 
  And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
 ```
 
-The model is what makes the default configure download 151 MB. It is copied
-beside the binary after every link rather than compiled into it — into
-`Contents/Resources` for a macOS bundle, next to the executable otherwise — so
-no translation unit ever holds it. Configure with
-`-DWHISPER_EACP_FETCH_MODEL=OFF` to skip the download; the two-argument form
-above still works, and `Whisper::hasBundledModel()` answers `false`.
+The 151 MB of weights is a download, never a commit, and never part of the
+build: `eacp::OnlineResource` fetches the four HuggingFace files at a pinned
+revision into one directory every binary here shares, and every later run finds
+them there and asks the network nothing. A configure downloads none of it, no
+binary carries it, and the two-argument form above points at a HuggingFace repo
+of your own instead.
 
 `Samples/jfk.wav` is 11 seconds of President Kennedy's inaugural address,
 20 January 1961, at 16 kHz mono PCM16 — byte-identical to whisper.cpp v1.9.3's
@@ -113,8 +116,9 @@ is a US government work held by the JFK Library and is
 `Apps/Demo/LiveTranscribe` is the same runtime over a microphone: pick an input
 device and which of its channels to listen to, watch the level meter, and read
 the transcript as it is spoken — closed sentences in white, the one still being
-re-decoded in blue. It carries the model the way `Transcribe` does, so it needs
-nothing on disk either.
+re-decoded in blue. It fetches the model the way `Transcribe` does — in the
+window, with the progress in the status line — so it needs nothing on disk
+either.
 
 ```bash
 open ./build/Apps/Demo/LiveTranscribe/LiveTranscribe.app

@@ -1,3 +1,4 @@
+#include <WhisperEACP/Model/ModelFetch.h>
 #include <WhisperEACP/Tokenizer/Tokenizer.h>
 
 #include <Miro/Json.h>
@@ -98,9 +99,8 @@ const Tokenizer& fixtureTokenizer()
 // Four places, most specific first. The two tokenizer-only ones came first and
 // are kept because they name a file rather than a directory, which is what a
 // checkout that is not a whole HF repo has. The two model-directory ones were
-// added once tokenizer.json joined the fetch: the file is downloaded beside the
-// other three now, so a build configured with -DWHISPER_EACP_FETCH_MODEL=ON runs
-// these without being told where anything is.
+// added once tokenizer.json joined the fetch: the file arrives beside the other
+// three, so a run on a machine with a network needs to be told nothing.
 std::filesystem::path realTokenizerPath()
 {
     const auto exists = [](const std::filesystem::path& path)
@@ -124,7 +124,7 @@ std::filesystem::path realTokenizerPath()
             return inDirectory;
     }
 
-    return std::filesystem::path {WHISPER_EACP_MODEL_DIR} / "tokenizer.json";
+    return ModelFetch::directory() / "tokenizer.json";
 }
 
 bool hasRealTokenizer()

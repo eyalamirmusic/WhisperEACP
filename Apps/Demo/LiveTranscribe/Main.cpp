@@ -27,8 +27,8 @@ constexpr auto usage =
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
     "                   preprocessor_config.json, model.safetensors and\n"
-    "                   tokenizer.json. Left out, the model the build copied\n"
-    "                   beside this binary is used.\n"
+    "                   tokenizer.json. Left out, openai/whisper-tiny.en is\n"
+    "                   fetched once and found on disk after that.\n"
     "  --autostart      open the default input as soon as the model is ready,\n"
     "                   and log a status line a second to stdout, so a run can\n"
     "                   be checked without a hand on the mouse.\n";
@@ -87,15 +87,18 @@ struct App
         panel.refresh(true);
         panel.refreshTranscript();
 
-        // After the window is up, so it appears at once saying it is loading
-        // rather than half a second later already loaded.
-        eacp::Threads::callAsync([this] { finishStartup(); });
+        session.onModelSettled = [this] { modelSettled(); };
+
+        // After the window is up, so it appears at once saying what it is doing
+        // rather than half a second later already loaded — or, on a first run,
+        // while 151 MB of weights arrives.
+        eacp::Threads::callAsync([this] { session.start(); });
     }
 
-    void finishStartup()
+    // The model is Ready or it Failed, and on a first run that is after a
+    // download rather than after half a second of mapping.
+    void modelSettled()
     {
-        session.loadModel();
-
         if (arguments.autostart)
         {
             logStartup();
