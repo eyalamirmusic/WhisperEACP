@@ -317,6 +317,9 @@ auto tTranscribeAsyncOnCoreML = test("Whisper/transcribeAsyncOnCoreML") = []
     const auto tokens = run.waitFor(eacp::Time::MS {30000});
 
     check(!whisper.isTranscribing());
+    check(whisper.lastEncoderPredictSeconds() > 0.0);
+    check(whisper.lastEncodeSeconds()
+          > whisper.lastEncoderMelSeconds() + whisper.lastEncoderPredictSeconds());
     check(tokens.size() == blocking.size());
 
     for (auto index = 0; index < tokens.size() && index < blocking.size(); ++index)

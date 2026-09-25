@@ -146,6 +146,13 @@ landed on develop as `07ee972b`, so the plain fetch has it. A build directory
 configured against an older eacp fails to compile that header; reconfigure so
 CPM fetches the current develop.
 
+**The Core ML backend is on eacp's develop, and this tree requires it.**
+`CoreMLNet` records into eacp's `eacp-ml-graph` and `CoreMLEncoder` runs on its
+`ML::Model`, both of which landed on develop as `b89ea2e5` (merged 2026-09-25),
+so the plain fetch has them. A build directory configured against an older eacp
+fails to build `whisper-net` and `CoreMLEncoder`; reconfigure so CPM fetches the
+current develop.
+
 ## Architecture
 
 New source files are added directly to the module's CMakeLists.txt under the

@@ -699,6 +699,7 @@ eacp::Threads::Async<Vector<TokenId>>
     {
         runInFlight = false;
         encodeSeconds = secondsSince(start);
+        predictSeconds = coreMLEncoder->lastPredictSeconds();
 
         if (!result.ok)
         {

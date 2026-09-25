@@ -96,8 +96,9 @@ public:
     double lastLoadSeconds() const { return loadSeconds; }
 
     // The prediction alone, without either copy across the seam. After an
-    // encodeAsync it runs from the queueing to the resolve on the main thread,
-    // so it includes the wait for the queue and the hop back.
+    // encodeAsync it is the Prediction's own predictSeconds, timed on the
+    // model's queue, so neither the wait for the queue nor the hop back is in
+    // it.
     double lastPredictSeconds() const { return predictSeconds; }
 
 private:

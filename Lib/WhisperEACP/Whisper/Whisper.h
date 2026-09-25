@@ -362,9 +362,9 @@ public:
     // refuses, or a decode that fails, rejects. Main thread only.
     //
     // A run's clocks are the blocking run's, except that encode ends when the
-    // prediction resolves on the main thread rather than when it returns, and
-    // lastEncoderPredictSeconds() is zero, since the prediction is not timed
-    // apart from the hop back to the loop.
+    // prediction resolves on the main thread rather than when it returns, so
+    // it holds the wait for the model's queue and the hop back, which
+    // lastEncoderPredictSeconds(), timed on that queue, does not.
     eacp::Threads::Async<Vector<TokenId>> transcribeAsync(Span<const float> samples);
 
     bool isTranscribing() const { return runInFlight; }

@@ -210,15 +210,14 @@ eacp::Threads::Async<eacp::ML::Result> CoreMLEncoder::encodeAsync(
 
     const auto promise = eacp::Threads::AsyncPromise<eacp::ML::Result> {};
     const auto output = member.rows;
-    const auto start = Clock::now();
     auto* target = &rows;
 
     // this outlives both: the model is a member, and destroying it abandons
     // the prediction's Async, so neither runs after the encoder is gone.
-    const auto copyOut = [this, promise, output, target, positionCount, start](
+    const auto copyOut = [this, promise, output, target, positionCount](
                              const eacp::ML::Prediction& done)
     {
-        predictSeconds = secondsSince(start);
+        predictSeconds = done.predictSeconds;
         finishAsync(positionCount);
 
         if (done.ok)
