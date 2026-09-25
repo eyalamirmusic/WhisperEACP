@@ -46,8 +46,10 @@ struct TensorBuffer
 {
     eacp::GPU::Buffer buffer;
     TensorType storage = TensorType::F32;
+    Vector<int> shape;
 
     bool isPackedHalf() const { return storage == TensorType::F16; }
+    int dimension(int axis) const { return axis < shape.size() ? shape[axis] : 0; }
 };
 
 // A safetensors file: eight bytes of little-endian header length, that many

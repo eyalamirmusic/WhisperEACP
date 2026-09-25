@@ -1,69 +1,102 @@
 #include "Encoder.h"
 
 #include <algorithm>
-#include <cstdint>
 #include <string>
 
 namespace WSP
 {
 using eacp::GPU::Buffer;
-using eacp::GPU::BufferUsage;
+using eacp::GPU::BufferRange;
 using eacp::GPU::ComputePass;
 using eacp::GPU::Device;
 
 namespace
 {
-constexpr int floatBytes(int elementCount)
+// The three projections read the same normalised rows and write three values
+// nothing else has touched, so they are the one place in a layer where a
+// concurrent pass has anything to overlap.
+Tensor selfAttention(Net& net,
+                     const EncoderShape& shape,
+                     const EncoderLayerWeights& weights,
+                     const Tensor& normalised)
 {
-    return elementCount * (int) sizeof(float);
+    const auto queries = net.linear(
+        normalised, weights.queryWeight, &weights.queryBias, Activation::none);
+    const auto keys =
+        net.linear(normalised, weights.keyWeight, nullptr, Activation::none);
+    const auto values = net.linear(
+        normalised, weights.valueWeight, &weights.valueBias, Activation::none);
+
+    return net.attention(queries, keys, values, shape.heads, false);
 }
 
-Buffer allocate(Device& device, int elementCount)
+// Pre-norm, which is what Whisper is: the block normalises what it reads and
+// adds what it computed to what it was given, so the residual is the
+// unnormalised input.
+Tensor encoderLayer(Net& net,
+                    const EncoderShape& shape,
+                    const EncoderLayerWeights& weights,
+                    const Tensor& hidden)
 {
-    return device.makeBuffer(floatBytes(elementCount), BufferUsage::Storage);
-}
+    const auto attended =
+        net.linearAdd(selfAttention(net,
+                                    shape,
+                                    weights,
+                                    net.layerNorm(hidden,
+                                                  weights.attentionNormWeight,
+                                                  weights.attentionNormBias)),
+                      weights.attentionOutputWeight,
+                      &weights.attentionOutputBias,
+                      hidden);
 
-Buffer allocateZeroed(Device& device, int elementCount)
-{
-    auto zeroes = Vector<float> {};
-    zeroes.resize(elementCount);
-
-    for (auto index = 0; index < elementCount; ++index)
-        zeroes[index] = 0.f;
-
-    return device.makeBuffer(
-        zeroes.data(), floatBytes(elementCount), BufferUsage::Storage);
-}
-
-// The projection programs differ only in how they read the weight and in which
-// tiling they compute the product with, so the bind is written once against
-// whichever of them the caller picked: every one of them takes a
-// TiledMatMulShape.
-template <typename Program>
-void dispatchLinear(Program& program,
-                    ComputePass& pass,
-                    const Buffer& input,
-                    const Buffer& weight,
-                    const Buffer& bias,
-                    const Buffer& target,
-                    int innerCount,
-                    int outputWidth,
-                    int rowCount,
-                    bool gelu,
-                    bool residual)
-{
-    program.a = input;
-    program.b = weight;
-    program.bias = bias;
-    program.output = target;
-
-    auto shape = TiledMatMulShape::forLinear(rowCount, innerCount, outputWidth);
-    shape.gelu = gelu;
-    shape.residual = residual;
-
-    program.dispatch(pass, shape);
+    return net.linearAdd(
+        net.linear(
+            net.layerNorm(attended, weights.finalNormWeight, weights.finalNormBias),
+            weights.feedForwardWeight,
+            &weights.feedForwardBias,
+            Activation::gelu),
+        weights.feedForwardOutputWeight,
+        &weights.feedForwardOutputBias,
+        attended);
 }
 } // namespace
+
+// Each convolution carries its padding and the GELU on its store, and reads its
+// input frame-major: the mel is turned from band-major before the first, and
+// the first writes frame-major, which is HuggingFace's permute after the
+// second convolution done by the first one's store.
+void recordEncoder(Net& net,
+                   const EncoderShape& shape,
+                   const EncoderWeights& weights,
+                   const Binding& mel,
+                   const Binding& rows,
+                   int inputFrames)
+{
+    const auto frames =
+        net.transpose(net.input(mel, {shape.melBins, inputFrames}, DType::float32));
+
+    auto hidden = net.conv1d(net.conv1d(frames,
+                                        weights.firstConvolutionWeight,
+                                        weights.firstConvolutionBias,
+                                        EncoderShape::firstConvolutionStride,
+                                        EncoderShape::convolutionPadding,
+                                        Activation::gelu),
+                             weights.secondConvolutionWeight,
+                             weights.secondConvolutionBias,
+                             EncoderShape::secondConvolutionStride,
+                             EncoderShape::convolutionPadding,
+                             Activation::gelu);
+
+    hidden = net.add(
+        hidden,
+        net.rows(weights.positionalEmbedding, 0, shape.positions(inputFrames)));
+
+    for (auto index = 0; index < shape.layers; ++index)
+        hidden = encoderLayer(net, shape, weights.layers[index], hidden);
+
+    net.output(net.layerNorm(hidden, weights.finalNormWeight, weights.finalNormBias),
+               rows);
+}
 
 Encoder::Encoder(const EncoderShape& shapeToUse)
     : encoderShape(shapeToUse)
@@ -72,335 +105,33 @@ Encoder::Encoder(const EncoderShape& shapeToUse)
 
 void Encoder::prepare(Device& device)
 {
-    unfold.prepare(device);
-    sum.prepare(device);
-    normalisation.prepare(device);
-    projection.prepare(device);
-    packedProjection.prepare(device);
-    scores.prepare(device);
-    attention.prepare(device);
-
-    const auto convolutionElements = encoderShape.convolutionElementCount();
-    const auto elements = encoderShape.elementCount();
     constexpr auto taps = EncoderShape::convolutionKernelSize;
+    const auto positions = encoderShape.positions();
+    const auto width = encoderShape.width;
 
-    columns.emplace(allocate(
-        device,
+    auto layout = KernelNetLayout {};
+    layout.heads = encoderShape.heads;
+    layout.headWidth = encoderShape.headWidth();
+    layout.widestLayerOutput = encoderShape.feedForwardWidth;
+    layout.columnElements =
         std::max(encoderShape.convolutionFrames() * encoderShape.melBins * taps,
-                 encoderShape.positions() * encoderShape.width * taps)));
-    convolved.emplace(allocate(device, convolutionElements));
+                 positions * width * taps);
 
-    hidden.emplace(allocate(device, elements));
-    normalised.emplace(allocate(device, elements));
-    queries.emplace(allocate(device, elements));
-    keys.emplace(allocate(device, elements));
-    values.emplace(allocate(device, elements));
-    attended.emplace(allocate(device, elements));
+    layout.scratch.add(
+        ScratchReservation {encoderShape.convolutionElementCount(), 1});
+    layout.scratch.add(ScratchReservation {encoderShape.elementCount(), 6});
+    layout.scratch.add(
+        ScratchReservation {encoderShape.feedForwardElementCount(), 1});
+    layout.attention.add(AttentionReservation {positions, positions});
+    layout.zeroBiasLengths.add(
+        std::max({width, encoderShape.feedForwardWidth, positions}));
 
-    attentionScores.emplace(allocate(device, encoderShape.scoreElementCount()));
-    attentionTileMaxima.emplace(allocate(
-        device,
-        encoderShape.scoreRowCount() * scoreColumnTiles(encoderShape.positions())));
-    feedForward.emplace(allocate(device, encoderShape.feedForwardElementCount()));
-
-    zeroBias.emplace(allocateZeroed(device,
-                                    std::max({encoderShape.width,
-                                              encoderShape.feedForwardWidth,
-                                              encoderShape.positions()})));
+    net.prepare(device, layout);
 }
 
 void Encoder::prepare()
 {
     prepare(Device::shared());
-}
-
-void Encoder::encodeSum(ComputePass& pass,
-                        const Buffer& stream,
-                        const Buffer& addend)
-{
-    sum.output = stream;
-    sum.addend = addend;
-
-    pass.dispatch(sum, positions() * encoderShape.width);
-}
-
-void Encoder::encodeLayerNorm(ComputePass& pass,
-                              const Buffer& input,
-                              const TensorBuffer& weight,
-                              const TensorBuffer& bias,
-                              const Buffer& target)
-{
-    normalisation.input = input;
-    normalisation.weight = weight.buffer;
-    normalisation.bias = bias.buffer;
-    normalisation.output = target;
-    normalisation.rowLength = (std::uint32_t) encoderShape.width;
-
-    normalisation.dispatchRows(pass, positions());
-}
-
-// The one place a weight's storage decides anything: a tensor the loader left
-// packed goes to the program that reads packed halves, and one it uploaded as
-// floats to the program that subscripts floats. Neither can read the other's
-// buffer, which is why the choice is made from the buffer rather than from a
-// build-time switch.
-void Encoder::encodeLinear(ComputePass& pass,
-                           const Buffer& input,
-                           const TensorBuffer& weight,
-                           const Buffer& bias,
-                           const Buffer& target,
-                           int innerCount,
-                           int outputWidth,
-                           int rowCount,
-                           bool gelu,
-                           bool residual)
-{
-    if (weight.isPackedHalf())
-        dispatchLinear(packedProjection,
-                       pass,
-                       input,
-                       weight.buffer,
-                       bias,
-                       target,
-                       innerCount,
-                       outputWidth,
-                       rowCount,
-                       gelu,
-                       residual);
-    else
-        dispatchLinear(projection,
-                       pass,
-                       input,
-                       weight.buffer,
-                       bias,
-                       target,
-                       innerCount,
-                       outputWidth,
-                       rowCount,
-                       gelu,
-                       residual);
-}
-
-void Encoder::encodeUnfold(ComputePass& pass,
-                           const Buffer& input,
-                           int inputChannelCount,
-                           int inputLength,
-                           int stride,
-                           int inputChannelStride,
-                           int inputFrameStride,
-                           int outputLength)
-{
-    constexpr auto taps = EncoderShape::convolutionKernelSize;
-
-    unfold.input = input;
-    unfold.columns = *columns;
-    unfold.inputChannelCount = (std::uint32_t) inputChannelCount;
-    unfold.inputLength = (std::uint32_t) inputLength;
-    unfold.kernelSize = (std::uint32_t) taps;
-    unfold.stride = (std::uint32_t) stride;
-    unfold.padding = (std::uint32_t) EncoderShape::convolutionPadding;
-    unfold.inputChannelStride = (std::uint32_t) inputChannelStride;
-    unfold.inputFrameStride = (std::uint32_t) inputFrameStride;
-
-    pass.dispatch(unfold, inputChannelCount * taps, outputLength);
-}
-
-// Each convolution is its windows unfolded into rows and one tiled product of
-// them against the weight as the file lays it out, [out, in, k] being
-// [out, in * k], with the GELU on the store. conv1 reads the mel band-major
-// and writes frame-major, which is what conv2 unfolds at a stride of two and
-// what the transformer reads — HuggingFace's permute after the second
-// convolution, done by the first one's store.
-void Encoder::encodeFrontEnd(ComputePass& pass,
-                             const Buffer& mel,
-                             const EncoderWeights& weights)
-{
-    const auto width = encoderShape.width;
-    constexpr auto taps = EncoderShape::convolutionKernelSize;
-
-    // The bound and the stride are two different numbers here for the first
-    // time: the mel buffer is the window's, so a band still starts every
-    // inputFrames of the *shape*, and only how far into it this run reads is
-    // the prefix's.
-    encodeUnfold(pass,
-                 mel,
-                 encoderShape.melBins,
-                 inputFrames(),
-                 EncoderShape::firstConvolutionStride,
-                 encoderShape.inputFrames,
-                 1,
-                 convolutionFrames());
-
-    pass.barrier();
-
-    encodeLinear(pass,
-                 *columns,
-                 weights.firstConvolutionWeight,
-                 weights.firstConvolutionBias.buffer,
-                 *convolved,
-                 encoderShape.melBins * taps,
-                 width,
-                 convolutionFrames(),
-                 true,
-                 false);
-
-    pass.barrier();
-
-    encodeUnfold(pass,
-                 *convolved,
-                 width,
-                 convolutionFrames(),
-                 EncoderShape::secondConvolutionStride,
-                 1,
-                 width,
-                 positions());
-
-    pass.barrier();
-
-    encodeLinear(pass,
-                 *columns,
-                 weights.secondConvolutionWeight,
-                 weights.secondConvolutionBias.buffer,
-                 *hidden,
-                 width * taps,
-                 width,
-                 positions(),
-                 true,
-                 false);
-
-    pass.barrier();
-
-    encodeSum(pass, *hidden, weights.positionalEmbedding.buffer);
-}
-
-void Encoder::encodeAttention(ComputePass& pass, const EncoderLayerWeights& weights)
-{
-    const auto width = encoderShape.width;
-    const auto rows = positions();
-
-    encodeLinear(pass,
-                 *normalised,
-                 weights.queryWeight,
-                 weights.queryBias.buffer,
-                 *queries,
-                 width,
-                 width,
-                 rows);
-
-    encodeLinear(
-        pass, *normalised, weights.keyWeight, *zeroBias, *keys, width, width, rows);
-
-    encodeLinear(pass,
-                 *normalised,
-                 weights.valueWeight,
-                 weights.valueBias.buffer,
-                 *values,
-                 width,
-                 width,
-                 rows);
-
-    // The three projections above read the same normalised rows and write three
-    // buffers nothing else has touched, so they are the one place in a layer
-    // where a concurrent pass has anything to overlap. Everything from here on
-    // reads what the dispatch before it wrote.
-    pass.barrier();
-
-    // The scores are a product of the queries against the keys, one batch per
-    // head over the head's columns, in the same layout as the projections: a
-    // key row is contiguous along the head dimension exactly as a weight row
-    // is along its inputs.
-    scores.a = *queries;
-    scores.b = *keys;
-    scores.bias = *zeroBias;
-    scores.output = *attentionScores;
-    scores.tileMaxima = *attentionTileMaxima;
-
-    scores.dispatch(
-        pass,
-        TiledMatMulShape::forAttentionScores(rows,
-                                             rows,
-                                             encoderShape.heads,
-                                             encoderShape.headWidth(),
-                                             width,
-                                             encoderShape.attentionScale(),
-                                             false));
-
-    pass.barrier();
-
-    attention.a = *attentionScores;
-    attention.b = *values;
-    attention.bias = *zeroBias;
-    attention.output = *attended;
-    attention.rowMaxima = *attentionTileMaxima;
-
-    attention.dispatch(
-        pass,
-        TiledMatMulShape::forAttentionApply(
-            rows, rows, encoderShape.heads, encoderShape.headWidth(), width));
-}
-
-// Pre-norm, which is what Whisper is: the block normalises what it reads and
-// adds what it computed to what it was given, so the residual is the
-// unnormalised input, and hidden is added to in place by each sublayer's last
-// projection.
-void Encoder::encodeLayer(ComputePass& pass, const EncoderLayerWeights& weights)
-{
-    const auto width = encoderShape.width;
-    const auto rows = positions();
-
-    encodeLayerNorm(pass,
-                    *hidden,
-                    weights.attentionNormWeight,
-                    weights.attentionNormBias,
-                    *normalised);
-
-    pass.barrier();
-
-    encodeAttention(pass, weights);
-
-    pass.barrier();
-
-    encodeLinear(pass,
-                 *attended,
-                 weights.attentionOutputWeight,
-                 weights.attentionOutputBias.buffer,
-                 *hidden,
-                 width,
-                 width,
-                 rows,
-                 false,
-                 true);
-
-    pass.barrier();
-
-    encodeLayerNorm(
-        pass, *hidden, weights.finalNormWeight, weights.finalNormBias, *normalised);
-
-    pass.barrier();
-
-    encodeLinear(pass,
-                 *normalised,
-                 weights.feedForwardWeight,
-                 weights.feedForwardBias.buffer,
-                 *feedForward,
-                 width,
-                 encoderShape.feedForwardWidth,
-                 rows,
-                 true,
-                 false);
-
-    pass.barrier();
-
-    encodeLinear(pass,
-                 *feedForward,
-                 weights.feedForwardOutputWeight,
-                 weights.feedForwardOutputBias.buffer,
-                 *hidden,
-                 encoderShape.feedForwardWidth,
-                 width,
-                 rows,
-                 false,
-                 true);
 }
 
 void Encoder::encode(ComputePass& pass,
@@ -418,23 +149,21 @@ void Encoder::encode(ComputePass& pass,
             "an encoder built for " + std::to_string(encoderShape.positions())
             + " positions was asked to run over " + std::to_string(positionCount)};
 
-    runInputFrames = positionCount == 0
-                         ? encoderShape.inputFrames
-                         : encoderShape.framesForPositions(positionCount);
-    runConvolutionFrames = encoderShape.convolutionFrames(runInputFrames);
-    runPositions = encoderShape.positions(runInputFrames);
+    const auto inputFrames = positionCount == 0
+                                 ? encoderShape.inputFrames
+                                 : encoderShape.framesForPositions(positionCount);
 
-    encodeFrontEnd(pass, mel, weights);
+    const auto melBinding =
+        Binding {BufferRange::of(mel),
+                 Shape {encoderShape.melBins, encoderShape.inputFrames}};
 
-    for (auto index = 0; index < encoderShape.layers; ++index)
-    {
-        pass.barrier();
-        encodeLayer(pass, weights.layers[index]);
-    }
-
-    pass.barrier();
-
-    encodeLayerNorm(
-        pass, *hidden, weights.finalNormWeight, weights.finalNormBias, output);
+    net.begin(pass);
+    recordEncoder(net,
+                  encoderShape,
+                  weights,
+                  melBinding,
+                  Binding {BufferRange::of(output), {}},
+                  inputFrames);
+    net.end();
 }
 } // namespace WSP

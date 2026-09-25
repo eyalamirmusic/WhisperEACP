@@ -208,6 +208,14 @@ TensorInfo parseTensor(const std::string& name,
     return tensor;
 }
 
+void assignShape(TensorBuffer& uploaded, const TensorInfo& tensor)
+{
+    uploaded.shape.clear();
+
+    for (auto extent: tensor.shape)
+        uploaded.shape.add(static_cast<int>(extent));
+}
+
 eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
 {
     return eacp::GPU::Device::shared().makeBuffer(
@@ -246,7 +254,8 @@ TensorBuffer uploadWidenedFloats(const Vector<float>& values,
     return {eacp::GPU::Device::shared().makeBuffer(values.data(),
                                                    static_cast<int>(byteCount),
                                                    eacp::GPU::BufferUsage::Storage),
-            TensorType::F32};
+            TensorType::F32,
+            {}};
 }
 
 // float32 to IEEE binary16, round to nearest even, overflowing to infinity —
@@ -516,36 +525,55 @@ void SafeTensors::readFloats(std::string_view name, Span<float> destination) con
     widenToFloat(tensor, rawBytes(tensor), destination);
 }
 
-TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
+namespace
 {
-    const auto& tensor = info(name);
-
+TensorBuffer uploadInFileLayout(const SafeTensors& file, const TensorInfo& tensor)
+{
     // Already a layout a kernel binds, so these go straight from the blob
     // rather than through a widened copy of themselves: F32 as the floats a
     // subscript reads, F16 as the packed halves readHalf reads.
     if (tensor.type == TensorType::F32)
-        return {uploadBytes(rawBytes(tensor)), tensor.type};
+        return {uploadBytes(file.rawBytes(tensor)), tensor.type, {}};
 
     if (tensor.type == TensorType::F16)
-        return {uploadPackedHalves(rawBytes(tensor)), tensor.type};
+        return {uploadPackedHalves(file.rawBytes(tensor)), tensor.type, {}};
 
     // BF16 and F64 have no shader read of their own, so the conversion has to
     // happen somewhere and doing it once here beats doing it in every kernel.
-    return uploadWidenedFloats(readFloats(name), tensor.name);
+    return uploadWidenedFloats(file.readFloats(tensor.name), tensor.name);
+}
+
+TensorBuffer uploadAsFloats(const SafeTensors& file, const TensorInfo& tensor)
+{
+    if (tensor.type == TensorType::F32)
+        return {uploadBytes(file.rawBytes(tensor)), tensor.type, {}};
+
+    // F16 joins BF16 and F64 on the widening path here, rather than going up
+    // packed as makeBuffer would have it: the caller binds this to a program
+    // that subscripts floats, and a packed buffer there would be read at half
+    // the stride it was written at, silently, on both backends.
+    return uploadWidenedFloats(file.readFloats(tensor.name), tensor.name);
+}
+} // namespace
+
+TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    auto uploaded = uploadInFileLayout(*this, tensor);
+    assignShape(uploaded, tensor);
+
+    return uploaded;
 }
 
 TensorBuffer SafeTensors::makeFloatBuffer(std::string_view name) const
 {
     const auto& tensor = info(name);
 
-    if (tensor.type == TensorType::F32)
-        return {uploadBytes(rawBytes(tensor)), tensor.type};
+    auto uploaded = uploadAsFloats(*this, tensor);
+    assignShape(uploaded, tensor);
 
-    // F16 joins BF16 and F64 on the widening path here, rather than going up
-    // packed as makeBuffer would have it: the caller binds this to a program
-    // that subscripts floats, and a packed buffer there would be read at half
-    // the stride it was written at, silently, on both backends.
-    return uploadWidenedFloats(readFloats(name), tensor.name);
+    return uploaded;
 }
 
 std::optional<TensorBuffer>
@@ -582,6 +610,9 @@ std::optional<TensorBuffer>
         reinterpret_cast<const std::uint8_t*>(halves.data()),
         static_cast<int>(byteCount)};
 
-    return TensorBuffer {uploadPackedHalves(bytes), TensorType::F16};
+    auto uploaded = TensorBuffer {uploadPackedHalves(bytes), TensorType::F16, {}};
+    assignShape(uploaded, tensor);
+
+    return uploaded;
 }
 } // namespace WSP
