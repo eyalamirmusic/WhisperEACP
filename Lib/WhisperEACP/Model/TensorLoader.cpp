@@ -65,6 +65,9 @@ TensorBuffer TensorLoader::loadFloatTensor(const std::string& name,
 {
     checkShape(require(name), expected);
 
+    if (placement == WeightPlacement::Host)
+        return file.makeHostTensor(name);
+
     return file.makeFloatBuffer(name);
 }
 
@@ -73,6 +76,9 @@ TensorBuffer TensorLoader::loadProjectionWeight(const std::string& name,
                                                 WeightPacking packing) const
 {
     checkShape(require(name), expected);
+
+    if (placement == WeightPlacement::Host)
+        return file.makeHostTensor(name);
 
     if (packing == WeightPacking::ExactHalf)
         if (auto packed = file.makeExactHalfBuffer(name))

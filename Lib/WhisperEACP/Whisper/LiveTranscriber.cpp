@@ -78,28 +78,47 @@ void LiveTranscriber::push(Span<const float> samples)
 
 // At most one model run a call, which is what makes this safe to drive from a
 // 20-30 Hz timer: a segment that closes takes the run and leaves the rest of
-// the incoming audio for the next call.
+// the incoming audio for the next call. While a run is in flight the audio
+// stays in the queue, so the segment the run was handed is the one its result
+// is applied to.
 bool LiveTranscriber::update()
 {
+    throwRunFailure();
+
+    if (runInFlight)
+        return takeChange();
+
     while (takeNextBlock())
     {
         if (segmentIsFull() || silenceClosesTheSegment())
-            return closeSegment();
+        {
+            closeSegment();
+            return takeChange();
+        }
     }
 
-    return runIsDue() && runModel();
+    if (runIsDue())
+        startRun(false);
+
+    return takeChange();
 }
 
 void LiveTranscriber::flush()
 {
+    waitForRun();
+
     while (takeNextBlock())
     {
         if (segmentIsFull())
+        {
             closeSegment();
+            waitForRun();
+        }
     }
 
     takeRemainingSamples();
     closeSegment();
+    waitForRun();
 }
 
 void LiveTranscriber::clear()
@@ -110,7 +129,11 @@ void LiveTranscriber::clear()
     startSegment();
 
     runCount = 0;
+    textChangeCount = 0;
     lastRun = 0.0;
+    hasChanged = false;
+    runFailure.clear();
+    ++generation;
 }
 
 LiveStats LiveTranscriber::stats() const
@@ -119,7 +142,9 @@ LiveStats LiveTranscriber::stats() const
             lastRun,
             secondsForSamples(segment.size()),
             secondsForSamples(speechSamples),
-            segmentHasSpeech};
+            segmentHasSpeech,
+            runInFlight,
+            textChangeCount};
 }
 
 bool LiveTranscriber::takeNextBlock()
@@ -223,43 +248,135 @@ bool LiveTranscriber::runIsDue() const
 // The context is set per run rather than once, because the segment grows: a
 // run over 2 s of it encodes fewer positions than the run over 6 s that closes
 // it, and the count each one wants is the one its own audio fills.
-bool LiveTranscriber::runModel()
+//
+// On the kernels the Async is resolved before transcribeAsync returns, so the
+// continuation runs inside then() and the run is over when this returns.
+void LiveTranscriber::startRun(bool closesTheSegment)
 {
     if (liveOptions.encodeOnlyTheAudioThereIs)
         model.setAudioContext(Whisper::audioContextForSamples(
             segment.size(), liveOptions.audioContextMarginSeconds));
 
     const auto start = std::chrono::steady_clock::now();
-    const auto tokens = model.transcribe(segment);
-    const auto text = withoutSurroundingSpace(model.textForTokens(tokens));
-    const auto elapsed = std::chrono::steady_clock::now() - start;
+    pendingRun = model.transcribeAsync(segment);
+    runInFlight = true;
 
-    lastRun = std::chrono::duration<double>(elapsed).count();
+    const auto alive = std::weak_ptr<int> {lifetime};
+    const auto runGeneration = generation;
+
+    const auto finish = [this, alive, runGeneration, start, closesTheSegment](
+                            const Vector<TokenId>& tokens)
+    {
+        if (alive.expired())
+            return;
+
+        runInFlight = false;
+
+        if (runGeneration != generation)
+            return;
+
+        const auto elapsed = std::chrono::steady_clock::now() - start;
+        finishRun(withoutSurroundingSpace(model.textForTokens(tokens)),
+                  std::chrono::duration<double>(elapsed).count(),
+                  closesTheSegment);
+    };
+
+    const auto fail = [this, alive, runGeneration](const std::string& error)
+    {
+        if (alive.expired())
+            return;
+
+        runInFlight = false;
+
+        if (runGeneration == generation)
+            runFailure = error;
+    };
+
+    pendingRun.then(finish, fail);
+}
+
+void LiveTranscriber::finishRun(const std::string& text,
+                                double seconds,
+                                bool closesTheSegment)
+{
+    lastRun = seconds;
     ++runCount;
     coveredSamples = segment.size();
     coveredSpeechSamples = speechSamples;
     hasRunThisSegment = true;
 
-    if (text == pendingText)
-        return false;
+    if (text != pendingText)
+    {
+        pendingText = text;
+        hasChanged = true;
+        ++textChangeCount;
+    }
 
-    pendingText = text;
-
-    return true;
+    if (closesTheSegment)
+        commitSegment();
 }
 
-bool LiveTranscriber::closeSegment()
+void LiveTranscriber::closeSegment()
 {
-    auto changed = hasAudioWorthTranscribing() && runModel();
+    if (hasAudioWorthTranscribing())
+        startRun(true);
+    else
+        commitSegment();
+}
 
+void LiveTranscriber::commitSegment()
+{
     if (!pendingText.empty())
     {
         committedText.add(pendingText);
         pendingText.clear();
-        changed = true;
+        hasChanged = true;
     }
 
     startSegment();
+}
+
+// A rejection has already been through the run's own fail continuation, which
+// kept the error only if the run belongs to this generation, so it is thrown
+// from there; one from before a clear() is dropped, as a late result is. A
+// timeout abandons nothing: the run stays in flight and lands on a later
+// update().
+void LiveTranscriber::waitForRun()
+{
+    if (runInFlight)
+    {
+        try
+        {
+            pendingRun.waitFor(eacp::Time::MS {runTimeoutMilliseconds});
+        }
+        catch (const eacp::Threads::AsyncError&)
+        {
+            if (!pendingRun.isReady())
+                throw ModelError {"the live transcriber's run did not come back "
+                                  "within "
+                                  + std::to_string(runTimeoutMilliseconds)
+                                  + " ms, and is still in flight"};
+        }
+    }
+
+    throwRunFailure();
+}
+
+void LiveTranscriber::throwRunFailure()
+{
+    if (runFailure.empty())
+        return;
+
+    const auto failure = runFailure;
+    runFailure.clear();
+
+    throw ModelError {"the live transcriber's run failed: " + failure};
+}
+
+bool LiveTranscriber::takeChange()
+{
+    const auto changed = hasChanged;
+    hasChanged = false;
 
     return changed;
 }

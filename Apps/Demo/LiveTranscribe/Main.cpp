@@ -23,7 +23,7 @@ namespace LiveTranscribe
 namespace
 {
 constexpr auto usage =
-    "usage: LiveTranscribe [--autostart] [model directory]\n"
+    "usage: LiveTranscribe [--autostart] [--coreml] [model directory]\n"
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
     "                   preprocessor_config.json, model.safetensors and\n"
@@ -31,7 +31,10 @@ constexpr auto usage =
     "                   beside this binary is used.\n"
     "  --autostart      open the default input as soon as the model is ready,\n"
     "                   and log a status line a second to stdout, so a run can\n"
-    "                   be checked without a hand on the mouse.\n";
+    "                   be checked without a hand on the mouse.\n"
+    "  --coreml         run the encoder on Core ML's Neural Engine rather than\n"
+    "                   the GPU kernels, where the machine can. The first run on\n"
+    "                   a machine compiles it for the engine, about 14 s.\n";
 
 constexpr auto ticksPerSecond = 30;
 constexpr auto ticksBetweenDeviceScans = ticksPerSecond * 5;
@@ -40,6 +43,7 @@ struct Arguments
 {
     std::string modelDirectory;
     bool autostart = false;
+    bool coreML = false;
     bool understood = true;
 };
 
@@ -53,6 +57,8 @@ Arguments parseArguments(int argc, char* argv[])
 
         if (argument == "--autostart")
             arguments.autostart = true;
+        else if (argument == "--coreml")
+            arguments.coreML = true;
         else if (arguments.modelDirectory.empty() && !argument.starts_with("--"))
             arguments.modelDirectory = argv[i];
         else
@@ -164,7 +170,7 @@ struct App
         std::fflush(stdout);
     }
 
-    Session session {arguments.modelDirectory};
+    Session session {arguments.modelDirectory, arguments.coreML};
 
     MainPanel panel {session};
     eacp::Graphics::Window window {makeWindowOptions()};

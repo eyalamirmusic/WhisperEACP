@@ -89,6 +89,28 @@ inline Whisper& preparedModel()
     return *model;
 }
 
+// The same with the encoder on Core ML under its default units, the engine,
+// shared for the same reason. The first prepare on a machine compiles the
+// eighteen-context model for the engine, about 14 s, into the cache every test
+// binary shares; every one after it finds the compile there.
+//
+// Only ever reached from a test that has already checked hasWhisperModel()
+// and Whisper::supportsEncoderBackend(EncoderBackend::coreML).
+inline Whisper& coreMLPreparedModel()
+{
+    static const auto model = []
+    {
+        auto whisper = std::make_unique<Whisper>();
+        whisper->load(modelDirectory());
+        whisper->setEncoderBackend(EncoderBackend::coreML);
+        whisper->setEncoderCacheDirectory(sharedCoreMLCacheDirectory());
+        whisper->prepare();
+        return whisper;
+    }();
+
+    return *model;
+}
+
 inline std::string trimmed(const std::string& text)
 {
     const auto first = text.find_first_not_of(" \t\n");

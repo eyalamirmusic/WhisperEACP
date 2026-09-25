@@ -1,6 +1,7 @@
 #include "Encoder.h"
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 
 namespace WSP
@@ -144,6 +145,10 @@ void Encoder::encode(ComputePass& pass,
         throw ModelError {"the weights were loaded against a different encoder "
                           "shape than this encoder was built for"};
 
+    if (weights.placement != WeightPlacement::Device)
+        throw std::logic_error {"the kernel encoder binds GPU buffers, and these "
+                                "weights were loaded for the host"};
+
     if (positionCount < 0 || positionCount > encoderShape.positions())
         throw ModelError {
             "an encoder built for " + std::to_string(encoderShape.positions())
@@ -155,14 +160,15 @@ void Encoder::encode(ComputePass& pass,
 
     const auto melBinding =
         Binding {BufferRange::of(mel),
-                 Shape {encoderShape.melBins, encoderShape.inputFrames}};
+                 Shape {encoderShape.melBins, encoderShape.inputFrames},
+                 "mel"};
 
     net.begin(pass);
     recordEncoder(net,
                   encoderShape,
                   weights,
                   melBinding,
-                  Binding {BufferRange::of(output), {}},
+                  Binding {BufferRange::of(output), {}, "rows"},
                   inputFrames);
     net.end();
 }

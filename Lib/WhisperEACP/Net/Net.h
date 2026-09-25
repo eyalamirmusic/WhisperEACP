@@ -3,6 +3,7 @@
 #include <WhisperEACP/Model/SafeTensors.h>
 
 #include <initializer_list>
+#include <string>
 
 namespace WSP
 {
@@ -57,10 +58,14 @@ private:
 // slots. capacity is the whole of what range holds, row-major, when that is
 // more than the shape a run reads out of it — the mel's 3000 frames a shorter
 // context reads the first few of, or the token slots a step reads one of.
+//
+// name is the feature a compiled model addresses it by. The kernel backend
+// binds by range and never reads it.
 struct Binding
 {
     eacp::GPU::BufferRange range;
     Shape capacity;
+    std::string name;
 };
 
 // Rows a sequence keeps between recordings, which a projection appends to in
@@ -91,6 +96,7 @@ public:
     ~Tensor();
 
     bool isValid() const { return owner != nullptr; }
+    bool isOwnedBy(const Net& net) const { return owner == &net; }
     int index() const { return id; }
 
 private:

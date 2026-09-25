@@ -5,6 +5,7 @@
 #include <cmath>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <utility>
 
 using namespace nano;
@@ -711,4 +712,89 @@ auto tExactHalfBufferPassesHalvesThrough =
     check(packed.has_value());
     check(packed->isPackedHalf());
     check(deviceBytesEqual(packed->buffer, file.rawBytes("w")));
+};
+
+// A host tensor is the file's bytes and nothing on the device: the shape, a
+// view into the blob, and the file's own type, whether that is F32 or F16.
+auto tHostTensorIsTheFile = test("Model/SafeTensors/hostTensorIsTheFile") = []
+{
+    const auto file = SafeTensors::fromBytes(mixedTensorFile());
+
+    const auto bias = file.makeHostTensor("bias");
+    check(bias.isHostOnly());
+    check(!bias.buffer.isValid());
+    check(bias.fileType == TensorType::F32);
+    check(bias.shape.size() == 1);
+    check(bias.dimension(0) == 2);
+    check(bias.fileBytes.size() == 8);
+    check(bias.fileBytes.data() == file.rawBytes("bias").data());
+    check(readFileFloats(bias) == file.readFloats("bias"));
+
+    const auto weight = file.makeHostTensor("weight");
+    check(weight.isHostOnly());
+    check(weight.fileType == TensorType::F16);
+    check(weight.dimension(0) == 4);
+    check(weight.fileBytes.size() == 8);
+    check(weight.fileBytes == file.rawBytes("weight"));
+
+    const auto widened = readFileFloats(weight);
+    check(widened == file.readFloats("weight"));
+    check(widened[0] == 1.0f);
+    check(widened[1] == -2.0f);
+    check(widened[3] == 2.0f);
+};
+
+// Every upload carries the same view of the file beside its buffer, and what
+// the device holds reads back as the floats the host view widens to.
+auto tUploadsCarryTheFileBytes =
+    test("Model/SafeTensors/uploadsCarryTheFileBytes") = []
+{
+    if (!eacp::GPU::Device::shared().isValid())
+        return;
+
+    const auto file = SafeTensors::fromBytes(mixedTensorFile());
+
+    for (const auto* name: {"bias", "weight"})
+    {
+        const auto host = file.makeHostTensor(name);
+        const auto uploaded = file.makeFloatBuffer(name);
+
+        check(!uploaded.isHostOnly());
+        check(uploaded.fileType == host.fileType);
+        check(uploaded.fileBytes == host.fileBytes);
+        check(uploaded.shape == host.shape);
+
+        auto readBack = Vector<float> {};
+        readBack.resize(uploaded.buffer.size() / (int) sizeof(float));
+        uploaded.buffer.read(readBack.data(), uploaded.buffer.size());
+
+        check(readBack == readFileFloats(host));
+    }
+
+    const auto packed = file.makeBuffer("weight");
+    check(packed.isPackedHalf());
+    check(packed.fileType == TensorType::F16);
+    check(packed.fileBytes == file.rawBytes("weight"));
+};
+
+auto tReadFileFloatsNeedsFileBytes =
+    test("Model/SafeTensors/readFileFloatsNeedsFileBytes") = []
+{
+    const auto file = SafeTensors::fromBytes(singleTensorFile());
+
+    auto stripped = file.makeHostTensor("weight");
+    stripped.fileBytes = {};
+
+    auto threwLogicError = false;
+
+    try
+    {
+        readFileFloats(stripped);
+    }
+    catch (const std::logic_error&)
+    {
+        threwLogicError = true;
+    }
+
+    check(threwLogicError);
 };

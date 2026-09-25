@@ -1,10 +1,14 @@
 #pragma once
 
 #include <WhisperEACP/Decoder/Decoder.h>
+#include <WhisperEACP/Encoder/CoreMLEncoder.h>
 #include <WhisperEACP/Encoder/Encoder.h>
 #include <WhisperEACP/Mel/Mel.h>
 #include <WhisperEACP/Model/Model.h>
 #include <WhisperEACP/Tokenizer/Tokenizer.h>
+
+#include <eacp/Core/Threads/Async.h>
+#include <eacp/Core/Utils/FilePath.h>
 
 #include <cstdint>
 #include <filesystem>
@@ -13,6 +17,25 @@
 
 namespace WSP
 {
+// What runs the encoder. The decoder is on the kernels either way.
+enum class EncoderBackend
+{
+    kernels,
+    coreML
+};
+
+// Where Core ML may place the encoder under EncoderBackend::coreML, Core ML's
+// own four settings. cpuAndNeuralEngine is the default because it is the only
+// one that reaches the engine: under all, Core ML places the whole encoder on
+// the GPU.
+enum class EncoderComputeUnits
+{
+    all,
+    cpuAndNeuralEngine,
+    cpuAndGPU,
+    cpu
+};
+
 // The whole runtime, from 30 s of samples to text: the mel front-end, the
 // encoder, the decoder's KV-cached loop, and the greedy search that turns the
 // last logit row into the next token.
@@ -126,6 +149,10 @@ public:
     // neither of which takes a device — they use Device::shared() — so a
     // prepare() against a second Device would compile there and upload here.
     // Recorded rather than hidden: it is a seam in the loader, not in this.
+    //
+    // A prepare that throws leaves this unprepared, whatever an earlier one
+    // had prepared; one while a transcribeAsync run is in flight is a
+    // std::logic_error.
     void prepare(eacp::GPU::Device& device);
     void prepare();
 
@@ -183,6 +210,35 @@ public:
     bool packsWeights() const { return packedWeights; }
     void setPacksWeights(bool shouldPack);
 
+    // The kernels by default. Set before prepare(), which builds the encoder
+    // for it; a call after is a std::logic_error. prepare() refuses a backend
+    // this build or this machine cannot run with a ModelError, and under
+    // coreML an audio context outside enumeratedAudioContexts() as well.
+    EncoderBackend encoderBackend() const { return chosenEncoderBackend; }
+    void setEncoderBackend(EncoderBackend backend);
+
+    // coreML wherever this build has eacp's Core ML runner and the OS loads a
+    // specification 8 program, the floor for the encoder with its attention
+    // unfused; where it also loads 9, the fused program is built instead.
+    static bool supportsEncoderBackend(EncoderBackend backend);
+
+    // Set before prepare(), like the backend, and read only under coreML.
+    EncoderComputeUnits encoderComputeUnits() const { return chosenComputeUnits; }
+    void setEncoderComputeUnits(EncoderComputeUnits units);
+
+    // Where the compiled Core ML encoder is cached, set before prepare() like
+    // the units; empty, the default, is eacp::ML::defaultCacheDirectory(), the
+    // app's own, so binaries that share one directory compile the model once.
+    const eacp::FilePath& encoderCacheDirectory() const
+    {
+        return coreMLCacheDirectory;
+    }
+    void setEncoderCacheDirectory(const eacp::FilePath& directory);
+
+    // Whether prepare() found the compiled Core ML encoder in the cache
+    // rather than compiling it. False on the kernels.
+    bool encoderWasCacheHit() const { return coreMLCacheHit; }
+
     // whisper.cpp's audio_ctx: how many of the encoder's 1500 positions a run
     // computes. Zero, the default, is the whole 30 s window, and every
     // existing number in this tree is that one.
@@ -204,6 +260,10 @@ public:
     // truncated one is a shape the model never saw. The transcripts at each
     // count are measured in Tests/Whisper and in plan.md rather than assumed,
     // and that is why this is off by default.
+    //
+    // Under EncoderBackend::coreML the count is zero or one of
+    // enumeratedAudioContexts(), since that encoder is compiled for those
+    // shapes alone, and anything else is a ModelError.
     int audioContext() const { return audioContextPositions; }
     void setAudioContext(int positions);
 
@@ -242,6 +302,42 @@ public:
     // segment is held here. Two tiles of headroom over the 384 that behaved.
     static constexpr int audioContextFloor = 448;
 
+    static_assert(audioContextFloor % audioContextTile == 0,
+                  "audioContextForSamples yields only enumerated contexts "
+                  "because the floor is itself a whole number of tiles");
+
+    // Every count audioContextForSamples can answer: the multiples of the tile
+    // from the floor up to the window, and the window. 448 to 1472 in steps of
+    // 64, and 1500, for Whisper's window. A backend compiled for fixed shapes
+    // is compiled for these.
+    static constexpr int enumeratedAudioContextCount =
+        (encoderPositions - audioContextFloor + audioContextTile - 1)
+            / audioContextTile
+        + 1;
+
+    using AudioContexts = Array<int, enumeratedAudioContextCount>;
+
+    static constexpr AudioContexts enumeratedAudioContexts()
+    {
+        auto contexts = AudioContexts {};
+
+        for (auto index = 0; index < enumeratedAudioContextCount - 1; ++index)
+            contexts[index] = audioContextFloor + index * audioContextTile;
+
+        contexts.back() = encoderPositions;
+
+        return contexts;
+    }
+
+    static constexpr bool isEnumeratedAudioContext(int positions)
+    {
+        for (auto context: enumeratedAudioContexts())
+            if (context == positions)
+                return true;
+
+        return false;
+    }
+
     // 16 kHz mono samples, at most one 30 s window of them.
     //
     // Fewer are zero-filled to the window, which is what HF's feature extractor
@@ -252,6 +348,26 @@ public:
     // first thirty seconds of a five-minute file would be the worst of the
     // available answers.
     Vector<TokenId> transcribe(Span<const float> samples);
+
+    // The same run for a caller that yields to the event loop. Under
+    // EncoderBackend::coreML the samples are uploaded and the mel committed
+    // before this returns, the prediction runs on the model's queue, and the
+    // decode runs on the main thread when it resolves, which is when this
+    // resolves; the GPU and the main thread are free while the engine works.
+    // On the kernels this is transcribe(), resolved before it returns.
+    //
+    // One run at a time: transcribe(), transcribeAsync() or setAudioContext()
+    // while a run is in flight is a std::logic_error. The misuse transcribe()
+    // refuses is refused here the same way, by throwing; a prediction Core ML
+    // refuses, or a decode that fails, rejects. Main thread only.
+    //
+    // A run's clocks are the blocking run's, except that encode ends when the
+    // prediction resolves on the main thread rather than when it returns, and
+    // lastEncoderPredictSeconds() is zero, since the prediction is not timed
+    // apart from the hop back to the loop.
+    eacp::Threads::Async<Vector<TokenId>> transcribeAsync(Span<const float> samples);
+
+    bool isTranscribing() const { return runInFlight; }
 
     // The same run, decoded through the vocabulary with the special tokens
     // dropped — the transcript as text, leading space and all.
@@ -267,8 +383,33 @@ public:
     // is the first step's submit to the read of the last token, and stops at
     // that read rather than waiting for the steps still in the air behind it —
     // so the two hold the run between them and neither counts the other.
+    //
+    // Under EncoderBackend::coreML the encode is the mel's command buffer, its
+    // read-back, the prediction and the copy of the rows back, end to end, and
+    // lastEncoderPredictSeconds() is the prediction alone; on the kernels that
+    // one is zero, since there is no prediction to separate out.
+    //
+    // lastEncoderMelSeconds() is the mel's command buffer under coreML,
+    // committed and waited on before the prediction starts, which makes it the
+    // only GPU work in that encode; zero on the kernels, where the mel shares
+    // the encoder's command buffer. What is left of the encode after the two
+    // is the seam: the mel read back and narrowed, the rows widened back.
     double lastEncodeSeconds() const { return encodeSeconds; }
     double lastDecodeSeconds() const { return decodeSeconds; }
+    double lastEncoderPredictSeconds() const { return predictSeconds; }
+    double lastEncoderMelSeconds() const { return melSeconds; }
+
+    // Under coreML, how long prepare() took to load the compiled encoder, or
+    // to compile and load it on a cache miss; zero on the kernels.
+    double encoderLoadSeconds() const { return coreMLLoadSeconds; }
+
+#if EACP_HAS_COREML
+    // Where Core ML placed the encoder's ops, read once and kept. Under
+    // cpuAndNeuralEngine the read costs the engine compile again, about 14 s,
+    // so only a caller that prints or asserts it should ask. A
+    // std::logic_error unless prepared with EncoderBackend::coreML.
+    const eacp::ML::ComputePlan& encoderComputePlan();
+#endif
 
     // How many decoder steps the last run consumed, which is one for the
     // prompt and one per token after it — one more than the transcript holds
@@ -291,6 +432,8 @@ private:
     void requireLoaded() const;
     void requirePrepared() const;
     void requireWhisperShapes() const;
+    void requireRunnableEncoder() const;
+    void requireAudioContextForBackend(int positions) const;
 
     void buildPrompt();
     void buildSuppressionMasks();
@@ -299,10 +442,25 @@ private:
     // the two loads parsed them.
     void buildGenerationConfig();
 
+    void requireNoRunInFlight() const;
+
     void uploadSamples(Span<const float> samples);
     void uploadPrompt();
 
+    // What every run does before its encode: the checks, the samples and the
+    // prompt uploaded, and the last run's clocks cleared.
+    void beginRun(Span<const float> samples);
+
+    // The decoder's steps, from the first to the one that ends the run, over
+    // whatever the encode left in encodedBuffer.
+    Vector<TokenId> decodeTranscript();
+
     double encodeAudio();
+    double encodeAudioOnCoreML();
+    void commitMel();
+    int encodedPositions() const;
+    void prepareCoreMLEncoder();
+    void unprepare();
 
     // Step zero opens the sequence and decodes the prompt; step j embeds the
     // token step j - 1 sampled. Every step samples into slot
@@ -337,9 +495,17 @@ private:
     Vector<float> laterStepSuppression;
     int maximumTokenCount = 0;
     bool packedWeights = true;
+    EncoderBackend chosenEncoderBackend = EncoderBackend::kernels;
+    EncoderComputeUnits chosenComputeUnits = EncoderComputeUnits::cpuAndNeuralEngine;
+    eacp::FilePath coreMLCacheDirectory;
+    bool coreMLCacheHit = false;
+    double coreMLLoadSeconds = 0.0;
     int audioContextPositions = 0;
 
     MelSpectrogram frontEnd;
+
+    // Under coreML this is the shape and nothing more: its kernels are never
+    // compiled and its scratch never allocated.
     std::optional<Encoder> encoder;
     std::optional<Decoder> decoder;
     std::optional<EncoderWeights> encoderWeights;
@@ -367,8 +533,17 @@ private:
     // back only to learn whether the run is over.
     std::optional<eacp::GPU::Buffer> sequenceTokens;
 
+#if EACP_HAS_COREML
+    // After everything a pending encodeAsync writes into or its decode reads,
+    // so that destroying it, which abandons the run, comes first.
+    std::optional<CoreMLEncoder> coreMLEncoder;
+#endif
+
     double encodeSeconds = 0.0;
     double decodeSeconds = 0.0;
+    double predictSeconds = 0.0;
+    double melSeconds = 0.0;
     int stepCount = 0;
+    bool runInFlight = false;
 };
 } // namespace WSP

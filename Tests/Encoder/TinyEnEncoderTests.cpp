@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <stdexcept>
 
 // The real openai/whisper-tiny.en weights, which are a download and never a
 // commit: configure with -DWHISPER_EACP_FETCH_MODEL=ON, or point
@@ -208,4 +209,90 @@ auto tTinyEnEncoderPacksEveryProjection =
     check(!weights.firstConvolutionWeight.isPackedHalf());
     check(!weights.secondConvolutionWeight.isPackedHalf());
     check(!weights.positionalEmbedding.isPackedHalf());
+};
+
+// The weights a Core ML encoder writes into its blob: every tensor checked as
+// the device load checks it, nothing uploaded, and each one the file's bytes
+// under the shape the device load gives it.
+auto tTinyEnHostWeights = test("Encoder/TinyEn/hostWeightsAreTheFile") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, config.encoderInputFrames());
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto device = EncoderWeights {file, shape, WeightPacking::ExactHalf};
+    const auto host = EncoderWeights {
+        file, shape, WeightPacking::ExactHalf, WeightPlacement::Host};
+
+    check(device.placement == WeightPlacement::Device);
+    check(host.placement == WeightPlacement::Host);
+
+    const auto sameTensor = [](const TensorBuffer& onHost, const TensorBuffer& onGpu)
+    {
+        return onHost.isHostOnly() && !onGpu.isHostOnly()
+               && onHost.shape == onGpu.shape && onHost.fileBytes == onGpu.fileBytes
+               && onHost.fileType == TensorType::F32;
+    };
+
+    check(sameTensor(host.firstConvolutionWeight, device.firstConvolutionWeight));
+    check(sameTensor(host.secondConvolutionBias, device.secondConvolutionBias));
+    check(sameTensor(host.positionalEmbedding, device.positionalEmbedding));
+    check(sameTensor(host.finalNormBias, device.finalNormBias));
+    check(host.layers.size() == device.layers.size());
+
+    for (auto index = 0; index < host.layers.size(); ++index)
+    {
+        const auto& onHost = host.layers[index];
+        const auto& onGpu = device.layers[index];
+
+        check(sameTensor(onHost.queryWeight, onGpu.queryWeight));
+        check(sameTensor(onHost.keyWeight, onGpu.keyWeight));
+        check(sameTensor(onHost.feedForwardWeight, onGpu.feedForwardWeight));
+        check(sameTensor(onHost.feedForwardOutputBias, onGpu.feedForwardOutputBias));
+        check(onHost.feedForwardWeight.fileBytes.size()
+              == shape.feedForwardWidth * shape.width * (int) sizeof(float));
+    }
+
+    check(readFileFloats(host.finalNormWeight)
+          == file.readFloats("model.encoder.layer_norm.weight"));
+};
+
+auto tKernelEncoderRefusesHostWeights =
+    test("Encoder/TinyEn/kernelEncoderRefusesHostWeights") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, shortInputFrames);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto host =
+        EncoderWeights {file, shape, WeightPacking::Float, WeightPlacement::Host};
+
+    auto& device = Device::shared();
+
+    auto encoder = Encoder {shape};
+    encoder.prepare(device);
+
+    const auto mel = storageOf(syntheticMel(shape));
+    const auto output = outputFor(shape.elementCount());
+
+    auto threwLogicError = false;
+    auto commands = device.makeCommandBuffer();
+
+    try
+    {
+        auto pass = commands.beginCompute();
+        encoder.encode(pass, mel, host, output);
+    }
+    catch (const std::logic_error&)
+    {
+        threwLogicError = true;
+    }
+
+    check(threwLogicError);
 };

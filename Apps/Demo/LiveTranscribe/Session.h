@@ -30,7 +30,10 @@ enum class ModelState
 class Session
 {
 public:
-    explicit Session(std::string modelDirectoryToUse);
+    // encoderOnCoreML runs the encoder on Core ML (the Neural Engine) instead
+    // of the kernels, where the build and the machine can; the run then comes
+    // back on a later tick and the window is never held for the encode.
+    Session(std::string modelDirectoryToUse, bool encoderOnCoreML);
 
     // Maps the weights, compiles every kernel and uploads them: about half a
     // second, so the app posts this rather than calling it from its
@@ -73,6 +76,7 @@ private:
     bool runTranscriber();
 
     std::string modelDirectory;
+    bool usesCoreML = false;
     ModelState modelState = ModelState::Loading;
     std::string message;
     std::string errorText;

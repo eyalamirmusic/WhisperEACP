@@ -256,7 +256,8 @@ void Decoder::beginSequence(ComputePass& pass,
 
     const auto encoderRows =
         Binding {BufferRange::of(encoderOutput),
-                 Shape {decoderShape.crossPositions, decoderShape.width}};
+                 Shape {decoderShape.crossPositions, decoderShape.width},
+                 "encoder_rows"};
 
     net.begin(pass);
     recordSequenceStart(net, decoderShape, weights, caches, encoderRows, rows);
@@ -287,18 +288,20 @@ void Decoder::step(ComputePass& pass,
                           + std::to_string(decoderShape.maxPositions)
                           + " this decoder was built for"};
 
-    const auto tokenSlots = Binding {tokens, Shape {decoderShape.maxPositions}};
+    const auto tokenSlots =
+        Binding {tokens, Shape {decoderShape.maxPositions}, "tokens"};
 
     net.begin(pass);
-    recordDecoderStep(net,
-                      decoderShape,
-                      weights,
-                      caches,
-                      tokenSlots,
-                      tokenCount,
-                      decodedPositions,
-                      Binding {BufferRange::of(*normalisedRows), {}},
-                      Binding {BufferRange::of(logits), {}});
+    recordDecoderStep(
+        net,
+        decoderShape,
+        weights,
+        caches,
+        tokenSlots,
+        tokenCount,
+        decodedPositions,
+        Binding {BufferRange::of(*normalisedRows), {}, "hidden_states"},
+        Binding {BufferRange::of(logits), {}, "logits"});
     net.end();
 
     decodedPositions += tokenCount;

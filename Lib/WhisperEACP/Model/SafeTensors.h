@@ -42,15 +42,31 @@ struct TensorInfo
 // them it holds, and binding a packed buffer where a float one is expected is
 // wrong by a factor of two in every index while staying silent on both
 // backends.
+//
+// fileBytes and fileType are the tensor as the safetensors blob holds it,
+// whatever went to the device: a view into the file, valid while the
+// SafeTensors it came from is, for a backend that writes weights somewhere
+// other than a GPU buffer. A host tensor (SafeTensors::makeHostTensor) has
+// only those and its shape, an invalid buffer, and the file's type as its
+// storage, since the file's bytes are the only ones it has. name is the
+// tensor's key in the file, which a graph backend names its constant after.
 struct TensorBuffer
 {
     eacp::GPU::Buffer buffer;
     TensorType storage = TensorType::F32;
     Vector<int> shape;
+    Span<const std::uint8_t> fileBytes {};
+    TensorType fileType = TensorType::F32;
+    std::string name {};
 
     bool isPackedHalf() const { return storage == TensorType::F16; }
+    bool isHostOnly() const { return !buffer.isValid(); }
     int dimension(int axis) const { return axis < shape.size() ? shape[axis] : 0; }
 };
+
+// The file's values of a tensor widened to float32, from fileBytes rather than
+// from the device, whichever float type the file holds.
+Vector<float> readFileFloats(const TensorBuffer& tensor);
 
 // A safetensors file: eight bytes of little-endian header length, that many
 // bytes of JSON naming every tensor, then one raw blob the offsets in that JSON
@@ -141,6 +157,10 @@ public:
     // A repo genuinely trained and saved in fp32 answers empty and keeps the
     // float weight it shipped.
     std::optional<TensorBuffer> makeExactHalfBuffer(std::string_view name) const;
+
+    // The tensor with nothing uploaded: its shape, its bytes in the file and
+    // the file's type, for a backend that never binds a GPU buffer to it.
+    TensorBuffer makeHostTensor(std::string_view name) const;
 
 private:
     // Which of the three constructions the bytes came from. Kept as a state

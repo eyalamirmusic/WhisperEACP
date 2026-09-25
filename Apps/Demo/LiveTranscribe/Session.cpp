@@ -22,8 +22,9 @@ double secondsSince(std::chrono::steady_clock::time_point start)
 }
 } // namespace
 
-Session::Session(std::string modelDirectoryToUse)
+Session::Session(std::string modelDirectoryToUse, bool encoderOnCoreML)
     : modelDirectory(std::move(modelDirectoryToUse))
+    , usesCoreML(encoderOnCoreML)
 {
     if (modelDirectory.empty() && !WSP::Whisper::hasBundledModel())
     {
@@ -54,6 +55,9 @@ void Session::loadModel()
             whisper.loadBundled();
         else
             whisper.load(modelDirectory);
+
+        if (usesCoreML)
+            whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
 
         whisper.prepare();
     }

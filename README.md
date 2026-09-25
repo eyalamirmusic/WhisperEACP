@@ -64,10 +64,11 @@ The transcript is the same token for token in all three columns.
 | `Lib/WhisperEACP/Mel` | Hann, STFT, the 80 x 201 filterbank, log10 and the scaling |
 | `Lib/WhisperEACP/Model` | safetensors weights, `config.json`, the filterbank |
 | `Lib/WhisperEACP/Tokenizer` | byte-level BPE and Whisper's special tokens |
-| `Lib/WhisperEACP/Encoder` | HF's `WhisperEncoder.forward`, recorded into one command buffer |
+| `Lib/WhisperEACP/Net` | The ops the encoder and decoder are written against, once, and the backends that run them: the kernels, and Core ML for the encoder |
+| `Lib/WhisperEACP/Encoder` | HF's `WhisperEncoder.forward`, recorded into one command buffer, or into one Core ML model (`CoreMLEncoder`, Apple only) |
 | `Lib/WhisperEACP/Decoder` | The same for the text half, over a KV cache |
 | `Lib/WhisperEACP/Whisper` | The whole runtime — samples in, a transcript out — and `LiveTranscriber` above it |
-| `Apps/Console/DeviceInfo` | What this machine offers: GPU limits and input devices |
+| `Apps/Console/DeviceInfo` | What this machine offers: GPU limits, input devices and Core ML; `--plan` loads the bundled model on Core ML and prints where the encoder's ops were placed |
 | `Apps/Console/Transcribe` | A WAV file in, the transcript and what it cost out |
 | `Apps/Demo/LiveTranscribe` | A window: pick an input, watch the meter, read the transcript as it arrives |
 | `Samples` | `jfk.wav`, the recording the end-to-end tests run on |
@@ -102,6 +103,37 @@ const auto text = whisper.transcribeText(samples);
 `prepare` is the half second of kernel compilation and upload. A run longer
 than the 30 s window is an error rather than a truncation, since deciding where
 to cut a recording is a chunking layer that does not exist yet.
+
+The encoder runs on the GPU kernels by default. On a Mac it can run on Core ML
+instead, through eacp's `eacp-ml`, which is how it reaches the Neural Engine;
+the decoder stays on the kernels either way. Everything about it is chosen
+before `prepare`, which builds the encoder for it:
+
+```cpp
+if (WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML))
+    whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
+
+whisper.setEncoderComputeUnits(WSP::EncoderComputeUnits::cpuAndNeuralEngine);
+whisper.setEncoderCacheDirectory(sharedDirectory);   // optional
+whisper.prepare();
+```
+
+`cpuAndNeuralEngine` is the default because it is the only setting that
+reaches the engine: under `all`, Core ML places the whole encoder on the GPU.
+The model is compiled for the eighteen audio contexts `setAudioContext` can
+take under Core ML (448 to 1472 in steps of 64, and 1500), and cached; the
+first `prepare` on a machine is the engine compiling all of them, about 14 s,
+and one after it finds the compile in the cache in well under a second. The
+cache is the app's own unless `setEncoderCacheDirectory` names one, which is
+how several binaries share one compile. `encoderWasCacheHit`,
+`encoderLoadSeconds`, `lastEncoderPredictSeconds`, `lastEncoderMelSeconds` and
+`encoderComputePlan` report what it did. `transcribeAsync` is `transcribe` for
+a caller that yields to the event loop: under Core ML the prediction runs on
+the model's queue and the decode when it comes back, so the main thread and
+the GPU are free while the engine works; on the kernels it resolves before it
+returns. On this machine the engine is slower than the kernels at every
+context (plan.md in eacp has the numbers), so the choice buys an idle GPU, not
+speed.
 
 `LiveTranscriber` sits above that for audio that keeps arriving: push 16 kHz
 mono samples of any block size, call `update()` from the thread that owns the
@@ -233,7 +265,9 @@ eacp's GPU layer is main-thread only — so a run of the model is a few tens of
 milliseconds the window waits for, and only the device callback is on a thread
 of its own. `--autostart` opens the default input as soon as the model is ready
 and logs a line a second to stdout, which is how a run is checked without a hand
-on the mouse.
+on the mouse. `--coreml` runs the encoder on Core ML's Neural Engine, where
+the machine has it; a run then comes back on a later tick and the window is
+never held for the encode.
 
 ## Testing
 
@@ -270,7 +304,14 @@ cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-release --target Benchmark
 ./build-release/Benchmark/Benchmark            # jfk.wav, 10 timed runs
 ./build-release/Benchmark/Benchmark 30 recording.wav
+./build-release/Benchmark/Benchmark 30 --units=all --plan
 ```
+
+Where the build and the OS have Core ML, a `WhisperEACP ANE` column runs the
+same runtime with the encoder on Core ML, under `--units` (the engine by
+default), and splits its encode into the mel on the GPU, the prediction and
+the seam copies; `--plan` also prints where Core ML placed the encoder's ops.
+`--live` streams twice, the encoder on the kernels and then on Core ML.
 
 The option builds whisper.cpp at its own defaults for the machine, backends
 on, where the oracle in `Tests/Oracle` alone builds it with every backend off

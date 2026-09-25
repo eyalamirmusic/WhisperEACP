@@ -7,6 +7,8 @@
 #include <whisper.h>
 
 #include <algorithm>
+#include <array>
+#include <charconv>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -51,7 +53,9 @@ constexpr auto buildType = WHISPER_EACP_BUILD_TYPE;
 
 constexpr auto usage =
     "usage: Benchmark [runs] [wav file] [--audio-ctx=positions|audio]\n"
+    "                 [--units=all|cpuAndNeuralEngine|cpuAndGPU|cpu] [--plan]\n"
     "       Benchmark --live [seconds] [gap seconds] [wav file]\n"
+    "                 [--audio-ctx=audio] [--units=...]\n"
     "\n"
     "  runs        timed runs per contestant after one warm-up, 10 by default\n"
     "  wav file    16 kHz mono, at most 30 seconds; Samples/jfk.wav by default\n"
@@ -60,10 +64,17 @@ constexpr auto usage =
     "              audio_ctx, which are the same knob; the whole window by\n"
     "              default. \"audio\" sizes it to the recording the way the\n"
     "              live loop does, and in --live turns that option on\n"
+    "  --units     where Core ML may place the encoder for the WhisperEACP ANE\n"
+    "              column, which runs wherever this build and OS have Core ML:\n"
+    "              cpuAndNeuralEngine by default, the only setting that reaches\n"
+    "              the engine; under all Core ML puts the encoder on the GPU\n"
+    "  --plan      print where Core ML placed the encoder's ops. Reading the\n"
+    "              plan costs the Neural Engine compile again, about 14 s\n"
     "\n"
     "  --live      our runtime alone, through LiveTranscriber, streamed at real\n"
     "              time: the recording on repeat with a gap of silence between\n"
-    "              passes. The numbers, in order, are how long to stream for -\n"
+    "              passes, once with the encoder on the kernels and once on\n"
+    "              Core ML. The numbers, in order, are how long to stream for -\n"
     "              30 s by default - and the gap, 1.5 s. The recording may be\n"
     "              any length here, since the segments are the policy's\n";
 
@@ -99,11 +110,18 @@ double secondsSince(Clock::time_point start)
 // `decodeSeconds` is the prompt pass and every token after it, and `steps`
 // counts them the same way on both sides — one for the prompt, one per sampled
 // token, the last of which is <|endoftext|>.
+//
+// With the encoder on Core ML, `encodeSeconds` is the mel's own command buffer,
+// the prediction, and the seam either side of it, and the first two are also
+// reported apart: `hasEncoderSplit` says they were.
 struct Run
 {
     double wallSeconds = 0.0;
     double encodeSeconds = 0.0;
     double decodeSeconds = 0.0;
+    double melSeconds = 0.0;
+    double predictSeconds = 0.0;
+    bool hasEncoderSplit = false;
     int steps = 0;
     WSP::Vector<int> tokens;
 };
@@ -119,22 +137,84 @@ public:
     virtual std::string text(const WSP::Vector<int>& tokens) const = 0;
 };
 
+const char* nameOf(WSP::EncoderComputeUnits units)
+{
+    switch (units)
+    {
+        case WSP::EncoderComputeUnits::all:
+            return "all";
+        case WSP::EncoderComputeUnits::cpuAndNeuralEngine:
+            return "cpuAndNeuralEngine";
+        case WSP::EncoderComputeUnits::cpuAndGPU:
+            return "cpuAndGPU";
+        case WSP::EncoderComputeUnits::cpu:
+            return "cpu";
+    }
+
+    return "?";
+}
+
+bool parseUnits(std::string_view text, WSP::EncoderComputeUnits& units)
+{
+    constexpr auto every = std::array {WSP::EncoderComputeUnits::all,
+                                       WSP::EncoderComputeUnits::cpuAndNeuralEngine,
+                                       WSP::EncoderComputeUnits::cpuAndGPU,
+                                       WSP::EncoderComputeUnits::cpu};
+
+    for (auto candidate: every)
+    {
+        if (text == nameOf(candidate))
+        {
+            units = candidate;
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool canRunTheEncoderOnCoreML()
+{
+    return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML);
+}
+
+// The kernel column prepares the encoder on the GPU; the ANE column records,
+// compiles (or finds in the cache) and loads the Core ML one, with the decoder
+// on the GPU either way.
 class OurRuntime final : public Contestant
 {
 public:
-    explicit OurRuntime(int audioContext)
+    OurRuntime(int audioContext,
+               WSP::EncoderBackend backendToUse = WSP::EncoderBackend::kernels,
+               WSP::EncoderComputeUnits unitsToUse =
+                   WSP::EncoderComputeUnits::cpuAndNeuralEngine)
     {
         whisper.loadBundled();
+        whisper.setEncoderBackend(backendToUse);
+        whisper.setEncoderComputeUnits(unitsToUse);
+
+        const auto start = Clock::now();
         whisper.prepare();
+        prepareSeconds = secondsSince(start);
+
         whisper.setAudioContext(audioContext);
     }
 
     std::string name() const override
     {
-        return "WhisperEACP on " + GPU::Device::shared().name();
+        const auto gpu = GPU::Device::shared().name();
+
+        if (!usesCoreML())
+            return "WhisperEACP on " + gpu;
+
+        return std::string {"WhisperEACP, encoder on Core ML ("}
+               + nameOf(whisper.encoderComputeUnits()) + "), decoder on " + gpu;
     }
 
-    std::string column() const override { return "WhisperEACP"; }
+    std::string column() const override
+    {
+        return usesCoreML() ? "WhisperEACP ANE" : "WhisperEACP";
+    }
 
     Run transcribe(WSP::Span<const float> samples) override
     {
@@ -145,6 +225,9 @@ public:
         run.wallSeconds = secondsSince(start);
         run.encodeSeconds = whisper.lastEncodeSeconds();
         run.decodeSeconds = whisper.lastDecodeSeconds();
+        run.melSeconds = whisper.lastEncoderMelSeconds();
+        run.predictSeconds = whisper.lastEncoderPredictSeconds();
+        run.hasEncoderSplit = usesCoreML();
         run.steps = whisper.lastStepCount();
 
         return run;
@@ -156,9 +239,17 @@ public:
     }
 
     bool packsWeights() const { return whisper.packsWeights(); }
+    bool usesCoreML() const
+    {
+        return whisper.encoderBackend() == WSP::EncoderBackend::coreML;
+    }
+
+    WSP::Whisper& runtime() { return whisper; }
+    double lastPrepareSeconds() const { return prepareSeconds; }
 
 private:
     WSP::Whisper whisper;
+    double prepareSeconds = 0.0;
 };
 
 // What the storage line says after "F32": the file on disk is F32 either way,
@@ -328,6 +419,10 @@ struct Summary
     double wallBest = 0.0;
     double encodeMedian = 0.0;
     double decodeMedian = 0.0;
+    double melMedian = 0.0;
+    double predictMedian = 0.0;
+    double seamMedian = 0.0;
+    bool hasEncoderSplit = false;
     int steps = 0;
     WSP::Vector<int> tokens;
     std::string text;
@@ -361,6 +456,9 @@ Summary benchmark(Contestant& contestant, WSP::Span<const float> samples, int ru
     auto wall = std::vector<double> {};
     auto encode = std::vector<double> {};
     auto decode = std::vector<double> {};
+    auto mel = std::vector<double> {};
+    auto predict = std::vector<double> {};
+    auto seam = std::vector<double> {};
 
     for (auto index = 0; index < runs; ++index)
     {
@@ -368,13 +466,20 @@ Summary benchmark(Contestant& contestant, WSP::Span<const float> samples, int ru
         wall.push_back(run.wallSeconds);
         encode.push_back(run.encodeSeconds);
         decode.push_back(run.decodeSeconds);
+        mel.push_back(run.melSeconds);
+        predict.push_back(run.predictSeconds);
+        seam.push_back(run.encodeSeconds - run.melSeconds - run.predictSeconds);
         summary.steps = run.steps;
+        summary.hasEncoderSplit = run.hasEncoderSplit;
     }
 
     summary.wallMedian = median(wall);
     summary.wallBest = *std::min_element(wall.begin(), wall.end());
     summary.encodeMedian = median(encode);
     summary.decodeMedian = median(decode);
+    summary.melMedian = median(mel);
+    summary.predictMedian = median(predict);
+    summary.seamMedian = median(seam);
 
     return summary;
 }
@@ -467,6 +572,16 @@ void printTable(const std::vector<Summary>& summaries)
              summaries,
              [](const Summary& s) { return milliseconds(s.encodeMedian); });
 
+    const auto splitCell = [](double Summary::* field)
+    {
+        return [field](const Summary& s)
+        { return s.hasEncoderSplit ? milliseconds(s.*field) : std::string {"-"}; };
+    };
+
+    printRow("  mel on the GPU, median", summaries, splitCell(&Summary::melMedian));
+    printRow("  predict, median", summaries, splitCell(&Summary::predictMedian));
+    printRow("  seam copies, median", summaries, splitCell(&Summary::seamMedian));
+
     printRow("decode, median",
              summaries,
              [](const Summary& s) { return milliseconds(s.decodeMedian); });
@@ -498,6 +613,14 @@ void printTable(const std::vector<Summary>& summaries)
     std::printf("\n  encode is the mel and the encoder for WhisperEACP, one "
                 "command buffer, and the\n  encoder alone for whisper.cpp, "
                 "whose timings do not expose its mel.\n");
+    std::printf("  For WhisperEACP ANE it is the mel's own command buffer, "
+                "committed and waited on,\n  the mel read back and narrowed to "
+                "fp16, the Core ML prediction, and the rows\n  widened back "
+                "into the decoder's buffer. The three rows under it split it: "
+                "the mel\n  is the only GPU work in the encode, so the GPU is "
+                "idle through the predict\n  wherever the plan (--plan) puts "
+                "the encoder on the engine; the seam copies\n  are the encode "
+                "less the other two, per run.\n");
 }
 
 void printBackends()
@@ -531,6 +654,20 @@ void printBuildType()
                             "tree for the real ones");
 }
 
+void printPlan(OurRuntime& contestant)
+{
+#if EACP_HAS_COREML
+    const auto start = Clock::now();
+    const auto& plan = contestant.runtime().encoderComputePlan();
+
+    std::printf("  plan, read in %.1f s\n%s",
+                secondsSince(start),
+                WSP::describePlacement(plan, "    ").c_str());
+#else
+    (void) contestant;
+#endif
+}
+
 struct Request
 {
     bool live = false;
@@ -543,7 +680,40 @@ struct Request
     // fromTheAudio is Whisper::audioContextForSamples over the recording.
     static constexpr auto fromTheAudio = -1;
     int audioContext = 0;
+
+    // The Core ML contestant's compute units, and whether to read its plan.
+    WSP::EncoderComputeUnits units = WSP::EncoderComputeUnits::cpuAndNeuralEngine;
+    bool readsPlan = false;
 };
+
+// What the ANE column ran on: the units it was compiled for, whether the load
+// found the compile in the cache, and how long the load and the whole prepare
+// took; and the plan only when asked for, since reading it is another engine
+// compile.
+void printCoreMLContestant(OurRuntime* contestant, const Request& request)
+{
+    if (contestant == nullptr)
+    {
+        std::printf("  WhisperEACP ANE not run: this build or this OS cannot run "
+                    "the encoder on Core ML\n");
+        return;
+    }
+
+    auto& whisper = contestant->runtime();
+
+    std::printf("  WhisperEACP ANE: Core ML %s, encoder load %.2f s (%s), "
+                "whole prepare %.2f s\n",
+                nameOf(whisper.encoderComputeUnits()),
+                whisper.encoderLoadSeconds(),
+                whisper.encoderWasCacheHit() ? "cache hit" : "compiled",
+                contestant->lastPrepareSeconds());
+
+    if (request.readsPlan)
+        printPlan(*contestant);
+    else
+        std::printf("  plan not read: --plan reads it, about 14 s on the "
+                    "engine\n");
+}
 
 bool parseNumber(const std::string& text, double& value)
 {
@@ -563,11 +733,27 @@ bool parse(const WSP::Vector<std::string>& arguments, Request& request)
     auto numbers = std::vector<double> {};
 
     constexpr auto audioContextFlag = std::string_view {"--audio-ctx="};
+    constexpr auto unitsFlag = std::string_view {"--units="};
 
     for (auto index = 1; index < arguments.size(); ++index)
     {
         const auto& argument = arguments[index];
         auto value = 0.0;
+
+        if (std::string_view {argument}.starts_with(unitsFlag))
+        {
+            if (!parseUnits(std::string_view {argument}.substr(unitsFlag.size()),
+                            request.units))
+                return false;
+
+            continue;
+        }
+
+        if (argument == "--plan")
+        {
+            request.readsPlan = true;
+            continue;
+        }
 
         if (std::string_view {argument}.starts_with(audioContextFlag))
         {
@@ -657,6 +843,7 @@ void silenceWhisperCpp()
 // there as most of a core when the true share is a twentieth of one.
 struct LiveSummary
 {
+    std::string column;
     double wallSeconds = 0.0;
     int runs = 0;
     int runsThatChangedTheText = 0;
@@ -668,19 +855,6 @@ struct LiveSummary
     int segments = 0;
     std::string firstLine;
 };
-
-// What the run that just happened made of the open segment: the pending text,
-// or the line it committed when that run was the one that closed the segment.
-std::string openSegmentText(const WSP::LiveTranscriber& live, int segmentsBefore)
-{
-    if (!live.pending().empty())
-        return live.pending();
-
-    if (live.committed().size() > segmentsBefore)
-        return live.committed()[live.committed().size() - 1];
-
-    return {};
-}
 
 // The recording followed by the gap, which the tick walks in a circle: a
 // microphone left open over somebody who says the same thing again after a
@@ -697,6 +871,20 @@ WSP::Vector<float> withGap(const WSP::Vector<float>& recording, double gapSecond
     return stream;
 }
 
+// Gives the event loop the thread until the deadline, which is where a run on
+// Core ML comes back; on the kernels there is nothing in it to run.
+void pumpUntil(Clock::time_point deadline)
+{
+    while (Clock::now() < deadline)
+    {
+        const auto remaining =
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - Clock::now());
+
+        Threads::runEventLoopFor(
+            Time::MS {std::max<std::int64_t>(1, remaining.count())});
+    }
+}
+
 LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
                                         const WSP::LiveOptions& options,
                                         const WSP::Vector<float>& stream,
@@ -707,13 +895,34 @@ LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
     auto chunk = WSP::Vector<float> {};
     auto cursor = 0;
     auto pushed = (long long) 0;
+    auto runsSeen = 0;
+
+    // A run is counted when its result is in, which on the kernels is inside
+    // update() and on Core ML inside a pump, and before the next update()
+    // starts another run over the runtime's clocks.
+    const auto countFinishedRun = [&live, &whisper, &summary, &runsSeen]
+    {
+        if (live.stats().runs == runsSeen)
+            return;
+
+        runsSeen = live.stats().runs;
+
+        const auto runSeconds = live.stats().lastRunSeconds;
+
+        ++summary.runs;
+        summary.modelSeconds += runSeconds;
+        summary.longestRunSeconds = std::max(summary.longestRunSeconds, runSeconds);
+        summary.encodeSeconds += whisper.lastEncodeSeconds();
+        summary.decodeSeconds += whisper.lastDecodeSeconds();
+        summary.steps += whisper.lastStepCount();
+    };
 
     const auto start = Clock::now();
 
     for (auto tick = 1; secondsSince(start) < seconds; ++tick)
     {
-        std::this_thread::sleep_until(
-            start + std::chrono::milliseconds(liveTickMilliseconds * tick));
+        pumpUntil(start + std::chrono::milliseconds(liveTickMilliseconds * tick));
+        countFinishedRun();
 
         // Whatever the elapsed audio time asks for, which is a run that
         // overran its tick handing the next one a larger block — exactly what
@@ -730,30 +939,17 @@ LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
         }
 
         live.push(chunk);
-
-        const auto runsBefore = live.stats().runs;
-        const auto segmentsBefore = live.committed().size();
-        const auto textBefore = live.pending();
-
         live.update();
-
-        if (live.stats().runs == runsBefore)
-            continue;
-
-        const auto runSeconds = live.stats().lastRunSeconds;
-
-        ++summary.runs;
-        summary.modelSeconds += runSeconds;
-        summary.longestRunSeconds = std::max(summary.longestRunSeconds, runSeconds);
-        summary.encodeSeconds += whisper.lastEncodeSeconds();
-        summary.decodeSeconds += whisper.lastDecodeSeconds();
-        summary.steps += whisper.lastStepCount();
-
-        if (openSegmentText(live, segmentsBefore) != textBefore)
-            ++summary.runsThatChangedTheText;
+        countFinishedRun();
     }
 
     summary.wallSeconds = secondsSince(start);
+
+    const auto isIdle = [&live] { return !live.isRunning(); };
+    Threads::runEventLoopUntil(isIdle, Time::MS {10000}, Time::MS {1});
+    countFinishedRun();
+
+    summary.runsThatChangedTheText = live.stats().runsThatChangedTheText;
     summary.segments = live.committed().size();
 
     if (summary.segments > 0)
@@ -762,30 +958,66 @@ LiveSummary streamThroughTheTranscriber(WSP::Whisper& whisper,
     return summary;
 }
 
-void printLiveTable(const LiveSummary& summary)
+void printLiveTable(const std::vector<LiveSummary>& summaries)
 {
-    const auto perRun = [&summary](double total)
-    { return 1000.0 * total / std::max(1, summary.runs); };
+    const auto row = [&summaries](const std::string& label, auto cellFor)
+    {
+        auto cells = std::vector<std::string> {};
 
-    printRow("stream, wall clock", {cell(summary.wallSeconds, "s", 1)});
-    printRow("runs", {std::to_string(summary.runs)});
-    printRow("runs that changed the text",
-             {std::to_string(summary.runsThatChangedTheText)});
-    printRow("model", {cell(summary.modelSeconds, "s", 3)});
-    printRow("duty",
-             {cell(100.0 * summary.modelSeconds / summary.wallSeconds, "%", 1)});
-    printRow("per run, mean", {cell(perRun(summary.modelSeconds), "ms", 1)});
-    printRow("per run, longest",
-             {cell(1000.0 * summary.longestRunSeconds, "ms", 1)});
-    printRow("encode, mean", {cell(perRun(summary.encodeSeconds), "ms", 1)});
-    printRow("decode, mean", {cell(perRun(summary.decodeSeconds), "ms", 1)});
-    printRow("steps per run",
-             {cell((double) summary.steps / std::max(1, summary.runs), "", 1)});
-    printRow("segments committed", {std::to_string(summary.segments)});
+        for (const auto& summary: summaries)
+            cells.push_back(cellFor(summary));
+
+        printRow(label, cells);
+    };
+
+    const auto perRun = [](const LiveSummary& s, double total)
+    { return cell(1000.0 * total / std::max(1, s.runs), "ms", 1); };
+
+    const auto column = [](const LiveSummary& s) { return s.column; };
+    const auto wall = [](const LiveSummary& s)
+    { return cell(s.wallSeconds, "s", 1); };
+    const auto runs = [](const LiveSummary& s) { return std::to_string(s.runs); };
+    const auto changed = [](const LiveSummary& s)
+    { return std::to_string(s.runsThatChangedTheText); };
+    const auto model = [](const LiveSummary& s)
+    { return cell(s.modelSeconds, "s", 3); };
+    const auto duty = [](const LiveSummary& s)
+    { return cell(100.0 * s.modelSeconds / s.wallSeconds, "%", 1); };
+    const auto meanRun = [&perRun](const LiveSummary& s)
+    { return perRun(s, s.modelSeconds); };
+    const auto longestRun = [](const LiveSummary& s)
+    { return cell(1000.0 * s.longestRunSeconds, "ms", 1); };
+    const auto meanEncode = [&perRun](const LiveSummary& s)
+    { return perRun(s, s.encodeSeconds); };
+    const auto meanDecode = [&perRun](const LiveSummary& s)
+    { return perRun(s, s.decodeSeconds); };
+    const auto steps = [](const LiveSummary& s)
+    { return cell((double) s.steps / std::max(1, s.runs), "", 1); };
+    const auto segments = [](const LiveSummary& s)
+    { return std::to_string(s.segments); };
+
+    row("", column);
+    row("stream, wall clock", wall);
+    row("runs", runs);
+    row("runs that changed the text", changed);
+    row("model", model);
+    row("duty", duty);
+    row("per run, mean", meanRun);
+    row("per run, longest", longestRun);
+    row("encode, mean", meanEncode);
+    row("decode, mean", meanDecode);
+    row("steps per run", steps);
+    row("segments committed", segments);
 
     std::printf("\n  a run at this cadence costs about twice what the "
                 "comparison above measures:\n  the GPU clocks down between "
                 "bursts half a second apart.\n");
+    std::printf("  On Core ML a run is its start to its result, the loop "
+                "turns the main thread\n  spent elsewhere while the engine "
+                "worked included, and its encode ends when the\n  prediction "
+                "comes back to the loop; so model and duty there are the "
+                "run's\n  latency, not the main thread's or the GPU's "
+                "share.\n");
 }
 
 void printLivePolicy(const WSP::LiveOptions& options)
@@ -804,9 +1036,14 @@ void printLivePolicy(const WSP::LiveOptions& options)
 
 void runLive(const Request& request)
 {
-    auto whisper = WSP::Whisper {};
-    whisper.loadBundled();
-    whisper.prepare();
+    auto ours = OurRuntime {0};
+    auto onCoreML = std::unique_ptr<OurRuntime> {};
+
+    if (canRunTheEncoderOnCoreML())
+        onCoreML = std::make_unique<OurRuntime>(
+            0, WSP::EncoderBackend::coreML, request.units);
+
+    auto& whisper = ours.runtime();
 
     const auto recording = WSP::readWavFile(request.wavFile);
     const auto stream = withGap(recording, request.gapSeconds);
@@ -829,18 +1066,35 @@ void runLive(const Request& request)
 
     printLivePolicy(options);
     printBuildType();
+    printCoreMLContestant(onCoreML.get(), request);
     std::printf("\n");
 
-    const auto summary =
-        streamThroughTheTranscriber(whisper, options, stream, request.liveSeconds);
+    auto summaries = std::vector<LiveSummary> {};
 
-    printLiveTable(summary);
+    summaries.push_back(
+        streamThroughTheTranscriber(whisper, options, stream, request.liveSeconds));
+    summaries.back().column = ours.column();
 
-    if (summary.segments > 0)
-        std::printf("\n  first committed line\n   %s\n", summary.firstLine.c_str());
-    else
-        std::printf("\n  nothing committed: the stream ended before a segment "
-                    "closed\n");
+    if (onCoreML != nullptr)
+    {
+        summaries.push_back(streamThroughTheTranscriber(
+            onCoreML->runtime(), options, stream, request.liveSeconds));
+        summaries.back().column = onCoreML->column();
+    }
+
+    printLiveTable(summaries);
+
+    for (const auto& summary: summaries)
+    {
+        if (summary.segments > 0)
+            std::printf("\n  %s, first committed line\n   %s\n",
+                        summary.column.c_str(),
+                        summary.firstLine.c_str());
+        else
+            std::printf("\n  %s committed nothing: the stream ended before a "
+                        "segment closed\n",
+                        summary.column.c_str());
+    }
 }
 
 void run(const Request& request)
@@ -854,8 +1108,14 @@ void run(const Request& request)
             : request.audioContext;
 
     // Loaded before the header rather than with the other contestants, since
-    // what it packed its weights as is part of what the header says ran.
+    // what it packed its weights as is part of what the header says ran, and
+    // what the Core ML one compiled for and how long it took to load.
     auto ours = std::make_unique<OurRuntime>(audioContext);
+    auto onCoreML = std::unique_ptr<OurRuntime> {};
+
+    if (canRunTheEncoderOnCoreML())
+        onCoreML = std::make_unique<OurRuntime>(
+            audioContext, WSP::EncoderBackend::coreML, request.units);
 
     std::printf("WhisperEACP benchmark\n");
     std::printf("  audio %s: %.1f s, zero-filled to the %d s window on both "
@@ -878,10 +1138,14 @@ void run(const Request& request)
                                         .c_str());
     printBuildType();
     printBackends();
+    printCoreMLContestant(onCoreML.get(), request);
     std::printf("\n");
 
     auto contestants = std::vector<std::unique_ptr<Contestant>> {};
     contestants.push_back(std::move(ours));
+
+    if (onCoreML != nullptr)
+        contestants.push_back(std::move(onCoreML));
 
     if (const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
         contestants.push_back(

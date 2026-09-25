@@ -32,6 +32,17 @@ enum class WeightPacking
     ExactHalf
 };
 
+// Where a weight struct's tensors go. Device uploads them as above; Host
+// uploads nothing and keeps each tensor's shape and its bytes in the file
+// (SafeTensors::makeHostTensor), for a backend that writes the weights into a
+// model of its own rather than binding GPU buffers. Packing means nothing to a
+// host tensor, which is the file's bytes whatever was asked.
+enum class WeightPlacement
+{
+    Device,
+    Host
+};
+
 // The checks a weight struct runs on the way from a safetensors file to the
 // TensorBuffer it hands a kernel: the file carries the tensor, the tensor has
 // the shape this build was compiled for, and its storage is one the program
@@ -57,6 +68,7 @@ struct TensorLoader
 {
     const SafeTensors& file;
     std::string_view component;
+    WeightPlacement placement = WeightPlacement::Device;
 
     const TensorInfo& require(const std::string& name) const;
 

@@ -79,7 +79,19 @@ cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-release --target Benchmark
 ./build-release/Benchmark/Benchmark                 # jfk.wav, 10 timed runs
 ./build-release/Benchmark/Benchmark 30 recording.wav
+./build-release/Benchmark/Benchmark 30 --units=all --plan
+./build-release/Benchmark/Benchmark --live --audio-ctx=audio
 ```
+
+Where the build has eacp's Core ML runner and the OS loads its programs, a
+fourth column, `WhisperEACP ANE`, runs the runtime with its encoder on Core ML
+(`Whisper::setEncoderBackend(EncoderBackend::coreML)`), right after the Metal
+column, which stays the transcript reference. Its encode is split into the
+mel's own command buffer, the prediction and the seam copies. `--units=` picks
+the compute units (`cpuAndNeuralEngine` by default, `all`, `cpuAndGPU`, `cpu`)
+and `--plan` prints where Core ML placed the encoder's ops, which under the
+engine settings costs the engine compile again, about 14 s, so it is off by
+default. `--live` streams twice, kernels then Core ML, into one table.
 
 whisper.cpp is fetched once, in the root `CMakeLists.txt`, through
 `CMake/WhisperCpp.cmake`, because its targets (`ggml`, `whisper`) are named
@@ -194,8 +206,20 @@ log10 and Whisper's clamp-and-scale.
 **Model/** — safetensors and the two config files. **Tokenizer/** — byte-level
 BPE and Whisper's special tokens.
 
+**Net/** — the seam: `Net` is the op list the encoder and decoder bodies are
+written against once (`recordEncoder`, `recordSequenceStart`,
+`recordDecoderStep`), and a backend is what runs it. `KernelNet` dispatches
+the kernels above; `CoreMLNet` records the encoder into an `eacp::ML` graph,
+the mel an fp16 input enumerated over the eighteen audio contexts and every
+weight a blob constant named after its safetensors key. `whisper-net` links
+`eacp-ml-graph`, which builds everywhere.
+
 **Encoder/** and **Decoder/** — HF's two halves out of those kernels, the second
-over a KV cache. **Whisper/** — the whole runtime, and the greedy search the
+over a KV cache. `CoreMLEncoder` (Apple only, behind `if (TARGET eacp-ml)`) is
+the encoder as one Core ML model: recorded through `CoreMLNet`, compiled and
+cached by `eacp::ML::Model`, run blocking or through `encodeAsync`, with the mel
+copied in and the rows widened out across the seam. **Whisper/** — the whole
+runtime, and the greedy search the
 decoder leaves to a layer that can hold the generation config. `LiveTranscriber`
 sits above it: 16 kHz mono samples in and a growing transcript out, with the
 open segment re-run as audio arrives and closed into `committed()` on silence or
@@ -369,6 +393,16 @@ reaches nothing here. The model is loaded from a `Threads::callAsync` posted in
 the app's constructor, so the window is up saying "loading model..." before the
 half second of mapping and kernel compilation starts.
 
+`--coreml` puts the encoder on Core ML's Neural Engine. `LiveTranscriber` runs
+through `Whisper::transcribeAsync` either way: on the kernels that resolves
+before it returns, so a run still starts and ends inside one tick; on Core ML
+it comes back on a later tick, the prediction on the model's queue and the
+decode on the main thread, and until then `update()` starts nothing and the
+audio waits in the queue. A `Whisper` with a run in flight refuses
+`transcribe`, `transcribeAsync`, `setAudioContext` and `prepare` with a
+`std::logic_error`. The first `--coreml` start on a machine is the engine
+compile, about 14 s.
+
 Two build-side requirements. The bundle needs an `Info.plist.in` of its own
 carrying `NSMicrophoneUsageDescription` — set **after**
 `whisper_set_default_target_setting`, which points every bundle here at eacp's
@@ -422,6 +456,18 @@ false, so the suite still passes on a machine with no GPU.
 Every kernel gets a test that asserts against a scalar CPU reference computed in
 the test itself. That is what catches a backend divergence — the same assertion
 runs against MSL on Apple and HLSL on Windows.
+
+`Tests/Net` runs the encoder on Core ML against the kernels' rows under each
+compute-unit setting, and `Tests/Whisper` and the oracle run the whole runtime
+on it. Every Core ML model they compile goes to one fixed cache,
+`<temp>/whisper-eacp-tests/CoreML` (`sharedCoreMLCacheDirectory()` in
+`Tests/Model/Common.h`, handed over through `Whisper::setEncoderCacheDirectory`
+and `CoreMLEncoderOptions::cacheDirectory`), so the 13.5 s engine compile is
+paid once per machine rather than once per test binary. The macOS CI runner
+places everything on the CPU, so `Tests/Net` holds every setting to the CPU's
+tolerance unless `EACP_REQUIRE_ANE=1`; `WHISPER_EACP_SLOW_TESTS=1` adds
+`Net/CoreML/errorByDepth`, which compiles one fixed program per depth into a
+cache of its own and removes it.
 
 ## Code Style
 

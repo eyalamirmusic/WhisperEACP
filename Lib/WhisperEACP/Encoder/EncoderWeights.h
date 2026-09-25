@@ -20,7 +20,8 @@ struct EncoderLayerWeights
     EncoderLayerWeights(const SafeTensors& file,
                         const EncoderShape& shape,
                         int index,
-                        WeightPacking packing);
+                        WeightPacking packing,
+                        WeightPlacement placement);
 
     TensorBuffer attentionNormWeight;
     TensorBuffer attentionNormBias;
@@ -61,13 +62,20 @@ struct EncoderLayerWeights
 // values — and uploaded as the file holds them wherever it is not. Nothing
 // else here moves: the convolutions, the norms, the biases and the positional
 // embedding are float whatever is asked for.
+//
+// Under WeightPlacement::Host nothing is uploaded and packing is moot: every
+// tensor is checked the same way and kept as its shape and its bytes in the
+// file, for the Core ML backend, which writes them into its model's blob. The
+// SafeTensors has to outlive the weights then, since those bytes are its.
 struct EncoderWeights
 {
     EncoderWeights(const SafeTensors& file,
                    const EncoderShape& shapeToUse,
-                   WeightPacking packingToUse = WeightPacking::Float);
+                   WeightPacking packingToUse = WeightPacking::Float,
+                   WeightPlacement placementToUse = WeightPlacement::Device);
 
     EncoderShape shape;
+    WeightPlacement placement = WeightPlacement::Device;
 
     TensorBuffer firstConvolutionWeight;
     TensorBuffer firstConvolutionBias;
