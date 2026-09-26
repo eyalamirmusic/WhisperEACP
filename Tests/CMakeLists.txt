@@ -7,9 +7,13 @@ find_package(NanoTest REQUIRED)
 # SOURCES beside NO_MAIN rather than keeping a copy of its own.
 set(WHISPER_GPU_TEST_MAIN "${CMAKE_CURRENT_LIST_DIR}/Support/GpuTestMain.cpp")
 
+# The same entry point with the model fetch in front of it, for the modules that
+# read the real tiny.en weights. One or the other, never both: it is that file
+# plus a call, and the call has to be outside the event loop the other one opens.
+set(WHISPER_MODEL_TEST_MAIN "${CMAKE_CURRENT_LIST_DIR}/Support/ModelTestMain.cpp")
+
 add_subdirectory(Core)
 add_subdirectory(Audio)
-add_subdirectory(Bundled)
 add_subdirectory(Decoder)
 add_subdirectory(Encoder)
 add_subdirectory(GPU)

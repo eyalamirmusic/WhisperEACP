@@ -10,11 +10,6 @@ namespace LiveTranscribe
 {
 namespace
 {
-constexpr auto missingBundledModel =
-    "this build copied no model beside the binary. Configure with "
-    "-DWHISPER_EACP_FETCH_MODEL=ON to get one, or name a HuggingFace Whisper "
-    "repo on the command line.";
-
 double secondsSince(std::chrono::steady_clock::time_point start)
 {
     const auto elapsed = std::chrono::steady_clock::now() - start;
@@ -26,14 +21,43 @@ Session::Session(std::string modelDirectoryToUse, bool encoderOnCoreML)
     : modelDirectory(std::move(modelDirectoryToUse))
     , usesCoreML(encoderOnCoreML)
 {
-    if (modelDirectory.empty() && !WSP::Whisper::hasBundledModel())
+    message = "loading model...";
+}
+
+// A directory on the command line is already on disk; anything else is the
+// fetch, and on a first run that is 151 MB before there is a model to map.
+// Either way the window is already up when this starts.
+void Session::start()
+{
+    if (!modelDirectory.empty() || WSP::ModelFetch::isAvailable())
     {
-        modelState = ModelState::NotBundled;
-        message = missingBundledModel;
+        loadModel();
+
         return;
     }
 
-    message = "loading model...";
+    modelState = ModelState::Downloading;
+    message = "downloading model...";
+
+    download.onFinished = [this](const WSP::ModelFetch::Outcome& outcome)
+    {
+        if (!outcome.ok)
+        {
+            failWith("the model could not be fetched: " + outcome.error);
+
+            return;
+        }
+
+        modelState = ModelState::Loading;
+        loadModel();
+    };
+
+    download.start();
+}
+
+std::string Session::downloadText() const
+{
+    return WSP::ModelFetch::progressText(download.progress());
 }
 
 void Session::loadModel()
@@ -51,10 +75,8 @@ void Session::loadModel()
 
     try
     {
-        if (modelDirectory.empty())
-            whisper.loadBundled();
-        else
-            whisper.load(modelDirectory);
+        whisper.load(modelDirectory.empty() ? WSP::ModelFetch::directory().string()
+                                            : modelDirectory);
 
         if (usesCoreML)
             whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
@@ -80,12 +102,16 @@ void Session::loadModel()
     modelLoadSeconds = secondsSince(start);
     modelState = ModelState::Ready;
     message = "model ready";
+
+    onModelSettled();
 }
 
 void Session::failWith(std::string reason)
 {
     modelState = ModelState::Failed;
     message = std::move(reason);
+
+    onModelSettled();
 }
 
 bool Session::startCapture()

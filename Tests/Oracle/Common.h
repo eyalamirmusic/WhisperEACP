@@ -52,8 +52,9 @@ inline constexpr auto preprocessorFile = "preprocessor_config.json";
 inline constexpr auto oracleThreads = 4;
 
 // WHISPER_EACP_GGML_MODEL is where the CPM fetch links the file, and
-// WHISPER_GGML_MODEL in the environment points at a copy somebody already has
-// — the same pair as WHISPER_EACP_MODEL_DIR and WHISPER_MODEL_DIR next door.
+// WHISPER_GGML_MODEL in the environment points at a copy somebody already has.
+// This one is still a configure-time download: it is whisper.cpp's own format,
+// fetched beside the library it feeds, and nothing here loads it.
 inline std::filesystem::path ggmlModelPath()
 {
     if (const auto* fromEnvironment = std::getenv("WHISPER_GGML_MODEL"))

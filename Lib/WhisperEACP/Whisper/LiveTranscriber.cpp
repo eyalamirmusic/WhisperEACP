@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <utility>
 
 namespace WSP
 {
@@ -39,6 +40,51 @@ double secondsForSamples(int samples)
 {
     return (double) samples / sampleRate;
 }
+
+eacp::Threads::Async<std::string> resolvedText(const std::string& text)
+{
+    auto promise = eacp::Threads::AsyncPromise<std::string> {};
+    promise.resolve(text);
+
+    return promise.get();
+}
+
+LiveTranscriber::AsyncTranscribeFunction
+    resolvedImmediately(const LiveTranscriber::TranscribeFunction& transcriber)
+{
+    return [transcriber](Span<const float> segment)
+    { return resolvedText(transcriber(segment)); };
+}
+
+// The runtime as a transcriber. The context is set per run rather than once,
+// because the segment grows: a run over 2 s of it encodes fewer positions than
+// the run over 6 s that closes it, and the count each one wants is the one its
+// own audio fills.
+//
+// On the kernels the Async is resolved before transcribeAsync returns, so the
+// text is too, and the run is over when the call is.
+LiveTranscriber::AsyncTranscribeFunction whisperTranscriber(Whisper& whisper,
+                                                            LiveOptions options)
+{
+    return [&whisper, options](Span<const float> segment)
+    {
+        if (options.encodeOnlyTheAudioThereIs)
+            whisper.setAudioContext(Whisper::audioContextForSamples(
+                segment.size(), options.audioContextMarginSeconds));
+
+        auto text = eacp::Threads::AsyncPromise<std::string> {};
+
+        const auto decodeText = [&whisper, text](const Vector<TokenId>& tokens)
+        { text.resolve(whisper.textForTokens(tokens)); };
+
+        const auto passOnFailure = [text](const std::string& error)
+        { text.reject(error); };
+
+        whisper.transcribeAsync(segment).then(decodeText, passOnFailure);
+
+        return text.get();
+    };
+}
 } // namespace
 
 float blockLevelDb(Span<const float> block)
@@ -64,9 +110,21 @@ bool isSpeechBlock(Span<const float> block, float thresholdDb)
     return blockLevelDb(block) > thresholdDb;
 }
 
-LiveTranscriber::LiveTranscriber(Whisper& whisper, LiveOptions optionsToUse)
-    : model(whisper)
+LiveTranscriber::LiveTranscriber(AsyncTranscribeFunction transcriber,
+                                 LiveOptions optionsToUse)
+    : transcribeSegment(std::move(transcriber))
     , liveOptions(optionsToUse)
+{
+}
+
+LiveTranscriber::LiveTranscriber(TranscribeFunction transcriber,
+                                 LiveOptions optionsToUse)
+    : LiveTranscriber(resolvedImmediately(transcriber), optionsToUse)
+{
+}
+
+LiveTranscriber::LiveTranscriber(Whisper& whisper, LiveOptions optionsToUse)
+    : LiveTranscriber(whisperTranscriber(whisper, optionsToUse), optionsToUse)
 {
 }
 
@@ -245,27 +303,19 @@ bool LiveTranscriber::runIsDue() const
                   >= samplesForSeconds(liveOptions.minNewSpeechSeconds);
 }
 
-// The context is set per run rather than once, because the segment grows: a
-// run over 2 s of it encodes fewer positions than the run over 6 s that closes
-// it, and the count each one wants is the one its own audio fills.
-//
-// On the kernels the Async is resolved before transcribeAsync returns, so the
-// continuation runs inside then() and the run is over when this returns.
+// A transcriber that answers before it returns runs the continuation inside
+// then(), so the run is over when this returns.
 void LiveTranscriber::startRun(bool closesTheSegment)
 {
-    if (liveOptions.encodeOnlyTheAudioThereIs)
-        model.setAudioContext(Whisper::audioContextForSamples(
-            segment.size(), liveOptions.audioContextMarginSeconds));
-
     const auto start = std::chrono::steady_clock::now();
-    pendingRun = model.transcribeAsync(segment);
+    pendingRun = transcribeSegment(segment);
     runInFlight = true;
 
     const auto alive = std::weak_ptr<int> {lifetime};
     const auto runGeneration = generation;
 
     const auto finish = [this, alive, runGeneration, start, closesTheSegment](
-                            const Vector<TokenId>& tokens)
+                            const std::string& text)
     {
         if (alive.expired())
             return;
@@ -276,7 +326,7 @@ void LiveTranscriber::startRun(bool closesTheSegment)
             return;
 
         const auto elapsed = std::chrono::steady_clock::now() - start;
-        finishRun(withoutSurroundingSpace(model.textForTokens(tokens)),
+        finishRun(withoutSurroundingSpace(text),
                   std::chrono::duration<double>(elapsed).count(),
                   closesTheSegment);
     };

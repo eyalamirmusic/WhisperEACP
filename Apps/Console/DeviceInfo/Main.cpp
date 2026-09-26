@@ -24,7 +24,7 @@ namespace
 constexpr auto usage =
     "usage: DeviceInfo [--plan]\n"
     "\n"
-    "  --plan  load the bundled model with its encoder on Core ML and print\n"
+    "  --plan  load the fetched model with its encoder on Core ML and print\n"
     "          where Core ML placed the encoder's ops. Reading the plan costs\n"
     "          the Neural Engine compile again, about 14 s, and a first load\n"
     "          on a machine another 14 s.\n";
@@ -100,10 +100,11 @@ double secondsSince(std::chrono::steady_clock::time_point start)
 
 void printEncoderPlan()
 {
-    if (!WSP::Whisper::hasBundledModel())
+    if (!WSP::ModelFetch::isAvailable())
     {
-        std::printf("  plan                      no bundled model: configure "
-                    "with -DWHISPER_EACP_FETCH_MODEL=ON\n");
+        std::printf("  plan                      no model: the fetch into %s "
+                    "did not finish\n",
+                    WSP::ModelFetch::directory().string().c_str());
         return;
     }
 
@@ -118,7 +119,7 @@ void printEncoderPlan()
     try
     {
         auto whisper = WSP::Whisper {};
-        whisper.loadBundled();
+        whisper.load(WSP::ModelFetch::directory());
         whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
         whisper.prepare();
 
@@ -188,6 +189,11 @@ int main(int argc, char* argv[])
 
         readsThePlan = true;
     }
+
+    // Before the loop, since ModelFetch::fetch pumps it; a failure is left for
+    // the plan line to report.
+    if (readsThePlan)
+        WSP::ModelFetch::fetch();
 
     Apps::setCommandLineArgs(argc, argv);
     return Apps::run(printDeviceInfo);

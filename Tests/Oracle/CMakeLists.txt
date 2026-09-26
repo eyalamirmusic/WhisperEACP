@@ -28,13 +28,12 @@ nano_add_executable(OracleTests
         MelOracleTests.cpp
         TokenizerOracleTests.cpp
         TranscriptOracleTests.cpp
-        ${WHISPER_GPU_TEST_MAIN}
+        ${WHISPER_MODEL_TEST_MAIN}
         TARGETS whisper-runtime whisper)
 
-# Set the same way Tests/Model and Tests/Encoder set theirs: the tests compile
-# against a real path whether or not anything was fetched, and skip on the
-# file's absence rather than on an #ifdef.
+# The GGML model and jfk.wav are still paths the configure fixes: whisper.cpp's
+# own fetch puts both in the build tree, and the tests skip on their absence.
+# Ours is ModelFetch::directory() and needs no definition.
 target_compile_definitions(OracleTests PRIVATE
-        WHISPER_EACP_MODEL_DIR="${WHISPER_EACP_MODEL_DIR}"
         WHISPER_EACP_GGML_MODEL="${WHISPER_EACP_GGML_MODEL}"
         WHISPER_EACP_JFK_WAV="${whisper-cpp_SOURCE_DIR}/samples/jfk.wav")

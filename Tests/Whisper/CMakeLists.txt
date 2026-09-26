@@ -14,11 +14,12 @@ nano_add_executable(WhisperTests
         PackedWeightsTests.cpp
         TranscribeTests.cpp
         WhisperTests.cpp
-        ${WHISPER_GPU_TEST_MAIN}
+        ${WHISPER_MODEL_TEST_MAIN}
         TARGETS whisper-runtime)
 
-# Both set whether or not the fetch ran, so the tests compile against real paths
-# either way and skip on a file's absence rather than on an #ifdef.
+# The samples are committed, so this one is a path into the source tree. The
+# model is not a path at all any more: ModelFetch::directory() is where the
+# runtime fetch put it, and the tests skip on a file's absence as they always
+# did.
 target_compile_definitions(WhisperTests PRIVATE
-        WHISPER_EACP_MODEL_DIR="${WHISPER_EACP_MODEL_DIR}"
         WHISPER_EACP_SAMPLE_DIR="${WHISPER_EACP_SAMPLE_DIR}")

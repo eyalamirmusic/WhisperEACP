@@ -30,7 +30,7 @@ if (APPLE)
             "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in")
 endif ()
 
-# Into Contents/Resources/WhisperModel, which is where Whisper::loadBundled()
-# looks. A no-op when the build fetched no model, and then the window says so
-# rather than the app failing to start.
-whisper_bundle_model(LiveTranscribe)
+# Nothing is copied into Contents/Resources: the four model files are fetched at
+# startup (Model/ModelFetch.h) into a directory every binary in this tree shares,
+# and the window draws the download rather than the build paying for it. The
+# bundle is 2 MB again.

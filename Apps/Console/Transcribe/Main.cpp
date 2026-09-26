@@ -13,24 +13,28 @@
 #include <string>
 #include <string_view>
 
-// The whole runtime as a binary, in three forms: with no arguments it runs the
-// model the build copied beside it on the recording it carries inside itself,
+// The whole runtime as a binary, in three forms: with no arguments it fetches
+// openai/whisper-tiny.en and runs it on the recording it carries inside itself,
 // with one it runs that model on a WAV of yours, and with two it takes a
-// HuggingFace directory as well. Either way it prints the transcript and what
-// each half of the run cost.
+// HuggingFace directory of your own as well. Either way it prints the transcript
+// and what each half of the run cost.
 //
 // Inside eacp::Apps::run for the reason every GPU-touching thing here is — the
 // Metal backend is written against the run loop and autorelease pool that owns,
 // and DeviceInfo next door is the same shape.
+//
+// The model fetch is the one thing that happens *outside* it, in main:
+// ModelFetch::fetch pumps the event loop until the four files are on disk, which
+// is what a console main may do and a callback running inside that loop may not.
 
 using namespace eacp;
 
 namespace
 {
 constexpr auto usage =
-    "usage: Transcribe                                  bundled model, "
+    "usage: Transcribe                                  fetched model, "
     "built-in sample\n"
-    "       Transcribe <wav file>                       bundled model\n"
+    "       Transcribe <wav file>                       fetched model\n"
     "       Transcribe <model directory> <wav file>\n"
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
@@ -41,14 +45,9 @@ constexpr auto usage =
     "                   the whole 30 s window, or 'audio' for the count the\n"
     "                   recording itself fills\n"
     "\n"
-    "The built-in sample is 11 s of Kennedy's inaugural address. The bundled\n"
-    "model is whisper-tiny.en, copied beside this binary by a build configured\n"
-    "with -DWHISPER_EACP_FETCH_MODEL=ON.\n";
-
-constexpr auto missingBundledModel =
-    "this build copied no model beside the binary, so there is nothing to run\n"
-    "without a model directory. Configure with -DWHISPER_EACP_FETCH_MODEL=ON to\n"
-    "get one, or name a HuggingFace Whisper repo on the command line.\n\n";
+    "The built-in sample is 11 s of Kennedy's inaugural address. The fetched\n"
+    "model is openai/whisper-tiny.en, downloaded once into this machine's own\n"
+    "application-support directory and found there by every later run.\n";
 
 constexpr auto embeddedSample = "jfk.wav";
 constexpr auto embeddedSampleCategory = "TranscribeSamples";
@@ -97,12 +96,12 @@ struct Request
 
     static constexpr int fromTheAudio = -1;
 
-    bool usesBundledModel() const { return modelDirectory.empty(); }
+    bool usesFetchedModel() const { return modelDirectory.empty(); }
     bool usesEmbeddedSample() const { return wavFile.empty(); }
 
     std::string modelPath() const
     {
-        return usesBundledModel() ? WSP::Whisper::bundledModelDirectory().string()
+        return usesFetchedModel() ? WSP::ModelFetch::directory().string()
                                   : modelDirectory;
     }
 
@@ -173,12 +172,7 @@ void run(const Request& request)
     const auto start = std::chrono::steady_clock::now();
 
     auto whisper = WSP::Whisper {};
-
-    if (request.usesBundledModel())
-        whisper.loadBundled();
-    else
-        whisper.load(request.modelDirectory);
-
+    whisper.load(request.modelPath());
     whisper.prepare();
 
     const auto samples = request.usesEmbeddedSample()
@@ -198,25 +192,54 @@ void run(const Request& request)
     report(whisper, tokens.size(), loading);
 }
 
+// At file scope because the fetch happens in main and the run happens inside the
+// loop, and the two read the same one.
+Request request;
+
+// One line rewritten rather than one per update: 151 MB at a report every 100 ms
+// is a few hundred of them. Nothing is printed for a file that was already on
+// disk, which is every run but the first.
+void printFetchProgress(const WSP::ModelFetch::Progress& progress)
+{
+    if (progress.file.stage != eacp::OnlineResource::Progress::Stage::downloading)
+        return;
+
+    std::printf("\r  %-58s", WSP::ModelFetch::progressText(progress).c_str());
+    std::fflush(stdout);
+}
+
+// The model on disk before anything else happens, for the two forms that did not
+// name one. False is "there is nothing to run", and the exit code is main's
+// rather than Apps::setReturnValue's, this being before the loop that owns that.
+bool fetchModelIfNeeded()
+{
+    if (!request.usesFetchedModel())
+        return true;
+
+    const auto announceDownload = !WSP::ModelFetch::isAvailable();
+
+    if (announceDownload)
+        std::printf("fetching %s into %s\n",
+                    WSP::ModelFetch::repository,
+                    WSP::ModelFetch::directory().string().c_str());
+
+    const auto outcome = WSP::ModelFetch::fetch(WSP::ModelFetch::Freshness::trust,
+                                                printFetchProgress);
+
+    if (announceDownload)
+        std::printf("\n");
+
+    if (outcome.ok)
+        return true;
+
+    std::printf(
+        "the model could not be fetched: %s\n\n%s", outcome.error.c_str(), usage);
+
+    return false;
+}
+
 void transcribe()
 {
-    const auto& arguments = Apps::getAppEnvironment().commandLineArgs;
-    auto request = Request {};
-
-    if (!parse(arguments, request))
-    {
-        std::printf("%s", usage);
-        Apps::setReturnValue(2);
-        return;
-    }
-
-    if (request.usesBundledModel() && !WSP::Whisper::hasBundledModel())
-    {
-        std::printf("%s%s", missingBundledModel, usage);
-        Apps::setReturnValue(2);
-        return;
-    }
-
     if (!GPU::Device::shared().isValid())
     {
         std::printf("no GPU device available - nothing here can run\n");
@@ -241,5 +264,15 @@ void transcribe()
 int main(int argc, char* argv[])
 {
     Apps::setCommandLineArgs(argc, argv);
+
+    if (!parse(Apps::getAppEnvironment().commandLineArgs, request))
+    {
+        std::printf("%s", usage);
+        return 2;
+    }
+
+    if (!fetchModelIfNeeded())
+        return 2;
+
     return Apps::run(transcribe);
 }

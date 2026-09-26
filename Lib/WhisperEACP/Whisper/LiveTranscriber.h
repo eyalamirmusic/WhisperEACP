@@ -2,6 +2,7 @@
 
 #include <WhisperEACP/Whisper/Whisper.h>
 
+#include <functional>
 #include <memory>
 #include <string>
 
@@ -81,16 +82,34 @@ struct LiveStats
 // re-transcribed as audio arrives, and closed into `committed()` on silence or
 // on length. Main thread only, like the Whisper it drives.
 //
-// A run goes through Whisper::transcribeAsync. On the kernels that resolves
-// before it returns, so a run starts and finishes inside one update(), as it
-// always has. Under the Core ML encoder it comes back on a later turn of the
-// event loop, and until then the transcriber holds still: update() starts
-// nothing and takes no audio, which waits in the queue push() fills, and the
-// result lands where the blocking run's did when it resolves. A segment that
-// closes on a run commits when that run comes back.
+// A run is a call to the transcriber, whose answer may come back later. A
+// blocking one, or Whisper::transcribeAsync on the kernels, resolves before it
+// returns, so a run starts and finishes inside one update(), as it always has.
+// Under the Core ML encoder it comes back on a later turn of the event loop,
+// and until then the transcriber holds still: update() starts nothing and
+// takes no audio, which waits in the queue push() fills, and the result lands
+// where the blocking run's did when it resolves. A segment that closes on a run
+// commits when that run comes back.
 class LiveTranscriber
 {
 public:
+    // The open segment's samples in, its transcript out. Whatever transcribes
+    // is the caller's: the policy below is written against audio time and the
+    // text a run answers, and neither is a question about the model.
+    using TranscribeFunction = std::function<std::string(Span<const float>)>;
+
+    // The same for a transcriber that answers on a later turn of the loop.
+    using AsyncTranscribeFunction =
+        std::function<eacp::Threads::Async<std::string>(Span<const float>)>;
+
+    explicit LiveTranscriber(TranscribeFunction transcriber,
+                             LiveOptions options = {});
+
+    explicit LiveTranscriber(AsyncTranscribeFunction transcriber,
+                             LiveOptions options = {});
+
+    // The runtime, which is the async function over Whisper::transcribeAsync
+    // with encodeOnlyTheAudioThereIs applied to the segment before each run.
     explicit LiveTranscriber(Whisper& whisper, LiveOptions options = {});
 
     LiveTranscriber(const LiveTranscriber&) = delete;
@@ -149,7 +168,7 @@ private:
 
     int maximumSegmentSamples() const;
 
-    Whisper& model;
+    AsyncTranscribeFunction transcribeSegment;
     LiveOptions liveOptions;
 
     // What push() took and no block has claimed yet, and the open segment the
@@ -178,7 +197,7 @@ private:
 
     // The run in flight, if any; which segment it belongs to, so a result
     // that comes back after clear() is dropped; and what update() reports.
-    eacp::Threads::Async<Vector<TokenId>> pendingRun;
+    eacp::Threads::Async<std::string> pendingRun;
     bool runInFlight = false;
     int generation = 0;
     bool hasChanged = false;

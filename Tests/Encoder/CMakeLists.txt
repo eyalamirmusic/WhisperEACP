@@ -10,10 +10,5 @@ nano_add_executable(EncoderTests
         SOURCES
         EncoderTests.cpp
         TinyEnEncoderTests.cpp
-        ${WHISPER_GPU_TEST_MAIN}
+        ${WHISPER_MODEL_TEST_MAIN}
         TARGETS whisper-encoder)
-
-# Set whether or not the fetch ran, so the tests against the real weights
-# compile either way and skip on the file's absence rather than on an #ifdef.
-target_compile_definitions(EncoderTests PRIVATE
-        WHISPER_EACP_MODEL_DIR="${WHISPER_EACP_MODEL_DIR}")

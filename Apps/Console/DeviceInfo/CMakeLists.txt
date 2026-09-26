@@ -1,10 +1,6 @@
 add_executable(DeviceInfo Main.cpp)
 target_link_libraries(DeviceInfo PRIVATE WhisperEACP)
 
-# For --plan, which loads the model to ask Core ML where it put the encoder;
-# a no-op when the build fetched no model, which --plan then says.
-whisper_bundle_model(DeviceInfo)
-
 set(BUNDLE_ID "com.eacp.whisper.deviceinfo")
 
 if (APPLE)

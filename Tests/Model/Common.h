@@ -132,15 +132,17 @@ inline bool nearlyEqual(float actual, float expected, float tolerance = 1.0e-6f)
     return (difference < 0 ? -difference : difference) <= tolerance;
 }
 
-// WHISPER_EACP_MODEL_DIR is where the CPM fetch assembles the real files, and
-// WHISPER_MODEL_DIR in the environment points at a checkout somebody already
-// has. Both may be absent, which is what the skips below are for.
+// ModelFetch::directory() is where the runtime fetch put the four files — the
+// entry point in Tests/Support/ModelTestMain.cpp is what fetched them, before
+// the suite opened — and WHISPER_MODEL_DIR in the environment points at a
+// checkout somebody already has instead. Either may be empty of the file a test
+// wants, which is what the skips below are for.
 inline std::filesystem::path modelDirectory()
 {
     if (const auto* fromEnvironment = std::getenv("WHISPER_MODEL_DIR"))
         return {fromEnvironment};
 
-    return {WHISPER_EACP_MODEL_DIR};
+    return ModelFetch::directory();
 }
 
 inline std::filesystem::path modelFile(std::string_view name)

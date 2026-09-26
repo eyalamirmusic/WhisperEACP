@@ -6,10 +6,10 @@
 #include <vector>
 
 // The real openai/whisper-tiny.en weights, which are a download and never a
-// commit: configure with -DWHISPER_EACP_FETCH_MODEL=ON, or point
-// WHISPER_MODEL_DIR at a checkout that already has them. Both tests here return
-// early when the files are absent, the same shape as a GPU test returning early
-// on an invalid device.
+// commit: this binary's entry point fetched them before the suite opened, or
+// WHISPER_MODEL_DIR points at a checkout that already has them. Both tests here
+// return early when the files are absent — no network, say — the same shape as a
+// GPU test returning early on an invalid device.
 
 using namespace nano;
 using namespace WSP;

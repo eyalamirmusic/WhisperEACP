@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <functional>
 #include <iostream>
 #include <numbers>
 #include <string>
@@ -154,6 +155,40 @@ TrailingSilenceDrive driveJfkThenSilence(double minNewSpeechSeconds)
         drive.committedLine = trimmed(live.committed()[0]);
 
     return drive;
+}
+
+// The same audio through any transcriber: jfk.wav a block at a time and then
+// the silence that closes the segment, which is what every drive above does.
+struct Drive
+{
+    int runs = 0;
+    int committed = 0;
+    std::string firstLine;
+};
+
+Drive driveJfkThenTheHold(LiveTranscriber& live)
+{
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto trailingSilence = silentChunk(2 * sampleRate);
+
+    pushChunked(live, samples, blockSamples);
+    pushChunked(live, trailingSilence, blockSamples);
+
+    auto drive = Drive {};
+    drive.runs = live.stats().runs;
+    drive.committed = live.committed().size();
+
+    if (drive.committed > 0)
+        drive.firstLine = trimmed(live.committed()[0]);
+
+    return drive;
+}
+
+bool strictlyIncreasing(const std::vector<int>& values)
+{
+    return std::adjacent_find(
+               values.begin(), values.end(), std::greater_equal<int> {})
+           == values.end();
 }
 } // namespace
 
@@ -621,4 +656,47 @@ auto tCoreMLUpdateDoesNotWaitForTheEngine =
 
     std::cout << "  jfk on Core ML without waiting: " << live.stats().runs
               << " runs\n";
+};
+
+// The layer drives a function rather than a Whisper, and the Whisper
+// constructor is that function over the runtime. Nothing in the policy asks
+// the model anything — a run is due on audio time, and the text only decides
+// whether committed() changed — so a fake that records what it was handed takes
+// exactly the runs, over exactly the segments, the model takes on the same
+// audio. That is what lets the benchmark stream whisper.cpp through this.
+auto tACallbackTakesTheSameRuns = test("Live/aCallbackTakesTheSameRuns") = []
+{
+    if (!canRun())
+        return;
+
+    auto segmentSamples = std::vector<int> {};
+
+    auto fake = LiveTranscriber {
+        [&segmentSamples](Span<const float> segment)
+        {
+            segmentSamples.push_back(segment.size());
+            return "  line " + std::to_string(segmentSamples.size()) + "  ";
+        }};
+
+    const auto throughTheFake = driveJfkThenTheHold(fake);
+
+    auto overTheModel = LiveTranscriber {preparedModel()};
+    const auto throughTheModel = driveJfkThenTheHold(overTheModel);
+
+    check(throughTheFake.runs == throughTheModel.runs);
+    check(throughTheFake.committed == throughTheModel.committed);
+    check(throughTheModel.firstLine == jfkTranscript);
+
+    check((int) segmentSamples.size() == throughTheFake.runs);
+    check(strictlyIncreasing(segmentSamples));
+    check(segmentSamples.back() <= windowSamples);
+
+    // The last run of a segment is the one whose text is committed, and the
+    // surrounding space comes off a callback's answer as it does the model's.
+    check(throughTheFake.firstLine
+          == "line " + std::to_string(segmentSamples.size()));
+
+    std::cout << "  a fake transcriber: " << throughTheFake.runs
+              << " runs over segments of " << segmentSamples.front() << " to "
+              << segmentSamples.back() << " samples\n";
 };
