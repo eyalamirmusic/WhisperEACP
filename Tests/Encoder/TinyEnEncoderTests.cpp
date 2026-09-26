@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <iostream>
+#include <stdexcept>
 
 // The real openai/whisper-tiny.en weights, which are a download and never a
 // commit: this binary's entry point fetched them before the suite opened, or
@@ -163,4 +164,135 @@ auto tTinyEnReducedContextMatchesReference =
               << " positions: worst error " << worst << "\n";
 
     check(worst <= 1e-4);
+};
+
+// What WeightPacking::ExactHalf actually did to the real weights: tiny.en's
+// tensors are fp16 values in an F32 container, so every one of the six
+// projections of every layer narrows exactly and none of them falls back to
+// the float upload. 28 MB of encoder weights read as 14.
+//
+// The fallback is the thing worth asserting against. It is silent by design —
+// a weight that would lose something keeps the float it shipped — so a bug
+// that stopped the packing from ever firing would leave every other assertion
+// in this suite passing and the bandwidth exactly where it was.
+auto tTinyEnEncoderPacksEveryProjection =
+    test("Encoder/TinyEn/exactHalfPacksEveryProjection") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, shortInputFrames);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto weights = EncoderWeights {file, shape, WeightPacking::ExactHalf};
+
+    for (const auto& layer: weights.layers)
+    {
+        check(layer.queryWeight.isPackedHalf());
+        check(layer.keyWeight.isPackedHalf());
+        check(layer.valueWeight.isPackedHalf());
+        check(layer.attentionOutputWeight.isPackedHalf());
+        check(layer.feedForwardWeight.isPackedHalf());
+        check(layer.feedForwardOutputWeight.isPackedHalf());
+
+        // The biases and the norms are subscripted inside Linear and
+        // LayerNorm, neither of which has a packed read, so the policy leaves
+        // them alone.
+        check(!layer.queryBias.isPackedHalf());
+        check(!layer.attentionNormWeight.isPackedHalf());
+    }
+
+    // The convolutions and the positional rows are float as well: the policy
+    // is over the projections, and those three go through the loader's float
+    // path whatever it is set to.
+    check(!weights.firstConvolutionWeight.isPackedHalf());
+    check(!weights.secondConvolutionWeight.isPackedHalf());
+    check(!weights.positionalEmbedding.isPackedHalf());
+};
+
+// The weights a Core ML encoder writes into its blob: every tensor checked as
+// the device load checks it, nothing uploaded, and each one the file's bytes
+// under the shape the device load gives it.
+auto tTinyEnHostWeights = test("Encoder/TinyEn/hostWeightsAreTheFile") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, config.encoderInputFrames());
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto device = EncoderWeights {file, shape, WeightPacking::ExactHalf};
+    const auto host = EncoderWeights {
+        file, shape, WeightPacking::ExactHalf, WeightPlacement::Host};
+
+    check(device.placement == WeightPlacement::Device);
+    check(host.placement == WeightPlacement::Host);
+
+    const auto sameTensor = [](const TensorBuffer& onHost, const TensorBuffer& onGpu)
+    {
+        return onHost.isHostOnly() && !onGpu.isHostOnly()
+               && onHost.shape == onGpu.shape && onHost.fileBytes == onGpu.fileBytes
+               && onHost.fileType == TensorType::F32;
+    };
+
+    check(sameTensor(host.firstConvolutionWeight, device.firstConvolutionWeight));
+    check(sameTensor(host.secondConvolutionBias, device.secondConvolutionBias));
+    check(sameTensor(host.positionalEmbedding, device.positionalEmbedding));
+    check(sameTensor(host.finalNormBias, device.finalNormBias));
+    check(host.layers.size() == device.layers.size());
+
+    for (auto index = 0; index < host.layers.size(); ++index)
+    {
+        const auto& onHost = host.layers[index];
+        const auto& onGpu = device.layers[index];
+
+        check(sameTensor(onHost.queryWeight, onGpu.queryWeight));
+        check(sameTensor(onHost.keyWeight, onGpu.keyWeight));
+        check(sameTensor(onHost.feedForwardWeight, onGpu.feedForwardWeight));
+        check(sameTensor(onHost.feedForwardOutputBias, onGpu.feedForwardOutputBias));
+        check(onHost.feedForwardWeight.fileBytes.size()
+              == shape.feedForwardWidth * shape.width * (int) sizeof(float));
+    }
+
+    check(readFileFloats(host.finalNormWeight)
+          == file.readFloats("model.encoder.layer_norm.weight"));
+};
+
+auto tKernelEncoderRefusesHostWeights =
+    test("Encoder/TinyEn/kernelEncoderRefusesHostWeights") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = EncoderShape::fromConfig(config, shortInputFrames);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto host =
+        EncoderWeights {file, shape, WeightPacking::Float, WeightPlacement::Host};
+
+    auto& device = Device::shared();
+
+    auto encoder = Encoder {shape};
+    encoder.prepare(device);
+
+    const auto mel = storageOf(syntheticMel(shape));
+    const auto output = outputFor(shape.elementCount());
+
+    auto threwLogicError = false;
+    auto commands = device.makeCommandBuffer();
+
+    try
+    {
+        auto pass = commands.beginCompute();
+        encoder.encode(pass, mel, host, output);
+    }
+    catch (const std::logic_error&)
+    {
+        threwLogicError = true;
+    }
+
+    check(threwLogicError);
 };

@@ -2,6 +2,7 @@
 
 #include <WhisperEACP/Decoder/DecoderShape.h>
 #include <WhisperEACP/Model/SafeTensors.h>
+#include <WhisperEACP/Model/TensorLoader.h>
 
 #include <optional>
 
@@ -25,7 +26,8 @@ struct DecoderLayerWeights
 {
     DecoderLayerWeights(const SafeTensors& file,
                         const DecoderShape& shape,
-                        int index);
+                        int index,
+                        WeightPacking packing);
 
     TensorBuffer selfAttentionNormWeight;
     TensorBuffer selfAttentionNormBias;
@@ -74,47 +76,45 @@ struct DecoderLayerWeights
 // half-reading variant and the Decoder picks it by TensorBuffer::storage. Every
 // other tensor here is bound to a program that has no half read — LayerNorm and
 // the embedding gather subscript a float buffer, and every bias is a float
-// subscript inside Linear itself — so a packed one there would be wrong by a
-// factor of two in every index while staying silent, and is rejected with a
-// ModelError naming the tensor and saying which kernel reads it.
+// subscript inside Linear itself — so an fp16 one is widened on the way to the
+// device rather than bound at half the stride it was written at, which would be
+// wrong in every index while staying silent on both backends. That is what
+// lets a repo shipped in fp16 load at all.
 //
 // embed_tokens is the tensor that decides its own case, because it is the one
 // bound twice. The gather that builds `h = embed_tokens[token] +
 // embed_positions[t]` subscripts it as floats; the logits projection at the end
-// could read it packed through Linear. One buffer cannot be both, and the
-// gather is the reader with no packed form, so **embed_tokens must be F32** and
-// a packed one is a ModelError naming it. That costs a fp16 repo 40 MB on the
-// widening path in SafeTensors rather than a second copy of the matrix, and it
-// keeps the tie between the embedding and the logits exact instead of exact
-// only up to a conversion.
+// could read it packed through Linear. One buffer cannot be both, so
+// **tokenEmbedding is always the float one** — widened from the file where the
+// file is fp16 — and the packed form is the second copy below rather than a
+// storage the gather would have to live with. Widening is exact, so the tie
+// between the embedding and the logits stays exact rather than exact only up
+// to a conversion.
 //
-// The one buffer that cannot be both is why LogitsWeight below is a *second*
-// copy rather than a choice of storage for the one tensor: the gather keeps
-// its floats and the projection gets the halves.
+// The one buffer that cannot be both is why the packed logits weight is a
+// *second* copy rather than a choice of storage for the one tensor: the gather
+// keeps its floats and the projection gets the halves.
+//
+// **The packing policy is one switch over both.** Under
+// WeightPacking::ExactHalf every projection weight of every layer is narrowed
+// to fp16 wherever narrowing is bit-exact, and embed_tokens gets that second
+// copy for the logits — 33 MB of a step's layer weights read as 16.5, and the
+// vocabulary projection's 80 MB read as 40, which was 133 us of a 590 us step
+// and is about 70. Under WeightPacking::Float everything is uploaded as the
+// file holds it and the logits read the tied weight.
+//
+// **It is not a numerical trade.** A weight is packed only where narrowing is
+// bit-exact, which for a Whisper repo is everywhere: OpenAI's checkpoints are
+// fp16 and HuggingFace's conversion only widens them, so every one of
+// tiny.en's 167 tensors round-trips through fp16 unchanged and the logits come
+// out identical to the last bit. A repo genuinely saved in fp32 keeps the
+// float weights it shipped and the tied logits weight, which is why this asks
+// for half the bytes rather than promising them.
 struct DecoderWeights
 {
-    // What the logits projection reads. Tied is embed_tokens itself, the
-    // matrix the gather reads. PackedHalfCopy is a second, fp16 copy of it
-    // kept beside the float one, so the projection reads 40 MB a step instead
-    // of 80 — 133 us of a 590 us step down to about 70.
-    //
-    // **It is not a numerical trade.** The copy is made only where narrowing
-    // is bit-exact, which for a Whisper repo is everywhere: OpenAI's
-    // checkpoints are fp16 and HuggingFace's conversion only widens them, so
-    // every one of tiny.en's 167 tensors round-trips through fp16 unchanged
-    // and the logits are identical to the last bit. A repo genuinely saved in
-    // fp32 gets no copy and the tied weight, which is why this asks for a copy
-    // rather than promising one — packedTokenEmbedding is empty when the file
-    // would have lost something.
-    enum class LogitsWeight
-    {
-        Tied,
-        PackedHalfCopy
-    };
-
     DecoderWeights(const SafeTensors& file,
                    const DecoderShape& shapeToUse,
-                   LogitsWeight logitsWeightToUse = LogitsWeight::Tied);
+                   WeightPacking packingToUse = WeightPacking::Float);
 
     DecoderShape shape;
 
@@ -123,7 +123,8 @@ struct DecoderWeights
     // them.
     TensorBuffer tokenEmbedding;
 
-    // The fp16 copy of the above, present only under PackedHalfCopy.
+    // The fp16 copy of the above, present only under WeightPacking::ExactHalf
+    // and only when the file's own values survive the narrowing.
     std::optional<TensorBuffer> packedTokenEmbedding;
 
     // What Decoder::step binds for the logits, which is the one place the

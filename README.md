@@ -36,8 +36,23 @@ The pipeline runs end to end: 30 seconds of audio in, a string out, through the
 mel front-end, the encoder, the decoder's KV-cached loop and the greedy search,
 checked against a double-precision reference at every layer and against
 whisper.cpp at the mel, the logits and the transcript. `plan.md` carries what
-came in which order, and the gaps this surfaced in eacp, Miro and ResEmbed —
-the second half of the point.
+came in which order, the four performance rounds, and the gaps this surfaced in
+eacp, Miro and ResEmbed — the second half of the point.
+
+### Where it stands
+
+`tiny.en` on jfk.wav, an M5 Max, the median of 30 timed runs, against
+whisper.cpp v1.9.3 in the same process (the table `Benchmark` prints; see
+[Benchmarking](#benchmarking) for what each row does and does not measure):
+
+| | WhisperEACP | whisper.cpp Metal | whisper.cpp CPU |
+| --- | --- | --- | --- |
+| transcribe, median | **0.0177 s** | 0.031 s | 0.103 s |
+| x real time, over the 30 s window | **1696** | 976 | 292 |
+| encode, median | **0.0052 s** | 0.005 s | 0.076 s |
+| decode, median, 25 steps | **0.0123 s** | 0.0143 s | 0.0140 s |
+
+The transcript is the same token for token in all three columns.
 
 ## Layout
 
@@ -45,26 +60,105 @@ the second half of the point.
 | --- | --- |
 | `Lib/WhisperEACP/Core` | Shared types and the library version. Links `eacp-gpu` |
 | `Lib/WhisperEACP/Audio` | Whisper's audio contract, and capture through MakeASound |
-| `Lib/WhisperEACP/Kernels` | layernorm, GELU, softmax, matmul — shapes as uniforms |
+| `Lib/WhisperEACP/Kernels` | layernorm, GELU, softmax, conv1d, attention and the matrix products — shapes as uniforms, so the encoder and decoder are written out of them |
 | `Lib/WhisperEACP/Mel` | Hann, STFT, the 80 x 201 filterbank, log10 and the scaling |
 | `Lib/WhisperEACP/Model` | safetensors weights, `config.json`, the filterbank |
 | `Lib/WhisperEACP/Tokenizer` | byte-level BPE and Whisper's special tokens |
-| `Lib/WhisperEACP/Encoder` | HF's `WhisperEncoder.forward`, recorded into one command buffer |
+| `Lib/WhisperEACP/Net` | The ops the encoder and decoder are written against, once, and the backends that run them: the kernels, and Core ML for the encoder |
+| `Lib/WhisperEACP/Encoder` | HF's `WhisperEncoder.forward`, recorded into one command buffer, or into one Core ML model (`CoreMLEncoder`, Apple only) |
 | `Lib/WhisperEACP/Decoder` | The same for the text half, over a KV cache |
-| `Lib/WhisperEACP/Whisper` | The whole runtime — samples in, a transcript out |
-| `Apps/Console/DeviceInfo` | What this machine offers: GPU limits and input devices |
+| `Lib/WhisperEACP/Whisper` | The whole runtime — samples in, a transcript out — and `LiveTranscriber` above it |
+| `Apps/Console/DeviceInfo` | What this machine offers: GPU limits, input devices and Core ML; `--plan` loads the fetched model on Core ML and prints where the encoder's ops were placed |
 | `Apps/Console/Transcribe` | A WAV file in, the transcript and what it cost out |
 | `Apps/Demo/LiveTranscribe` | A window: pick an input, watch the meter, read the transcript as it arrives |
 | `Samples` | `jfk.wav`, the recording the end-to-end tests run on |
-| `Tests` | NanoTest, one executable per module |
+| `Tests` | NanoTest, one executable per module; `Tests/Oracle` compares against whisper.cpp |
 | `Benchmark` | Our runtime against whisper.cpp, in one process, behind `WHISPER_EACP_ENABLE_BENCHMARK` |
 
-Headers are spelled `<WhisperEACP/...>`, beside eacp's own `<eacp/...>`.
+Headers are spelled `<WhisperEACP/...>`, beside eacp's own `<eacp/...>`, and
+everything lives in namespace `WSP`.
+
+Three kinds of matrix product share the tree. `TiledMatMul` is the
+register-tiled product for the encoder's many rows, `SplitLinear` splits a
+decode step's few rows across a group, and `SimdTiledMatMul` is the many-row
+product again out of eacp's SIMD-group matrices. The role aliases at the foot
+of `Kernels/SimdTiledMatMul.h` — `LinearProduct`, `AttentionScoresProduct` and
+the rest — are what every call site names, so which kernel a product runs is
+one decision in one place.
+
+## Using the library
+
+```cpp
+#include <WhisperEACP/WhisperEACP.h>
+
+auto whisper = WSP::Whisper {};
+whisper.load("path/to/whisper-tiny.en");   // or WSP::ModelFetch::directory()
+whisper.prepare();                          // compiles the kernels, uploads the weights
+
+const auto samples = WSP::readWavFile("recording.wav");   // 16 kHz mono, <= 30 s
+const auto text = whisper.transcribeText(samples);
+```
+
+`load` maps the four files of a HuggingFace Whisper repo and touches no GPU;
+`prepare` is the half second of kernel compilation and upload. A run longer
+than the 30 s window is an error rather than a truncation, since deciding where
+to cut a recording is a chunking layer that does not exist yet.
+
+The encoder runs on the GPU kernels by default. On a Mac it can run on Core ML
+instead, through eacp's `eacp-ml`, which is how it reaches the Neural Engine;
+the decoder stays on the kernels either way. Everything about it is chosen
+before `prepare`, which builds the encoder for it:
+
+```cpp
+if (WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML))
+    whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
+
+whisper.setEncoderComputeUnits(WSP::EncoderComputeUnits::cpuAndNeuralEngine);
+whisper.setEncoderCacheDirectory(sharedDirectory);   // optional
+whisper.prepare();
+```
+
+`cpuAndNeuralEngine` is the default because it is the only setting that
+reaches the engine: under `all`, Core ML places the whole encoder on the GPU.
+The model is compiled for the eighteen audio contexts `setAudioContext` can
+take under Core ML (448 to 1472 in steps of 64, and 1500), and cached; the
+first `prepare` on a machine is the engine compiling all of them, about 14 s,
+and one after it finds the compile in the cache in well under a second. The
+cache is the app's own unless `setEncoderCacheDirectory` names one, which is
+how several binaries share one compile. `encoderWasCacheHit`,
+`encoderLoadSeconds`, `lastEncoderPredictSeconds`, `lastEncoderMelSeconds` and
+`encoderComputePlan` report what it did. `transcribeAsync` is `transcribe` for
+a caller that yields to the event loop: under Core ML the prediction runs on
+the model's queue and the decode when it comes back, so the main thread and
+the GPU are free while the engine works; on the kernels it resolves before it
+returns. On this machine the engine is slower than the kernels at every
+context (plan.md in eacp has the numbers), so the choice buys an idle GPU, not
+speed.
+
+`LiveTranscriber` sits above that for audio that keeps arriving: push 16 kHz
+mono samples of any block size, call `update()` from the thread that owns the
+GPU, and read `committed()` for the closed segments and `pending()` for the one
+still being re-decoded. Every clock in it is audio time rather than wall time,
+so a run over a given recording is deterministic.
+
+```cpp
+auto live = WSP::LiveTranscriber {whisper};
+
+live.push(block);
+if (live.update())
+    show(live.committed(), live.pending());
+```
+
+Everything GPU-side is main-thread only, which is eacp's rule rather than this
+project's. Anything touching the device runs inside `eacp::Apps::run`, which
+owns the run loop and autorelease pool the Metal backend is written against.
 
 ## Building
 
 Requires CMake 3.31+, a C++20 compiler and a 64-bit toolchain. eacp, MakeASound
-and NanoTest are fetched automatically via CPM.
+and NanoTest are fetched through CPM — eacp at `develop`, the others at `main`
+— so the configure line is the whole story and no build here points at a
+checkout on the machine.
 
 ```bash
 cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DWHISPER_EACP_UNITY_BUILD=OFF
@@ -76,6 +170,31 @@ ctest --test-dir build --output-on-failure
 
 macOS and Windows. eacp gates its whole GPU stack behind platforms with a Metal
 or D3D12 backend, so there is no Linux target.
+
+| option | default | |
+| --- | --- | --- |
+| `WHISPER_EACP_ENABLE_TESTS` | on when top-level | The `Tests/` tree |
+| `WHISPER_EACP_ENABLE_APPS` | on when top-level | The `Apps/` tree. The demo needs eacp's widget tier, which eacp builds only where it has a Metal or D3D12 backend |
+| `WHISPER_EACP_ENABLE_WHISPER_CPP` | `OFF` | Fetch whisper.cpp with every backend off and build `Tests/Oracle` against it |
+| `WHISPER_EACP_ENABLE_BENCHMARK` | `OFF` | Fetch whisper.cpp at its own defaults for the machine and build `Benchmark` |
+| `WHISPER_EACP_UNITY_BUILD` | `OFF` | Unity builds of the libraries. Off, per-file compile commands land in `compile_commands.json` |
+| `WHISPER_EACP_CI_BUILD` | `OFF` | The unity builds CI uses, here and in eacp, MakeASound and Miro |
+
+### Building against a local eacp
+
+For the case that is actually for — changing eacp itself alongside a change
+here that needs it:
+
+```bash
+cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DWHISPER_EACP_UNITY_BUILD=OFF \
+      -DCPM_eacp_SOURCE=$HOME/Code/eacp
+```
+
+Use `$HOME`, not `~`: CMake does not expand a tilde and the shell will not
+expand one inside quotes, so the path silently resolves to nothing and the
+failure surfaces much later as a missing `eacp-gpu` target. A local tree also
+brings whatever is uncommitted in it into the build, so an unrelated refactor in
+progress there breaks every target here.
 
 ## Transcribing
 
@@ -96,7 +215,14 @@ model: ~/Library/Application Support/eacp/WhisperEACP/Models/tiny.en
 audio: built-in jfk.wav
 
  And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.
+
+  load and upload          1.451 s
+  mel + encoder            0.020 s
+  decode,  24 tokens       0.016 s     0.7 ms per step over 25
+  mel to transcript        0.036 s
 ```
+
+That is a Debug tree; the load is mostly kernel compilation, paid once.
 
 The 151 MB of weights is a download, never a commit, and never part of the
 build: `eacp::OnlineResource` fetches the four HuggingFace files at a pinned
@@ -104,6 +230,19 @@ revision into one directory every binary here shares, and every later run finds
 them there and asks the network nothing. A configure downloads none of it, no
 binary carries it, and the two-argument form above points at a HuggingFace repo
 of your own instead.
+
+The weights are HuggingFace **safetensors**, read straight from a repo's four
+files: `model.safetensors`, `config.json`, `tokenizer.json` and
+`preprocessor_config.json`, the last of which carries the mel filterbank
+already built. `tiny.en` ships F32, but every value in it round-trips through
+fp16 unchanged — OpenAI's checkpoints are fp16 and the conversion only widens
+them — so `Whisper::setPacksWeights`, on by default, sends every projection
+weight of the encoder and the decoder to the device narrowed, the logits
+projection among them, for half the bandwidth and arithmetic that is bit
+identical to what the float weights produce. A repo that ships fp16 in the
+first place loads just as well: the tensors no program reads packed — the
+norms, the biases, the convolutions and the embedding tables — are widened on
+upload.
 
 `Samples/jfk.wav` is 11 seconds of President Kennedy's inaugural address,
 20 January 1961, at 16 kHz mono PCM16 — byte-identical to whisper.cpp v1.9.3's
@@ -129,7 +268,30 @@ eacp's GPU layer is main-thread only — so a run of the model is a few tens of
 milliseconds the window waits for, and only the device callback is on a thread
 of its own. `--autostart` opens the default input as soon as the model is ready
 and logs a line a second to stdout, which is how a run is checked without a hand
-on the mouse.
+on the mouse. `--coreml` runs the encoder on Core ML's Neural Engine, where
+the machine has it; a run then comes back on a later tick and the window is
+never held for the encode.
+
+## Testing
+
+NanoTest, one executable per module, and three tiers in the order a failure is
+diagnosed:
+
+1. **A scalar CPU reference inside the test itself**, for every kernel and
+   every layer — layernorm, GELU, softmax, the products, attention, the
+   encoder and decoder against double precision. No dependency, and the only
+   tier that catches a backend divergence, since the same assertion runs
+   against MSL on Apple and HLSL on Windows. This is the bulk of the suite.
+2. **whisper.cpp as an in-process oracle**, `Tests/Oracle`, behind
+   `WHISPER_EACP_ENABLE_WHISPER_CPP`: the mel, the logits, the tokenizer and
+   the transcript, stage by stage, so a mismatch bisects to a layer rather
+   than only reporting a wrong transcript.
+3. **Small committed fixtures** for what is cheap and stable — the filterbank
+   matrix, a handful of tokenizer cases.
+
+A test that needs the GPU returns early when no device is valid, and one that
+needs a model file skips when the fetch is off, so the suite passes on any
+machine and runs in full on one with both.
 
 ## Benchmarking
 
@@ -145,7 +307,14 @@ cmake -G Ninja -B build-release -DCMAKE_BUILD_TYPE=Release \
 cmake --build build-release --target Benchmark
 ./build-release/Benchmark/Benchmark            # jfk.wav, 10 timed runs
 ./build-release/Benchmark/Benchmark 30 recording.wav
+./build-release/Benchmark/Benchmark 30 --units=all --plan
 ```
+
+Where the build and the OS have Core ML, a `WhisperEACP ANE` column runs the
+same runtime with the encoder on Core ML, under `--units` (the engine by
+default), and splits its encode into the mel on the GPU, the prediction and
+the seam copies; `--plan` also prints where Core ML placed the encoder's ops.
+`--live` streams twice, the encoder on the kernels and then on Core ML.
 
 The option builds whisper.cpp at its own defaults for the machine, backends
 on, where the oracle in `Tests/Oracle` alone builds it with every backend off
@@ -156,20 +325,6 @@ importantly, what it does not. `Benchmark/backends.py` runs mlx-whisper,
 faster-whisper and openai-whisper — whichever are installed — on the same
 protocol, for the backends that cannot be in the process.
 
-eacp is fetched at `develop`, MakeASound and NanoTest at `main`. The configure
-line above is the whole story — no build here points at a checkout on the
-machine.
+## License
 
-To build against a local eacp checkout instead, for the case that is actually
-for — changing eacp itself alongside a change here that needs it:
-
-```bash
-cmake -G Ninja -B build -DCMAKE_BUILD_TYPE=Debug -DWHISPER_EACP_UNITY_BUILD=OFF \
-      -DCPM_eacp_SOURCE=$HOME/Code/eacp
-```
-
-Use `$HOME`, not `~`: CMake does not expand a tilde and the shell will not
-expand one inside quotes, so the path silently resolves to nothing and the
-failure surfaces much later as a missing `eacp-gpu` target. A local tree also
-brings whatever is uncommitted in it into the build, so an unrelated refactor in
-progress there breaks every target here.
+MIT — see `LICENSE`.

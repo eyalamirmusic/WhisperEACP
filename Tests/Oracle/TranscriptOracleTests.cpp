@@ -53,6 +53,29 @@ Whisper& ourRuntime()
     return *runtime;
 }
 
+#if EACP_HAS_COREML
+// The second contestant: the same runtime with its encoder on Core ML, under
+// the default compute units, which put it on the Neural Engine. Null where
+// the OS cannot run it.
+Whisper* ourCoreMLRuntime()
+{
+    static const auto runtime = []() -> std::unique_ptr<Whisper>
+    {
+        if (!Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+            return nullptr;
+
+        auto whisper = std::make_unique<Whisper>();
+        whisper->load(modelDirectory());
+        whisper->setEncoderBackend(EncoderBackend::coreML);
+        whisper->setEncoderCacheDirectory(sharedCoreMLCacheDirectory());
+        whisper->prepare();
+        return whisper;
+    }();
+
+    return runtime.get();
+}
+#endif
+
 // Greedy, one segment, no timestamps, English, no translation — and no
 // temperature fallback, since a run that retried at a higher temperature would
 // no longer be the greedy search this is compared against.
@@ -121,12 +144,10 @@ std::string joinedText(whisper_context& context,
 }
 } // namespace
 
-auto tTranscriptAgreesWithTheOracle =
-    test("Oracle/transcriptAgreesWithTheOracle") = []
+namespace
 {
-    if (!canRun())
-        return;
-
+void checkAgreesAtTheWindow(Whisper& whisper)
+{
     const auto context = loadOracle();
 
     if (context == nullptr)
@@ -146,7 +167,6 @@ auto tTranscriptAgreesWithTheOracle =
     const auto reference = oracleTranscript(*context, samples);
     check(!reference.empty());
 
-    auto& whisper = ourRuntime();
     const auto mine = whisper.transcribe(samples);
 
     const auto ourText = whisper.textForTokens(mine);
@@ -166,7 +186,7 @@ auto tTranscriptAgreesWithTheOracle =
     // implementations and Tests/Oracle already found one string they segment
     // differently.
     check(ourText == theirText);
-};
+}
 
 // The same comparison at a reduced audio context, which is the assertion the
 // whole option rests on: both sides encode 576 of the 1500 positions and both
@@ -177,12 +197,8 @@ auto tTranscriptAgreesWithTheOracle =
 // you" disappears. Agreeing at 1500 says the truncation is unused; agreeing
 // here, on a transcript neither side produces at the window, says the two
 // truncate the same way.
-auto tTranscriptAgreesAtAReducedContext =
-    test("Oracle/transcriptAgreesWithTheOracleAtAReducedContext") = []
+void checkAgreesAtAReducedContext(Whisper& whisper)
 {
-    if (!canRun())
-        return;
-
     const auto context = loadOracle();
 
     if (context == nullptr)
@@ -195,7 +211,6 @@ auto tTranscriptAgreesAtAReducedContext =
 
     constexpr auto audioContext = 576;
 
-    auto& whisper = ourRuntime();
     const auto atTheWindow = whisper.transcribe(samples);
 
     whisper.setAudioContext(audioContext);
@@ -224,4 +239,43 @@ auto tTranscriptAgreesAtAReducedContext =
     // above is about the truncation rather than about a context large enough
     // to make no difference.
     check(mine.size() != atTheWindow.size());
+}
+} // namespace
+
+auto tTranscriptAgreesWithTheOracle =
+    test("Oracle/transcriptAgreesWithTheOracle") = []
+{
+    if (canRun())
+        checkAgreesAtTheWindow(ourRuntime());
 };
+
+auto tTranscriptAgreesAtAReducedContext =
+    test("Oracle/transcriptAgreesWithTheOracleAtAReducedContext") = []
+{
+    if (canRun())
+        checkAgreesAtAReducedContext(ourRuntime());
+};
+
+#if EACP_HAS_COREML
+// The same two comparisons with the encoder on Core ML, which computes in
+// fp16 on the Neural Engine: the bar is still whisper.cpp's tokens, exactly.
+auto tTranscriptAgreesOnCoreML =
+    test("Oracle/transcriptAgreesWithTheOracleOnCoreML") = []
+{
+    if (!canRun())
+        return;
+
+    if (auto* whisper = ourCoreMLRuntime())
+        checkAgreesAtTheWindow(*whisper);
+};
+
+auto tTranscriptAgreesAtAReducedContextOnCoreML =
+    test("Oracle/transcriptAgreesWithTheOracleAtAReducedContextOnCoreML") = []
+{
+    if (!canRun())
+        return;
+
+    if (auto* whisper = ourCoreMLRuntime())
+        checkAgreesAtAReducedContext(*whisper);
+};
+#endif

@@ -58,7 +58,7 @@ void checkLayerLoaded(const DecoderLayerWeights& layer,
 
     auto projection = [&](const TensorBuffer& tensor, int outputWidth, int inner)
     {
-        return projectionStorage == ProjectionStorage::PackedHalf
+        return storesProjectionsAsHalves(projectionStorage)
                    ? holdsHalves(tensor, outputWidth * inner)
                    : holdsFloats(tensor, outputWidth * inner);
     };
@@ -100,8 +100,8 @@ void checkLoaded(ProjectionStorage projectionStorage)
     check(weights.shape == shape);
     check(weights.layers.size() == shape.layers);
 
-    // Float whatever the projections are: the gather subscripts this one, and
-    // the logits projection reads the same buffer.
+    // Float whatever the file holds: the gather subscripts this one, so an
+    // fp16 table is widened on the way to the device rather than refused.
     check(holdsFloats(weights.tokenEmbedding, shape.vocabularySize * shape.width));
     check(holdsFloats(weights.positionalEmbedding, shape.cacheElementCount()));
     check(holdsFloats(weights.finalNormWeight, shape.width));
@@ -132,6 +132,18 @@ auto tDecoderWeightsLoadPackedProjections =
         return;
 
     checkLoaded(ProjectionStorage::PackedHalf);
+};
+
+// The other half, over the file an fp16 repo actually is: every tensor packed,
+// the projections staying that way and everything else — the norms, the biases,
+// both embedding tables — coming back as the float buffer its program
+// subscripts, at the full float size.
+auto tDecoderWeightsLoadAnAllHalfFile = test("Decoder/weightsLoadAnAllHalfFile") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    checkLoaded(ProjectionStorage::EveryTensorHalf);
 };
 
 auto tDecoderMissingTensorIsAnError = test("Decoder/missingTensorIsAnError") = []
@@ -234,52 +246,58 @@ auto tDecoderShortEmbeddingIsAnError = test("Decoder/shortEmbeddingIsAnError") =
 };
 
 // The tensor the fp16 rule turns on: embed_tokens is the gather's table as well
-// as the logits projection's weight, and the gather has no packed read, so it
-// is F32 or it is an error — never a buffer bound at half the stride it was
-// written at, which is silent on both backends.
-auto tDecoderPackedTokenEmbeddingIsAnError =
-    test("Decoder/packedTokenEmbeddingIsAnError") = []
+// as the logits projection's weight, and the gather has no packed read. So a
+// packed one is widened into the float table the gather subscripts, holding the
+// file's own halves to the bit — and the logits keep the packed original beside
+// it, which is the same values again.
+auto tDecoderPackedTokenEmbeddingIsWidened =
+    test("Decoder/packedTokenEmbeddingIsWidened") = []
 {
     if (!Device::shared().isValid())
         return;
 
     const auto shape = smallDecoderShape();
+    const auto file =
+        syntheticDecoderFile(shape, ProjectionStorage::EveryTensorHalf);
+    const auto name = decoderTensor("embed_tokens.weight");
 
-    auto builder = TensorFileBuilder {};
-    builder.addHalves(decoderTensor("embed_tokens.weight"),
-                      {shape.vocabularySize, shape.width},
-                      spreadValues(shape.vocabularySize * shape.width, 13u, 0.3f));
+    const auto weights = DecoderWeights {file, shape, WeightPacking::ExactHalf};
 
-    const auto file = builder.parse();
-    const auto text = modelErrorText([&] { DecoderWeights {file, shape}; });
+    check(holdsWidenedFloats(weights.tokenEmbedding, file, name));
+    check(holdsWidenedFloats(
+        weights.positionalEmbedding, file, decoderTensor("embed_positions.weight")));
 
-    check(mentions(text, "model.decoder.embed_tokens.weight"));
-    check(mentions(text, "fp16"));
-    check(mentions(text, "the embedding gather"));
+    // makeExactHalfBuffer hands an fp16 tensor back as it lies in the blob, so
+    // the logits read the file's own halves rather than a second narrowing of
+    // the widened copy.
+    check(weights.packedTokenEmbedding.has_value());
+    check(weights.logitsWeight().isPackedHalf());
+    check(weights.logitsWeight().buffer.size()
+          == 2 * shape.vocabularySize * shape.width);
 };
 
-auto tDecoderPackedNormIsAnError = test("Decoder/packedNormIsAnError") = []
+auto tDecoderPackedNormIsWidened = test("Decoder/packedNormIsWidened") = []
 {
     if (!Device::shared().isValid())
         return;
 
     const auto shape = smallDecoderShape();
+    const auto file =
+        syntheticDecoderFile(shape, ProjectionStorage::EveryTensorHalf);
+    const auto weights = DecoderWeights {file, shape};
 
-    auto builder = TensorFileBuilder {};
-    builder.addFloats(decoderTensor("embed_tokens.weight"),
-                      {shape.vocabularySize, shape.width},
-                      spreadValues(shape.vocabularySize * shape.width, 14u, 0.3f));
-    builder.addFloats(decoderTensor("embed_positions.weight"),
-                      {shape.maxPositions, shape.width},
-                      spreadValues(shape.cacheElementCount(), 15u, 0.3f));
-    builder.addHalves(decoderTensor("layer_norm.weight"),
-                      {shape.width},
-                      spreadValues(shape.width, 16u, 0.2f));
+    check(holdsWidenedFloats(
+        weights.finalNormWeight, file, decoderTensor("layer_norm.weight")));
+    check(holdsWidenedFloats(
+        weights.finalNormBias, file, decoderTensor("layer_norm.bias")));
+    check(holdsWidenedFloats(weights.layers[0].selfAttentionNormWeight,
+                             file,
+                             decoderLayerTensor(0, "self_attn_layer_norm.weight")));
+    check(holdsWidenedFloats(weights.layers[0].selfQueryBias,
+                             file,
+                             decoderLayerTensor(0, "self_attn.q_proj.bias")));
 
-    const auto file = builder.parse();
-    const auto text = modelErrorText([&] { DecoderWeights {file, shape}; });
-
-    check(mentions(text, "model.decoder.layer_norm.weight"));
-    check(mentions(text, "fp16"));
-    check(mentions(text, "LayerNorm"));
+    // The same file's projections stayed packed, since Linear reads them that
+    // way: the widening is per binding, not per file.
+    check(weights.layers[0].selfQueryWeight.isPackedHalf());
 };

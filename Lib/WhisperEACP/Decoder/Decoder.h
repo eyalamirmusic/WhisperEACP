@@ -1,13 +1,24 @@
 #pragma once
 
 #include <WhisperEACP/Decoder/DecoderWeights.h>
+#include <WhisperEACP/Net/KernelNet.h>
 
 #include <optional>
 
 namespace WSP
 {
-// HuggingFace's WhisperDecoder.forward with a KV cache, recorded into a command
-// buffer:
+// One pair per layer. The self-attention pair grows a row per token and is read
+// from row zero to the position every step; the cross-attention pair is written
+// once per sequence and read whole by every step after it.
+struct DecoderCaches
+{
+    Vector<Cache> selfKeys;
+    Vector<Cache> selfValues;
+    Vector<Cache> crossKeys;
+    Vector<Cache> crossValues;
+};
+
+// HuggingFace's WhisperDecoder.forward with a KV cache:
 //
 //   h = embed_tokens[token] + embed_positions[position + t]
 //   per layer: h += self_attn.out_proj(attention(self_attn_layer_norm(h)))
@@ -26,31 +37,11 @@ namespace WSP
 // writes their logits, so the prompt a run opens with is one call and each
 // token after it is another.
 //
-// The shape of this is the Encoder's: prepare() compiles every kernel and sizes
-// every intermediate once, and the two recording calls only record, into the
-// one compute pass the caller opened. A step used to open a pass per dispatch,
-// and at a few microseconds of GPU each its ninety passes were half of it; the
-// KV cache is now read in the same pass that appended to it.
-//
-// The ordering inside that pass is spelled out here rather than assumed: a
-// pass.barrier() sits at every boundary where a stage reads what the stage
-// before it wrote, which costs nothing in a serial pass and is the whole
-// ordering in a concurrent one. Three places have no barrier because they need
-// none — a layer's three self-attention projections, and the eight
-// cross-attention projections beginSequence opens with, both of which read one
-// buffer and write buffers of their own.
-//
-// One program of each kind serves every dispatch of that kind: the shapes are
-// uniforms, so the layers, the two attentions and the two feed-forward widths
-// are re-bindings of a few pipelines rather than pipelines of their own. The
-// projections are the exception, and are held six ways over three questions: a
-// float-weight program and a packed-half one, so a weight that arrived fp16 is
-// dispatched through the program that reads it as fp16; the many-row form the
-// cross-attention keys and values are projected with once per sequence against
-// the few-row form a step's one or two tokens take, where the inner sum is
-// split across a group instead of walked by a thread; and, inside that
-// few-row form, the split count the shape wants — see stepSplitCount and
-// logitsSplitCount below.
+// The two recordings are recordSequenceStart and recordDecoderStep, written
+// once against Net. This class runs them on the kernel backend, the Encoder's
+// way: prepare() compiles every kernel and sizes every intermediate once, and
+// the two recording calls only record, into the one compute pass the caller
+// opened, the KV cache read in the same pass that appended to it.
 //
 // Argmax is deliberately not here. Greedy sampling is the layer above: which
 // tokens are suppressed at which step is generation config, and a decoder that
@@ -124,127 +115,35 @@ public:
     const eacp::GPU::Buffer& hiddenStates() const { return *normalisedRows; }
 
 private:
-    // How many lanes share one output's inner sum in the projections a step
-    // takes. A 384-wide input row is 96 float4s, so at 96 every lane reads
-    // exactly one and none idles; fc2's 1536 are four each. At the stock 8 a
-    // 384-wide projection dispatched 48 groups, which is a few thousand
-    // threads on a device that wants tens of thousands: measured against 8,
-    // 16, 32, 64, 128, 192, 256 and 384, and 96 is the floor of that curve on
-    // every one of the three shapes.
-    static constexpr auto stepSplitCount = 96;
-
-    // The logits projection wants far fewer. Its 51864 outputs fill the device
-    // at any split count, so the only thing more lanes buy is a longer fold
-    // and a thread that reads eight bytes — 64 measured 4% slower than 32 over
-    // the whole decode, 128 12% slower.
-    //
-    // The count is the **shape's** rather than the weight's, which is what
-    // keeps the float and packed logits bit identical: the two read the same
-    // matrix at two widths, and they sum it in the same order only if they are
-    // dispatched at the same split. Decoder/TinyEn/packedLogitsWeightIsIdentical
-    // is what says so.
-    static constexpr auto logitsSplitCount = 32;
-
     void requireMatchingWeights(const DecoderWeights& weights) const;
-
-    void encodeLayer(eacp::GPU::ComputePass& pass,
-                     const DecoderLayerWeights& weights,
-                     int layerIndex,
-                     int tokenCount);
-
-    void encodeSelfAttention(eacp::GPU::ComputePass& pass,
-                             const DecoderLayerWeights& weights,
-                             int layerIndex,
-                             int tokenCount);
-
-    void encodeCrossAttention(eacp::GPU::ComputePass& pass,
-                              const DecoderLayerWeights& weights,
-                              int layerIndex,
-                              int tokenCount);
-
-    void encodeAttentionOverCache(eacp::GPU::ComputePass& pass,
-                                  const eacp::GPU::Buffer& keys,
-                                  const eacp::GPU::Buffer& values,
-                                  const eacp::GPU::Buffer& scores,
-                                  int queryCount,
-                                  int keyCount,
-                                  bool causal);
-
-    void encodeLayerNorm(eacp::GPU::ComputePass& pass,
-                         const eacp::GPU::Buffer& input,
-                         const TensorBuffer& weight,
-                         const TensorBuffer& bias,
-                         const eacp::GPU::Buffer& target,
-                         int rowCount);
-
-    // gelu applies the activation on the store, and residual adds the result
-    // into what the target holds: the stages either side of a projection,
-    // folded into it rather than dispatched on their own.
-    void encodeLinear(eacp::GPU::ComputePass& pass,
-                      const eacp::GPU::Buffer& input,
-                      const TensorBuffer& weight,
-                      const eacp::GPU::Buffer& bias,
-                      const eacp::GPU::BufferRange& target,
-                      int innerCount,
-                      int outputWidth,
-                      int rowCount,
-                      bool gelu = false,
-                      bool residual = false);
-
-    // Where this step's keys and values are written into the layer's cache:
-    // the row the sequence has reached, as a byte offset into the buffer.
-    eacp::GPU::BufferRange cacheRowsAt(const eacp::GPU::Buffer& cache,
-                                       int tokenCount) const;
 
     DecoderShape decoderShape;
     int decodedPositions = 0;
     int activeCrossPositions = 0;
 
-    Embed embedding;
-
-    // The one-row group: every layer norm a step takes is a single row of 384,
-    // and the prompt step's is two.
-    LayerNorm normalisation {LayerNorm::singleRowLanes};
-    CrossProjectionProduct projection;
-    HalfWeightCrossProjectionProduct packedProjection;
-    SplitLinear splitProjection {stepSplitCount};
-    HalfWeightSplitLinear packedSplitProjection {stepSplitCount};
-    SplitLinear splitLogits {logitsSplitCount};
-    HalfWeightSplitLinear packedSplitLogits {logitsSplitCount};
-    AttentionScores scores;
-    Softmax softmax;
-    AttentionApply attention;
-    SingleQueryAttention singleQueryAttention;
-
-    // The residual stream, which three sublayers add to in place from their
-    // last projection's store: a layer enters and leaves in hidden, so the
-    // next layer reads what this one wrote without a swap the call site would
-    // have to keep track of.
-    std::optional<eacp::GPU::Buffer> hidden;
-
-    std::optional<eacp::GPU::Buffer> normalised;
-    std::optional<eacp::GPU::Buffer> queries;
-    std::optional<eacp::GPU::Buffer> attended;
-    std::optional<eacp::GPU::Buffer> selfScores;
-    std::optional<eacp::GPU::Buffer> crossScores;
-    std::optional<eacp::GPU::Buffer> feedForward;
+    KernelNet net {KernelProfile::decoder};
+    DecoderCaches caches;
     std::optional<eacp::GPU::Buffer> normalisedRows;
-
-    // One pair per layer. The self-attention pair grows a row per token and is
-    // read from row zero to the position every step; the cross-attention pair
-    // is written once per sequence and read whole by every step after it.
-    Vector<eacp::GPU::Buffer> selfKeyCache;
-    Vector<eacp::GPU::Buffer> selfValueCache;
-    Vector<eacp::GPU::Buffer> crossKeys;
-    Vector<eacp::GPU::Buffer> crossValues;
-
-    // What k_proj binds where another projection binds its bias, and what the
-    // tied logits projection binds where a proj_out would have had one. Two
-    // buffers rather than one because Linear reads outputWidth of them and the
-    // two projections have different output widths. Filled once, because
-    // neither backend defines what a shader reading an unbound buffer gets and
-    // a flag would only guard a read that must not happen at all.
-    std::optional<eacp::GPU::Buffer> zeroBias;
-    std::optional<eacp::GPU::Buffer> zeroLogitBias;
 };
+
+// Empties every cache and projects the cross-attention keys and values out of
+// the first rows of the encoder's output.
+void recordSequenceStart(Net& net,
+                         const DecoderShape& shape,
+                         const DecoderWeights& weights,
+                         DecoderCaches& caches,
+                         const Binding& encoderRows,
+                         int rows);
+
+// Appends tokenCount tokens read from tokens to the self-attention caches, and
+// writes their final hidden rows into hiddenStates and their logits into logits.
+void recordDecoderStep(Net& net,
+                       const DecoderShape& shape,
+                       const DecoderWeights& weights,
+                       DecoderCaches& caches,
+                       const Binding& tokens,
+                       int tokenCount,
+                       int firstPosition,
+                       const Binding& hiddenStates,
+                       const Binding& logits);
 } // namespace WSP

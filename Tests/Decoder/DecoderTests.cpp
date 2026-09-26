@@ -66,14 +66,15 @@ double checkStepAgainstReference(const StepResult& result,
 
 void checkPromptInOneStep(ProjectionStorage projectionStorage,
                           std::string_view label,
-                          double tolerance)
+                          double tolerance,
+                          WeightPacking packing = WeightPacking::Float)
 {
     const auto shape = smallDecoderShape();
     const auto file = syntheticDecoderFile(shape, projectionStorage);
     const auto encoderOutput = syntheticEncoderOutput(shape);
     const auto tokens = promptTokens();
 
-    auto run = DecoderRun {shape, file};
+    auto run = DecoderRun {shape, file, packing};
     run.begin(encoderOutput);
 
     const auto result = run.step(tokens);
@@ -94,7 +95,7 @@ void checkPromptInOneStep(ProjectionStorage projectionStorage,
 // definition, over weights that went through a real safetensors header — so the
 // loader's name and shape mapping is under test alongside the arithmetic.
 //
-// 3.6e-7 measured against 5e-6 asserted, and the four small-shape comparisons
+// 3.6e-7 measured against 5e-6 asserted, and the five small-shape comparisons
 // below span 1.8e-7 to 4.1e-7 — the encoder's tolerance for the encoder's
 // reason: the GPU accumulates every sum in float32 where the reference
 // accumulates in double, and exp, rsqrt and the erf helper are each a float32
@@ -213,9 +214,8 @@ auto tDecoderMixedStepsAndASecondSequence =
 // the same halves widened. Widening is exact both sides, so the tolerance is
 // the float32 accumulation one again rather than fp16's three digits.
 //
-// embed_tokens stays F32 in both runs, because the loader rejects a packed one:
-// it is the gather's table as well as the logits projection's weight, and the
-// gather subscripts floats.
+// embed_tokens stays F32 in both runs, which is the file this case is about:
+// the projections change storage and nothing else does.
 auto tDecoderMatchesReferenceWithPackedWeights =
     test("Decoder/matchesReferenceWithPackedWeights") = []
 {
@@ -223,6 +223,24 @@ auto tDecoderMatchesReferenceWithPackedWeights =
         return;
 
     checkPromptInOneStep(ProjectionStorage::PackedHalf, "packed halves", 5e-6);
+};
+
+// And again over a file that is fp16 end to end, which is how HuggingFace ships
+// whisper-base and everything above it. embed_tokens is the tensor this turns
+// on, because it is the one bound twice: the gather subscripts the widened
+// float table the loader made of it, and the logits projection reads the packed
+// original through the half-reading Linear. Both are the file's own halves, so
+// the reference is the one above and the tolerance with it.
+auto tDecoderMatchesReferenceWithAnAllHalfFile =
+    test("Decoder/matchesReferenceWithAnAllHalfFile") = []
+{
+    if (!Device::shared().isValid())
+        return;
+
+    checkPromptInOneStep(ProjectionStorage::EveryTensorHalf,
+                         "every tensor half",
+                         5e-6,
+                         WeightPacking::ExactHalf);
 };
 
 // Greedy sampling, which is the layer above the decoder: the Argmax kernel over

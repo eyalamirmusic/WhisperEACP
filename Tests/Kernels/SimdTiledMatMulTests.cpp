@@ -1,9 +1,5 @@
 #include "TiledProduct.h"
 
-// Nothing to check where eacp has no SIMD-group matrix to write one against:
-// SimdTiledMatMul.h declares no program there. See CMake/Findeacp.cmake.
-#if defined(WHISPER_EACP_HAS_SIMD_MATRIX)
-
 using namespace nano;
 using namespace WSP;
 using namespace eacp::GPU;
@@ -210,5 +206,3 @@ auto tSimdTiledMatchesRegisterTiled =
     for (auto i = 0; i < result.size(); ++i)
         check(isClose(result[i], expected[i], 1e-5));
 };
-
-#endif

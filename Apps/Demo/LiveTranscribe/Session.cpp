@@ -17,8 +17,9 @@ double secondsSince(std::chrono::steady_clock::time_point start)
 }
 } // namespace
 
-Session::Session(std::string modelDirectoryToUse)
+Session::Session(std::string modelDirectoryToUse, bool encoderOnCoreML)
     : modelDirectory(std::move(modelDirectoryToUse))
+    , usesCoreML(encoderOnCoreML)
 {
     message = "loading model...";
 }
@@ -76,6 +77,10 @@ void Session::loadModel()
     {
         whisper.load(modelDirectory.empty() ? WSP::ModelFetch::directory().string()
                                             : modelDirectory);
+
+        if (usesCoreML)
+            whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
+
         whisper.prepare();
     }
     catch (const std::exception& failure)

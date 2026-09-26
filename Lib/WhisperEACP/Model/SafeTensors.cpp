@@ -8,6 +8,7 @@
 #include <bit>
 #include <cstring>
 #include <limits>
+#include <stdexcept>
 
 namespace WSP
 {
@@ -73,11 +74,12 @@ void widenEach(Span<const std::uint8_t> source, Span<float> destination, Widen w
     }
 }
 
-void widenToFloat(const TensorInfo& tensor,
+void widenToFloat(TensorType type,
+                  const std::string& what,
                   Span<const std::uint8_t> source,
                   Span<float> destination)
 {
-    switch (tensor.type)
+    switch (type)
     {
         case TensorType::F32:
             std::memcpy(destination.data(),
@@ -101,10 +103,17 @@ void widenToFloat(const TensorInfo& tensor,
             return;
 
         default:
-            throw ModelError {"tensor '" + tensor.name + "' has type "
-                              + std::string {tensorTypeName(tensor.type)}
+            throw ModelError {what + " has type "
+                              + std::string {tensorTypeName(type)}
                               + ", which is not a float type"};
     }
+}
+
+void widenToFloat(const TensorInfo& tensor,
+                  Span<const std::uint8_t> source,
+                  Span<float> destination)
+{
+    widenToFloat(tensor.type, "tensor '" + tensor.name + "'", source, destination);
 }
 
 Vector<std::int64_t> parseShape(const Miro::Json::Object& entry,
@@ -208,6 +217,20 @@ TensorInfo parseTensor(const std::string& name,
     return tensor;
 }
 
+void describeFromFile(TensorBuffer& uploaded,
+                      const SafeTensors& file,
+                      const TensorInfo& tensor)
+{
+    uploaded.shape.clear();
+
+    for (auto extent: tensor.shape)
+        uploaded.shape.add(static_cast<int>(extent));
+
+    uploaded.fileBytes = file.rawBytes(tensor);
+    uploaded.fileType = tensor.type;
+    uploaded.name = tensor.name;
+}
+
 eacp::GPU::Buffer uploadBytes(Span<const std::uint8_t> raw)
 {
     return eacp::GPU::Device::shared().makeBuffer(
@@ -232,6 +255,22 @@ eacp::GPU::Buffer uploadPackedHalves(Span<const std::uint8_t> raw)
     std::memcpy(padded.data(), raw.data(), static_cast<std::size_t>(raw.size()));
 
     return uploadBytes(padded);
+}
+
+TensorBuffer uploadWidenedFloats(const Vector<float>& values,
+                                 const std::string& name)
+{
+    const auto byteCount = static_cast<std::int64_t>(values.size())
+                           * static_cast<std::int64_t>(sizeof(float));
+
+    if (byteCount > std::numeric_limits<int>::max())
+        throw ModelError {"tensor '" + name + "' is too large for a GPU buffer"};
+
+    return {eacp::GPU::Device::shared().makeBuffer(values.data(),
+                                                   static_cast<int>(byteCount),
+                                                   eacp::GPU::BufferUsage::Storage),
+            TensorType::F32,
+            {}};
 }
 
 // float32 to IEEE binary16, round to nearest even, overflowing to infinity —
@@ -501,33 +540,89 @@ void SafeTensors::readFloats(std::string_view name, Span<float> destination) con
     widenToFloat(tensor, rawBytes(tensor), destination);
 }
 
-TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
+namespace
 {
-    const auto& tensor = info(name);
-
+TensorBuffer uploadInFileLayout(const SafeTensors& file, const TensorInfo& tensor)
+{
     // Already a layout a kernel binds, so these go straight from the blob
     // rather than through a widened copy of themselves: F32 as the floats a
     // subscript reads, F16 as the packed halves readHalf reads.
     if (tensor.type == TensorType::F32)
-        return {uploadBytes(rawBytes(tensor)), tensor.type};
+        return {uploadBytes(file.rawBytes(tensor)), tensor.type, {}};
 
     if (tensor.type == TensorType::F16)
-        return {uploadPackedHalves(rawBytes(tensor)), tensor.type};
+        return {uploadPackedHalves(file.rawBytes(tensor)), tensor.type, {}};
 
     // BF16 and F64 have no shader read of their own, so the conversion has to
     // happen somewhere and doing it once here beats doing it in every kernel.
-    const auto values = readFloats(name);
-    const auto byteCount = static_cast<std::int64_t>(values.size())
-                           * static_cast<std::int64_t>(sizeof(float));
+    return uploadWidenedFloats(file.readFloats(tensor.name), tensor.name);
+}
 
-    if (byteCount > std::numeric_limits<int>::max())
-        throw ModelError {"tensor '" + tensor.name
-                          + "' is too large for a GPU buffer"};
+TensorBuffer uploadAsFloats(const SafeTensors& file, const TensorInfo& tensor)
+{
+    if (tensor.type == TensorType::F32)
+        return {uploadBytes(file.rawBytes(tensor)), tensor.type, {}};
 
-    return {eacp::GPU::Device::shared().makeBuffer(values.data(),
-                                                   static_cast<int>(byteCount),
-                                                   eacp::GPU::BufferUsage::Storage),
-            TensorType::F32};
+    // F16 joins BF16 and F64 on the widening path here, rather than going up
+    // packed as makeBuffer would have it: the caller binds this to a program
+    // that subscripts floats, and a packed buffer there would be read at half
+    // the stride it was written at, silently, on both backends.
+    return uploadWidenedFloats(file.readFloats(tensor.name), tensor.name);
+}
+} // namespace
+
+TensorBuffer SafeTensors::makeBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    auto uploaded = uploadInFileLayout(*this, tensor);
+    describeFromFile(uploaded, *this, tensor);
+
+    return uploaded;
+}
+
+TensorBuffer SafeTensors::makeFloatBuffer(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    auto uploaded = uploadAsFloats(*this, tensor);
+    describeFromFile(uploaded, *this, tensor);
+
+    return uploaded;
+}
+
+// A zero-byte buffer allocates nothing and answers isValid() false, which is
+// the one way to leave the member empty: GPU::Buffer has no default.
+TensorBuffer SafeTensors::makeHostTensor(std::string_view name) const
+{
+    const auto& tensor = info(name);
+
+    auto host = TensorBuffer {
+        eacp::GPU::Device::shared().makeBuffer(0, eacp::GPU::BufferUsage::Storage),
+        tensor.type,
+        {}};
+    describeFromFile(host, *this, tensor);
+
+    return host;
+}
+
+Vector<float> readFileFloats(const TensorBuffer& tensor)
+{
+    auto elementCount = 1;
+
+    for (auto extent: tensor.shape)
+        elementCount *= extent;
+
+    if (tensor.fileBytes.size() != elementCount * bytesPerElement(tensor.fileType))
+        throw std::logic_error {"readFileFloats was given a tensor whose file "
+                                "bytes do not hold its shape; only a tensor a "
+                                "SafeTensors made carries them"};
+
+    auto values = Vector<float> {};
+    values.resize(elementCount);
+    widenToFloat(tensor.fileType, "a tensor", tensor.fileBytes, values);
+
+    return values;
 }
 
 std::optional<TensorBuffer>
@@ -564,6 +659,9 @@ std::optional<TensorBuffer>
         reinterpret_cast<const std::uint8_t*>(halves.data()),
         static_cast<int>(byteCount)};
 
-    return TensorBuffer {uploadPackedHalves(bytes), TensorType::F16};
+    auto uploaded = TensorBuffer {uploadPackedHalves(bytes), TensorType::F16, {}};
+    describeFromFile(uploaded, *this, tensor);
+
+    return uploaded;
 }
 } // namespace WSP

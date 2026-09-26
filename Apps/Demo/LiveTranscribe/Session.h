@@ -31,7 +31,10 @@ enum class ModelState
 class Session
 {
 public:
-    explicit Session(std::string modelDirectoryToUse);
+    // encoderOnCoreML runs the encoder on Core ML (the Neural Engine) instead
+    // of the kernels, where the build and the machine can; the run then comes
+    // back on a later tick and the window is never held for the encode.
+    Session(std::string modelDirectoryToUse, bool encoderOnCoreML);
 
     // Called once the state has settled on Ready or Failed, which is what the
     // app's autostart hangs off: the model arrives over the network now, so
@@ -86,6 +89,7 @@ private:
     bool runTranscriber();
 
     std::string modelDirectory;
+    bool usesCoreML = false;
     WSP::ModelFetch::Download download;
     ModelState modelState = ModelState::Loading;
     std::string message;

@@ -459,6 +459,205 @@ auto tLiveLeavesTheContextAloneByDefault =
     check(whisper.audioContext() == 0);
 };
 
+// The same layer with the encoder on Core ML, where a run comes back on a
+// later turn of the event loop rather than inside update(). The drives below
+// give the loop a turn after every chunk, which is what the demo's timer does;
+// the first three wait for each run to come back before the next chunk, so
+// the runs see exactly the segments the kernels' blocking runs saw, and the
+// last does not wait at all.
+namespace
+{
+constexpr auto runTimeout = eacp::Time::MS {30000};
+
+bool canRunOnCoreML()
+{
+    return canRun() && Whisper::supportsEncoderBackend(EncoderBackend::coreML);
+}
+
+bool waitForTheRun(LiveTranscriber& live)
+{
+    const auto isIdle = [&live] { return !live.isRunning(); };
+    return eacp::Threads::runEventLoopUntil(isIdle, runTimeout, eacp::Time::MS {1});
+}
+
+bool pushChunkedThroughTheLoop(LiveTranscriber& live,
+                               Span<const float> samples,
+                               int chunk)
+{
+    auto sawPending = false;
+
+    for (auto offset = 0; offset < samples.size(); offset += chunk)
+    {
+        live.push(samples.subspan(offset, std::min(chunk, samples.size() - offset)));
+        live.update();
+        check(waitForTheRun(live));
+
+        sawPending = sawPending || !live.pending().empty();
+    }
+
+    return sawPending;
+}
+} // namespace
+
+auto tCoreMLJfkStreamsIntoOneCommittedLine =
+    test("Live/CoreML/jfkStreamsIntoOneCommittedLine") = []
+{
+    if (!canRunOnCoreML())
+        return;
+
+    auto live = LiveTranscriber {coreMLPreparedModel()};
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto trailingSilence = silentChunk(2 * sampleRate);
+
+    auto sawPending = pushChunkedThroughTheLoop(live, samples, blockSamples);
+    sawPending =
+        pushChunkedThroughTheLoop(live, trailingSilence, blockSamples) || sawPending;
+
+    const auto chunks = chunkCount(samples.size(), blockSamples)
+                        + chunkCount((int) trailingSilence.size(), blockSamples);
+
+    check(live.committed().size() == 1);
+    check(live.pending().empty());
+    check(sawPending);
+    check(live.stats().runs > 1);
+    check(live.stats().runs < chunks);
+
+    if (live.committed().size() == 1)
+        check(trimmed(live.committed()[0]) == jfkTranscript);
+
+    std::cout << "  jfk live on Core ML: " << live.stats().runs << " runs, last run "
+              << live.stats().lastRunSeconds << " s\n";
+};
+
+auto tCoreMLFlushCommits = test("Live/CoreML/flushCommitsAndClearEmpties") = []
+{
+    if (!canRunOnCoreML())
+        return;
+
+    auto live = LiveTranscriber {coreMLPreparedModel()};
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    live.push(samples);
+    live.flush();
+
+    check(!live.isRunning());
+    check(live.committed().size() == 1);
+    check(live.pending().empty());
+    check(live.stats().runs == 1);
+
+    if (live.committed().size() == 1)
+        check(trimmed(live.committed()[0]) == jfkTranscript);
+
+    live.clear();
+
+    check(live.committed().size() == 0);
+    check(live.stats().runs == 0);
+};
+
+// Every context the live loop asks for is one the Core ML encoder is compiled
+// for, and the answer is the kernels' at the segment's own length too.
+auto tCoreMLEncodesOnlyTheAudioThereIs =
+    test("Live/CoreML/encodesOnlyTheAudioThereIs") = []
+{
+    if (!canRunOnCoreML())
+        return;
+
+    auto options = LiveOptions {};
+    options.encodeOnlyTheAudioThereIs = true;
+
+    auto& whisper = coreMLPreparedModel();
+    auto live = LiveTranscriber {whisper, options};
+
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto trailingSilence = silentChunk(2 * sampleRate);
+
+    pushChunkedThroughTheLoop(live, samples, blockSamples);
+    pushChunkedThroughTheLoop(live, trailingSilence, blockSamples);
+
+    const auto context = whisper.audioContext();
+    whisper.setAudioContext(0);
+
+    check(live.committed().size() == 1);
+
+    if (live.committed().size() == 1)
+        check(trimmed(live.committed()[0]) == jfkTranscript);
+
+    check(Whisper::isEnumeratedAudioContext(context));
+    check(context < encoderPositions);
+
+    std::cout << "  live on Core ML at the segment's own length: " << context
+              << " positions, " << live.stats().runs << " runs, last run "
+              << live.stats().lastRunSeconds << " s\n";
+};
+
+// The point of the Async: update() starts a run and returns with it in the
+// air, a second update() starts nothing and takes no audio, and the result
+// lands on a later turn of the loop. Driven without waiting, as a timer
+// would, the closing run still sees the whole segment.
+auto tCoreMLUpdateDoesNotWaitForTheEngine =
+    test("Live/CoreML/updateDoesNotWaitForTheEngine") = []
+{
+    if (!canRunOnCoreML())
+        return;
+
+    auto live = LiveTranscriber {coreMLPreparedModel()};
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto speech = Span<const float> {samples}.subspan(0, 2 * sampleRate);
+
+    live.push(speech);
+    live.update();
+
+    check(live.isRunning());
+    check(live.stats().runInFlight);
+    check(live.stats().runs == 0);
+
+    const auto pendingBefore = live.stats().pendingSeconds;
+    const auto silence = silentChunk(blockSamples);
+    live.push(silence);
+    check(!live.update());
+    check(live.stats().pendingSeconds == pendingBefore);
+
+    check(waitForTheRun(live));
+    check(live.stats().runs == 1);
+    check(!live.pending().empty());
+
+    live.clear();
+
+    const auto trailingSilence = silentChunk(2 * sampleRate);
+    const auto drive = [&live](Span<const float> audio)
+    {
+        for (auto offset = 0; offset < audio.size(); offset += blockSamples)
+        {
+            live.push(audio.subspan(offset,
+                                    std::min(blockSamples, audio.size() - offset)));
+            live.update();
+            eacp::Threads::runEventLoopFor(eacp::Time::MS {1});
+        }
+    };
+
+    drive(samples);
+    drive(trailingSilence);
+
+    const auto committedOrIdle = [&live]
+    {
+        live.update();
+        return live.committed().size() > 0 && !live.isRunning();
+    };
+
+    check(eacp::Threads::runEventLoopUntil(
+        committedOrIdle, runTimeout, eacp::Time::MS {1}));
+
+    live.flush();
+
+    check(live.committed().size() == 1);
+
+    if (live.committed().size() == 1)
+        check(trimmed(live.committed()[0]) == jfkTranscript);
+
+    std::cout << "  jfk on Core ML without waiting: " << live.stats().runs
+              << " runs\n";
+};
+
 // The layer drives a function rather than a Whisper, and the Whisper
 // constructor is that function over the runtime. Nothing in the policy asks
 // the model anything — a run is due on audio time, and the text only decides

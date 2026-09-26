@@ -3,6 +3,7 @@
 #include <WhisperEACP/Whisper/Whisper.h>
 
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace WSP
@@ -59,7 +60,9 @@ struct LiveOptions
 
 struct LiveStats
 {
-    // Whisper::transcribe calls so far, and the wall clock of the last one.
+    // Model runs finished so far, and the wall clock of the last one, from
+    // its start to its result: under the Core ML encoder that includes the
+    // loop turns the main thread spent elsewhere while the engine worked.
     int runs = 0;
     double lastRunSeconds = 0.0;
 
@@ -67,11 +70,26 @@ struct LiveStats
     double pendingSeconds = 0.0;
     double speechSeconds = 0.0;
     bool pendingHasSpeech = false;
+
+    // Whether a run has started and not yet come back.
+    bool runInFlight = false;
+
+    // Runs whose text differed from the pending text before them.
+    int runsThatChangedTheText = 0;
 };
 
 // 16 kHz mono samples in, a growing transcript out: the open segment is
 // re-transcribed as audio arrives, and closed into `committed()` on silence or
 // on length. Main thread only, like the Whisper it drives.
+//
+// A run is a call to the transcriber, whose answer may come back later. A
+// blocking one, or Whisper::transcribeAsync on the kernels, resolves before it
+// returns, so a run starts and finishes inside one update(), as it always has.
+// Under the Core ML encoder it comes back on a later turn of the event loop,
+// and until then the transcriber holds still: update() starts nothing and
+// takes no audio, which waits in the queue push() fills, and the result lands
+// where the blocking run's did when it resolves. A segment that closes on a run
+// commits when that run comes back.
 class LiveTranscriber
 {
 public:
@@ -80,26 +98,48 @@ public:
     // text a run answers, and neither is a question about the model.
     using TranscribeFunction = std::function<std::string(Span<const float>)>;
 
+    // The same for a transcriber that answers on a later turn of the loop.
+    using AsyncTranscribeFunction =
+        std::function<eacp::Threads::Async<std::string>(Span<const float>)>;
+
     explicit LiveTranscriber(TranscribeFunction transcriber,
                              LiveOptions options = {});
 
-    // The runtime, which is that function over Whisper::transcribe with
-    // encodeOnlyTheAudioThereIs applied to the segment before each run.
+    explicit LiveTranscriber(AsyncTranscribeFunction transcriber,
+                             LiveOptions options = {});
+
+    // The runtime, which is the async function over Whisper::transcribeAsync
+    // with encodeOnlyTheAudioThereIs applied to the segment before each run.
     explicit LiveTranscriber(Whisper& whisper, LiveOptions options = {});
+
+    LiveTranscriber(const LiveTranscriber&) = delete;
+    LiveTranscriber& operator=(const LiveTranscriber&) = delete;
 
     // Any block size. Buffers only; no GPU work happens here.
     void push(Span<const float> samples);
 
-    // Runs the model if a run is due and closes the segment if the policy says
-    // so. Returns true when committed() or pending() changed.
+    // Starts a run if one is due and none is in flight, and closes the segment
+    // if the policy says so. Returns true when committed() or pending()
+    // changed since the last call, which includes a run that came back
+    // between the two. A run that failed while in flight throws here, as the
+    // blocking run did from inside the call.
     bool update();
 
     // Closes the open segment now (the Stop button): a final run if it holds
-    // speech, then commit.
+    // speech, then commit. Waits for a run in flight, and for the final run,
+    // pumping the event loop.
     void flush();
 
-    // Drops everything: segments, pending audio, stats.
+    // Drops everything: segments, pending audio, stats. A run in flight is
+    // left to finish and its result dropped.
     void clear();
+
+    bool isRunning() const { return runInFlight; }
+
+    // How long flush() waits for one run before giving up with a ModelError.
+    // The run is not abandoned: it stays in flight, and its result lands on a
+    // later update() unless clear() drops it.
+    static constexpr int runTimeoutMilliseconds = 60000;
 
     const Vector<std::string>& committed() const { return committedText; }
     const std::string& pending() const { return pendingText; }
@@ -117,13 +157,18 @@ private:
     bool hasAudioWorthTranscribing() const;
     bool runIsDue() const;
 
-    bool runModel();
-    bool closeSegment();
+    void startRun(bool closesTheSegment);
+    void finishRun(const std::string& text, double seconds, bool closesTheSegment);
+    void closeSegment();
+    void commitSegment();
     void startSegment();
+    void waitForRun();
+    void throwRunFailure();
+    bool takeChange();
 
     int maximumSegmentSamples() const;
 
-    TranscribeFunction transcribeSegment;
+    AsyncTranscribeFunction transcribeSegment;
     LiveOptions liveOptions;
 
     // What push() took and no block has claimed yet, and the open segment the
@@ -147,7 +192,20 @@ private:
     std::string pendingText;
 
     int runCount = 0;
+    int textChangeCount = 0;
     double lastRun = 0.0;
+
+    // The run in flight, if any; which segment it belongs to, so a result
+    // that comes back after clear() is dropped; and what update() reports.
+    eacp::Threads::Async<std::string> pendingRun;
+    bool runInFlight = false;
+    int generation = 0;
+    bool hasChanged = false;
+    std::string runFailure;
+
+    // What a run's continuation checks before touching this object, which
+    // may be gone by the time the engine answers.
+    std::shared_ptr<int> lifetime = std::make_shared<int>(0);
 };
 
 // The classifier, exposed for the tests: RMS of a block in dBFS (silence is a

@@ -17,9 +17,10 @@ add_subdirectory(Mel)
 add_subdirectory(Model)
 add_subdirectory(Tokenizer)
 
-# The first module above the seam: it includes headers from two of the four
-# below it, which is what "assembled from Kernels/, fed by Mel/ and Model/"
-# means once there is something to assemble.
+# The first module above the seam: the net the encoder and decoder are written
+# against, and the backend that runs it out of Kernels/ and Model/.
+add_subdirectory(Net)
+
 add_subdirectory(Encoder)
 
 # Beside the encoder rather than above it: the encoder's output reaches the
@@ -40,6 +41,7 @@ target_link_libraries(WhisperEACP INTERFACE
         whisper-mel
         whisper-model
         whisper-tokenizer
+        whisper-net
         whisper-encoder
         whisper-decoder
         whisper-runtime)

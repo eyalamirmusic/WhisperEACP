@@ -10,11 +10,6 @@ namespace
 {
 constexpr auto decoderPrefix = "model.decoder.";
 
-// The gather has no class in Kernels/ yet — it arrives with the Decoder — so
-// the tensors it reads name it by what it does rather than by a type this file
-// would have to keep in step.
-constexpr auto embeddingReader = "the embedding gather";
-
 std::string decoderName(std::string_view suffix)
 {
     return std::string {decoderPrefix} + std::string {suffix};
@@ -29,18 +24,15 @@ TensorLoader decoderTensors(const SafeTensors& file)
 
 // The logits projection's weight as well as the gather's table, and the gather
 // is the reader with no packed form — so this one is float whatever the repo
-// ships, and the tie between the two stays exact rather than exact up to a
-// conversion.
+// ships, widened here for an fp16 repo. The logits keep their own packed copy
+// beside it, which is the same values to the bit.
 TensorBuffer loadTokenEmbedding(const SafeTensors& file, const DecoderShape& shape)
 {
     const auto tensors = decoderTensors(file);
     const auto name = decoderName("embed_tokens.weight");
     tensors.checkShape(tensors.require(name), {shape.vocabularySize, shape.width});
 
-    auto loaded = file.makeBuffer(name);
-    tensors.rejectPackedHalf(loaded, name, embeddingReader);
-
-    return loaded;
+    return file.makeFloatBuffer(name);
 }
 
 TensorBuffer loadPositionalEmbedding(const SafeTensors& file,
@@ -61,10 +53,7 @@ TensorBuffer loadPositionalEmbedding(const SafeTensors& file,
                           + " positions, and this decoder was built for "
                           + std::to_string(shape.maxPositions)};
 
-    auto loaded = file.makeBuffer(name);
-    tensors.rejectPackedHalf(loaded, name, embeddingReader);
-
-    return loaded;
+    return file.makeFloatBuffer(name);
 }
 
 std::string decoderLayerPrefix(int index)
@@ -75,115 +64,103 @@ std::string decoderLayerPrefix(int index)
 
 DecoderLayerWeights::DecoderLayerWeights(const SafeTensors& file,
                                          const DecoderShape& shape,
-                                         int index)
+                                         int index,
+                                         WeightPacking packing)
     : selfAttentionNormWeight(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "self_attn_layer_norm.weight",
-          {shape.width},
-          "LayerNorm"))
+          decoderLayerPrefix(index) + "self_attn_layer_norm.weight", {shape.width}))
     , selfAttentionNormBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "self_attn_layer_norm.bias",
-          {shape.width},
-          "LayerNorm"))
+          decoderLayerPrefix(index) + "self_attn_layer_norm.bias", {shape.width}))
     , selfQueryWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "self_attn.q_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , selfQueryBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "self_attn.q_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "self_attn.q_proj.bias", {shape.width}))
     , selfKeyWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "self_attn.k_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , selfValueWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "self_attn.v_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , selfValueBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "self_attn.v_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "self_attn.v_proj.bias", {shape.width}))
     , selfAttentionOutputWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "self_attn.out_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , selfAttentionOutputBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "self_attn.out_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "self_attn.out_proj.bias", {shape.width}))
     , crossAttentionNormWeight(decoderTensors(file).loadFloatTensor(
           decoderLayerPrefix(index) + "encoder_attn_layer_norm.weight",
-          {shape.width},
-          "LayerNorm"))
+          {shape.width}))
     , crossAttentionNormBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "encoder_attn_layer_norm.bias",
-          {shape.width},
-          "LayerNorm"))
+          decoderLayerPrefix(index) + "encoder_attn_layer_norm.bias", {shape.width}))
     , crossQueryWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "encoder_attn.q_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , crossQueryBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "encoder_attn.q_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "encoder_attn.q_proj.bias", {shape.width}))
     , crossKeyWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "encoder_attn.k_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , crossValueWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "encoder_attn.v_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , crossValueBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "encoder_attn.v_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "encoder_attn.v_proj.bias", {shape.width}))
     , crossAttentionOutputWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "encoder_attn.out_proj.weight",
-          {shape.width, shape.width}))
+          {shape.width, shape.width},
+          packing))
     , crossAttentionOutputBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "encoder_attn.out_proj.bias",
-          {shape.width},
-          "Linear"))
+          decoderLayerPrefix(index) + "encoder_attn.out_proj.bias", {shape.width}))
     , finalNormWeight(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "final_layer_norm.weight",
-          {shape.width},
-          "LayerNorm"))
+          decoderLayerPrefix(index) + "final_layer_norm.weight", {shape.width}))
     , finalNormBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "final_layer_norm.bias",
-          {shape.width},
-          "LayerNorm"))
+          decoderLayerPrefix(index) + "final_layer_norm.bias", {shape.width}))
     , feedForwardWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "fc1.weight",
-          {shape.feedForwardWidth, shape.width}))
-    , feedForwardBias(decoderTensors(file).loadFloatTensor(decoderLayerPrefix(index)
-                                                               + "fc1.bias",
-                                                           {shape.feedForwardWidth},
-                                                           "Linear"))
+          {shape.feedForwardWidth, shape.width},
+          packing))
+    , feedForwardBias(decoderTensors(file).loadFloatTensor(
+          decoderLayerPrefix(index) + "fc1.bias", {shape.feedForwardWidth}))
     , feedForwardOutputWeight(decoderTensors(file).loadProjectionWeight(
           decoderLayerPrefix(index) + "fc2.weight",
-          {shape.width, shape.feedForwardWidth}))
+          {shape.width, shape.feedForwardWidth},
+          packing))
     , feedForwardOutputBias(decoderTensors(file).loadFloatTensor(
-          decoderLayerPrefix(index) + "fc2.bias", {shape.width}, "Linear"))
+          decoderLayerPrefix(index) + "fc2.bias", {shape.width}))
 {
 }
 
 DecoderWeights::DecoderWeights(const SafeTensors& file,
                                const DecoderShape& shapeToUse,
-                               LogitsWeight logitsWeightToUse)
+                               WeightPacking packingToUse)
     : shape(shapeToUse)
     , tokenEmbedding(loadTokenEmbedding(file, shapeToUse))
     , positionalEmbedding(loadPositionalEmbedding(file, shapeToUse))
     , finalNormWeight(decoderTensors(file).loadFloatTensor(
-          decoderName("layer_norm.weight"), {shapeToUse.width}, "LayerNorm"))
+          decoderName("layer_norm.weight"), {shapeToUse.width}))
     , finalNormBias(decoderTensors(file).loadFloatTensor(
-          decoderName("layer_norm.bias"), {shapeToUse.width}, "LayerNorm"))
+          decoderName("layer_norm.bias"), {shapeToUse.width}))
 {
-    // The shape and the storage of the float table were checked above, so this
-    // narrows a tensor already known to be the matrix it claims to be — and
-    // keeps the result only if narrowing changed none of it.
-    if (logitsWeightToUse == LogitsWeight::PackedHalfCopy)
+    // The shape of the table was checked above, so this narrows a tensor
+    // already known to be the matrix it claims to be — and keeps the result
+    // only if narrowing changed none of it. For an fp16 file the packed upload
+    // is the blob's own halves, so the copy direction simply reverses: the
+    // gather got the widened table, and the logits get the original.
+    if (packingToUse == WeightPacking::ExactHalf)
         packedTokenEmbedding =
             file.makeExactHalfBuffer(decoderName("embed_tokens.weight"));
 
     layers.reserve(shapeToUse.layers);
 
     for (auto index = 0; index < shapeToUse.layers; ++index)
-        layers.emplace_back(file, shapeToUse, index);
+        layers.emplace_back(file, shapeToUse, index, packingToUse);
 }
 } // namespace WSP

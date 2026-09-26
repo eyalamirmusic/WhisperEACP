@@ -5,19 +5,31 @@
 
 #include <MakeASound/Devices/DeviceManager.h>
 
+#include <chrono>
 #include <cstdio>
+#include <exception>
+#include <string_view>
 
 // Bring-up check: the two halves this project stands on — a device to dispatch
 // compute on, and a microphone to feed it — reporting what each one gives us to
-// plan against. Worth a real binary rather than knowledge, because every number
-// below is a property of the eacp and MakeASound versions that were fetched,
-// not of this project.
+// plan against, and whether Core ML can take the encoder. Worth a real binary
+// rather than knowledge, because every number below is a property of the eacp
+// and MakeASound versions that were fetched, not of this project.
 
 using namespace eacp;
 using namespace eacp::GPU;
 
 namespace
 {
+constexpr auto usage =
+    "usage: DeviceInfo [--plan]\n"
+    "\n"
+    "  --plan  load the fetched model with its encoder on Core ML and print\n"
+    "          where Core ML placed the encoder's ops. Reading the plan costs\n"
+    "          the Neural Engine compile again, about 14 s, and a first load\n"
+    "          on a machine another 14 s.\n";
+
+bool readsThePlan = false;
 void printGpuInfo()
 {
     auto& device = Device::shared();
@@ -74,6 +86,85 @@ void printFormat()
                 WSP::encoderPositions);
 }
 
+#if EACP_HAS_COREML
+const char* yesOrNo(bool answer)
+{
+    return answer ? "yes" : "no";
+}
+
+double secondsSince(std::chrono::steady_clock::time_point start)
+{
+    const auto elapsed = std::chrono::steady_clock::now() - start;
+    return std::chrono::duration<double>(elapsed).count();
+}
+
+void printEncoderPlan()
+{
+    if (!WSP::ModelFetch::isAvailable())
+    {
+        std::printf("  plan                      no model: the fetch into %s "
+                    "did not finish\n",
+                    WSP::ModelFetch::directory().string().c_str());
+        return;
+    }
+
+    if (!Device::shared().isValid()
+        || !WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML))
+    {
+        std::printf("  plan                      the encoder cannot run on Core "
+                    "ML here\n");
+        return;
+    }
+
+    try
+    {
+        auto whisper = WSP::Whisper {};
+        whisper.load(WSP::ModelFetch::directory());
+        whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
+        whisper.prepare();
+
+        std::printf("  encoder load              %.2f s, %s\n",
+                    whisper.encoderLoadSeconds(),
+                    whisper.encoderWasCacheHit() ? "cache hit" : "compiled");
+
+        const auto start = std::chrono::steady_clock::now();
+        const auto& plan = whisper.encoderComputePlan();
+
+        std::printf("  plan, cpuAndNeuralEngine  read in %.1f s\n%s",
+                    secondsSince(start),
+                    WSP::describePlacement(plan, "    ").c_str());
+    }
+    catch (const std::exception& failure)
+    {
+        std::printf("  plan                      %s\n", failure.what());
+    }
+}
+#endif
+
+void printCoreMLInfo()
+{
+    std::printf("\nCore ML\n");
+
+#if EACP_HAS_COREML
+    std::printf("  Neural Engine             %s\n",
+                yesOrNo(eacp::ML::hasNeuralEngine()));
+    std::printf("  Core ML runner            %s\n",
+                yesOrNo(eacp::ML::isSupported()));
+    std::printf("  fused attention (spec 9)  %s\n",
+                yesOrNo(eacp::ML::supportsSpecification(9)));
+    std::printf(
+        "  encoder on Core ML        %s\n",
+        yesOrNo(WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML)));
+
+    if (readsThePlan)
+        printEncoderPlan();
+    else
+        std::printf("  plan                      --plan reads it, about 14 s\n");
+#else
+    std::printf("  not built with Core ML\n");
+#endif
+}
+
 void printDeviceInfo()
 {
     std::printf("WhisperEACP %s\n\n",
@@ -82,10 +173,28 @@ void printDeviceInfo()
     printGpuInfo();
     printAudioInfo();
     printFormat();
+    printCoreMLInfo();
 }
 } // namespace
 
-int main()
+int main(int argc, char* argv[])
 {
+    for (auto index = 1; index < argc; ++index)
+    {
+        if (std::string_view {argv[index]} != "--plan")
+        {
+            std::printf("%s", usage);
+            return 2;
+        }
+
+        readsThePlan = true;
+    }
+
+    // Before the loop, since ModelFetch::fetch pumps it; a failure is left for
+    // the plan line to report.
+    if (readsThePlan)
+        WSP::ModelFetch::fetch();
+
+    Apps::setCommandLineArgs(argc, argv);
     return Apps::run(printDeviceInfo);
 }

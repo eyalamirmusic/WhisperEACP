@@ -4,11 +4,14 @@
 
 #include <NanoTest/NanoTest.h>
 
+#include <eacp/Core/Utils/FilePath.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -104,6 +107,25 @@ bool throwsModelError(Body&& body)
     return false;
 }
 
+template <typename Body>
+bool throwsLogicError(Body&& body)
+{
+    try
+    {
+        body();
+    }
+    catch (const std::logic_error&)
+    {
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    return false;
+}
+
 inline bool nearlyEqual(float actual, float expected, float tolerance = 1.0e-6f)
 {
     const auto difference = actual - expected;
@@ -132,5 +154,13 @@ inline bool hasModelFile(std::string_view name)
 {
     auto error = std::error_code {};
     return std::filesystem::is_regular_file(modelFile(name), error);
+}
+
+// One Core ML cache for every test binary, fixed rather than per process: the
+// engine compile of the eighteen-context encoder is about 13.5 s, and with
+// each binary's own appCacheDirectory() every one of them paid it.
+inline eacp::FilePath sharedCoreMLCacheDirectory()
+{
+    return eacp::FilePath::tempDirectory() / "whisper-eacp-tests" / "CoreML";
 }
 } // namespace WSP::Testing

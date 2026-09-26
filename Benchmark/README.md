@@ -30,6 +30,8 @@ Benchmark recording.wav    another 16 kHz mono WAV of at most 30 s
 Benchmark 30 recording.wav
 Benchmark 30 --audio-ctx=704       both sides over 704 of the 1500 encoder positions
 Benchmark 30 --audio-ctx=audio     the positions Whisper::audioContextForSamples picks
+Benchmark 30 --units=all           the ANE column's encoder under Core ML's all (the GPU)
+Benchmark 30 --plan                also print where Core ML placed the encoder (~14 s)
 
 Benchmark --live           jfk.wav on repeat, 30 s of stream, a 1.5 s gap
 Benchmark --live 60        60 s of stream
@@ -59,18 +61,22 @@ the every-backend-off oracle.
 
 ## What it measures
 
-Three contestants, each loaded once, each given one warm-up run and then the
+Four contestants, each loaded once, each given one warm-up run and then the
 timed runs, of which the **median** is what the columns compare:
 
 | column | what runs |
 | --- | --- |
 | `WhisperEACP` | our runtime, on eacp's device, from the F32 safetensors |
+| `WhisperEACP ANE` | the same with the encoder on Core ML (`Whisper::setEncoderBackend(coreML)`), compiled for `--units`, `cpuAndNeuralEngine` by default; the decoder stays on eacp's device. Only where the build and the OS have Core ML |
 | `whisper.cpp GPU` | whisper.cpp on its GPU backend — Metal on a Mac — from the F16 GGML file |
 | `whisper.cpp CPU` | the same context with `use_gpu` off: ggml's CPU backend, plus Accelerate through the BLAS backend on a Mac, at whisper.cpp's own default thread count |
 
 The header names whisper.cpp's version, its flash-attention default and every
 backend ggml registered, so a number is never read without knowing what
-produced it. On a build with no GPU backend the middle column is skipped and
+produced it; and for the ANE column the compute units, whether its load found
+the compiled model in the cache, and the load time. `--plan` adds where Core ML
+placed the encoder's ops, which is behind a flag because reading the plan
+under the engine settings is the engine compile again, about 14 s. On a build with no GPU backend the middle column is skipped and
 says so.
 
 The decode is the same policy on every side — greedy, temperature 0, no
@@ -86,6 +92,7 @@ The rows:
 | `transcribe, median` / `best` | wall clock around the whole call, samples in to tokens out. The one number that is defined the same way on every side |
 | `x real time, 30 s window` | the window's length over the median. Every encoder here does the work of a full window whatever the clip's length, so the window is the honest denominator; an 11 s clip does not transcribe three times faster than a 30 s one |
 | `encode, median` | ours: the upload, the mel and the encoder, which are one command buffer. whisper.cpp: its encoder alone, since `whisper_get_timings` does not expose its mel. Read this row knowing it |
+| `mel on the GPU` / `predict` / `seam copies` | the ANE column's encode split three ways: the mel's own command buffer, committed and waited on, which is all the GPU does in that encode; the Core ML prediction alone; and the rest, per run, which is the mel read back and narrowed to fp16 and the rows widened back into the decoder's buffer. `-` in the other columns |
 | `decode, median` | the prompt pass and every token after it, on both sides. Ours is the pipelined loop end to end — the first step's submit to the read of the last token — and stops at that read rather than waiting for the one step still in the air behind it |
 | `decode per step, median` | that over `steps`, which counts one for the prompt and one per sampled token on both sides. A step is counted when its token is read, so the step a run leaves running past its end is in neither number |
 
@@ -110,14 +117,24 @@ The recording is played on repeat with a gap of silence between passes — a
 microphone left open over somebody who says the same thing again after a pause
 — pushed at a 33 ms tick, which is the timer `Apps/Demo/LiveTranscribe` runs.
 
-**All three contestants take that stream**, one after another, each loaded once,
-and the table has the three columns the comparison has. whisper.cpp has no
+**Every contestant takes that stream**, one after another, each loaded once,
+and the table has the columns the comparison has. whisper.cpp has no
 equivalent of this layer, so what its two columns measure is *our* policy
-driving `whisper_full`: `LiveTranscriber` transcribes through a
-`std::function<std::string(Span<const float>)>` rather than through a `Whisper`,
-and the constructor that takes the runtime is that function over
-`Whisper::transcribe`. So the segments, the runs and the audio each run saw are
-the policy's on every side, and only the seconds are the backend's. With
+driving `whisper_full`: `LiveTranscriber` transcribes through a function of the
+open segment rather than through a `Whisper` — a
+`std::function<std::string(Span<const float>)>`, or one answering an
+`eacp::Threads::Async<std::string>` — and the constructor that takes the
+runtime is the second over `Whisper::transcribeAsync`. So the segments, the
+runs and the audio each run saw are the policy's on every side, and only the
+seconds are the backend's.
+
+Ours streams twice, once with the encoder on the kernels and once on Core ML
+(the `WhisperEACP ANE` column, where the machine has it). On Core ML a run comes
+back on a later turn of the event loop, which the stream pumps between ticks,
+and the transcriber takes no audio until it does, so its `runs` can fall short
+of the others' when a run outlasts the step; and that column's `per run`
+and `duty` are each run's start-to-result latency, loop turns included, rather
+than time the main thread or the GPU spent on it. With
 `--audio-ctx=audio` the per-run context is set on each side from the same
 `Whisper::audioContextForSamples(segment)` — `Whisper::setAudioContext` for
 ours, `whisper_full_params::audio_ctx` for theirs.
@@ -125,7 +142,7 @@ ours, `whisper_full_params::audio_ctx` for theirs.
 Every clock in `LiveTranscriber` is audio time, and the tick delivers a tick's
 worth of samples rather than however many the wall clock ran past, so `runs` is
 the same number for a given recording, gap and policy whatever ran the model.
-That is what makes the three columns comparable, and what makes this a
+That is what makes the columns comparable, and what makes this a
 before-and-after tool: the run count moves only when the policy does, and the
 seconds under it are the noise. A contestant that cannot keep up falls behind
 the clock rather than skipping runs, and the two stream rows are where that

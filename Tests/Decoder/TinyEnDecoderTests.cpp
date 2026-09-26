@@ -251,19 +251,21 @@ auto tTinyEnDecoderMatchesReference =
               << "\n";
 };
 
-// The vocabulary projection reading a packed fp16 copy of embed_tokens instead
+// A step under WeightPacking::ExactHalf against the same step under
+// WeightPacking::Float: every projection of every layer read as packed fp16,
+// and the vocabulary projection reading a packed copy of embed_tokens instead
 // of the float matrix — 40 MB a step rather than 80, which is the largest read
 // a step makes and a quarter of its GPU time.
 //
 // What this asserts is that it costs nothing at all: **every logit is bit
 // identical**, not close. tiny.en's weights are fp16 values in an F32 container
-// (Model/TinyEn/weightsAreExactlyHalves says so over the whole file), so the
+// (Model/TinyEn/weightsAreExactlyHalves says so over the whole file), so every
 // narrowed weight is the same number and the same products are summed in the
 // same order by the same kernel — only the load width differs. An equality
 // rather than a tolerance is therefore the honest assertion, and it is the one
-// that would catch a repo where the packing quietly lost something, since
-// DecoderWeights refuses to pack such a file at all and this would then be
-// comparing the tied weight with itself.
+// that would catch a repo where the packing quietly lost something, since a
+// weight that would lose something is not packed at all and this would then be
+// comparing the float weight with itself.
 auto tTinyEnDecoderPackedLogitsAreIdentical =
     test("Decoder/TinyEn/packedLogitsWeightIsIdentical") = []
 {
@@ -283,15 +285,15 @@ auto tTinyEnDecoderPackedLogitsAreIdentical =
     check(
         file.makeExactHalfBuffer(decoderTensor("embed_tokens.weight")).has_value());
 
-    const auto logitsFrom = [&](DecoderWeights::LogitsWeight which)
+    const auto logitsFrom = [&](WeightPacking packing)
     {
-        auto run = DecoderRun {shape, file, which};
+        auto run = DecoderRun {shape, file, packing};
         run.begin(encoderOutput);
         return run.step(tokens).logits;
     };
 
-    const auto tied = logitsFrom(DecoderWeights::LogitsWeight::Tied);
-    const auto packed = logitsFrom(DecoderWeights::LogitsWeight::PackedHalfCopy);
+    const auto tied = logitsFrom(WeightPacking::Float);
+    const auto packed = logitsFrom(WeightPacking::ExactHalf);
 
     check(tied.size() == packed.size());
     check(tied.size() == (int) tokens.size() * shape.vocabularySize);
@@ -303,6 +305,52 @@ auto tTinyEnDecoderPackedLogitsAreIdentical =
             ++differing;
 
     check(differing == 0);
+};
+
+// And that ExactHalf actually packed all of it, which is what the equality
+// above is worth something for: the ten projection weights of every layer are
+// where a step's 33 MB of weights live, and a fallback firing on any of them
+// would leave that read at 8 MB a layer while every assertion here still
+// passed. tiny.en's tensors all round-trip, so none of them falls back.
+auto tTinyEnDecoderPacksEveryProjection =
+    test("Decoder/TinyEn/exactHalfPacksEveryProjection") = []
+{
+    if (!hasModel() || !Device::shared().isValid())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile(configFile));
+    const auto shape = DecoderShape::fromConfig(config, shortCrossPositions);
+
+    const auto file = SafeTensors::fromFile(modelFile(weightsFile));
+    const auto weights = DecoderWeights {file, shape, WeightPacking::ExactHalf};
+
+    check(weights.packedTokenEmbedding.has_value());
+    check(weights.logitsWeight().isPackedHalf());
+
+    // The gather's table and the positional rows are the two the packing does
+    // not reach: one buffer cannot be both the subscripted table and the
+    // packed projection, which is what the second copy above is for.
+    check(!weights.tokenEmbedding.isPackedHalf());
+    check(!weights.positionalEmbedding.isPackedHalf());
+
+    for (const auto& layer: weights.layers)
+    {
+        check(layer.selfQueryWeight.isPackedHalf());
+        check(layer.selfKeyWeight.isPackedHalf());
+        check(layer.selfValueWeight.isPackedHalf());
+        check(layer.selfAttentionOutputWeight.isPackedHalf());
+        check(layer.crossQueryWeight.isPackedHalf());
+        check(layer.crossKeyWeight.isPackedHalf());
+        check(layer.crossValueWeight.isPackedHalf());
+        check(layer.crossAttentionOutputWeight.isPackedHalf());
+        check(layer.feedForwardWeight.isPackedHalf());
+        check(layer.feedForwardOutputWeight.isPackedHalf());
+
+        // Every bias and both norms stay float: they are subscripted inside
+        // Linear and LayerNorm, neither of which has a packed read.
+        check(!layer.selfQueryBias.isPackedHalf());
+        check(!layer.selfAttentionNormWeight.isPackedHalf());
+    }
 };
 
 // The shape a step is actually run at: a full 30 second window behind it, so

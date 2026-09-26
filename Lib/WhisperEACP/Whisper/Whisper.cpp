@@ -6,6 +6,7 @@
 #include <array>
 #include <chrono>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <system_error>
 
@@ -53,6 +54,25 @@ double secondsSince(Clock::time_point start)
 {
     return std::chrono::duration<double>(Clock::now() - start).count();
 }
+
+#if EACP_HAS_COREML
+eacp::ML::ComputeUnits toCoreMLUnits(EncoderComputeUnits units)
+{
+    switch (units)
+    {
+        case EncoderComputeUnits::all:
+            return eacp::ML::ComputeUnits::all;
+        case EncoderComputeUnits::cpuAndGPU:
+            return eacp::ML::ComputeUnits::cpuAndGPU;
+        case EncoderComputeUnits::cpu:
+            return eacp::ML::ComputeUnits::cpu;
+        case EncoderComputeUnits::cpuAndNeuralEngine:
+            break;
+    }
+
+    return eacp::ML::ComputeUnits::cpuAndNeuralEngine;
+}
+#endif
 } // namespace
 
 void Whisper::load(const std::filesystem::path& modelDirectory)
@@ -198,9 +218,72 @@ void Whisper::setMaximumTokens(int count)
     maximumTokenCount = count;
 }
 
-void Whisper::setPacksLogitsWeight(bool shouldPack)
+void Whisper::setPacksWeights(bool shouldPack)
 {
-    packedLogitsWeight = shouldPack;
+    packedWeights = shouldPack;
+}
+
+void Whisper::setEncoderBackend(EncoderBackend backend)
+{
+    if (isPrepared())
+        throw std::logic_error {"the encoder backend is chosen before prepare(), "
+                                "which builds the encoder for it"};
+
+    chosenEncoderBackend = backend;
+}
+
+bool Whisper::supportsEncoderBackend(EncoderBackend backend)
+{
+    if (backend == EncoderBackend::kernels)
+        return true;
+
+#if EACP_HAS_COREML
+    return eacp::ML::isSupported() && eacp::ML::supportsSpecification(8);
+#else
+    return false;
+#endif
+}
+
+void Whisper::setEncoderComputeUnits(EncoderComputeUnits units)
+{
+    if (isPrepared())
+        throw std::logic_error {"the encoder's compute units are chosen before "
+                                "prepare(), which compiles the encoder for them"};
+
+    chosenComputeUnits = units;
+}
+
+void Whisper::setEncoderCacheDirectory(const eacp::FilePath& directory)
+{
+    if (isPrepared())
+        throw std::logic_error {"the encoder's cache directory is chosen before "
+                                "prepare(), which compiles the encoder into it"};
+
+    coreMLCacheDirectory = directory;
+}
+
+void Whisper::requireRunnableEncoder() const
+{
+    requireAudioContextForBackend(audioContextPositions);
+
+    if (!supportsEncoderBackend(chosenEncoderBackend))
+        throw ModelError {"this Whisper was asked to run its encoder on Core ML, "
+                          "which this build or this machine cannot do"};
+}
+
+void Whisper::requireAudioContextForBackend(int positions) const
+{
+    if (chosenEncoderBackend != EncoderBackend::coreML || positions == 0
+        || isEnumeratedAudioContext(positions))
+        return;
+
+    throw ModelError {
+        "the Core ML encoder is compiled for "
+        + std::to_string(enumeratedAudioContextCount)
+        + " audio contexts, the multiples of " + std::to_string(audioContextTile)
+        + " from " + std::to_string(audioContextFloor) + " and "
+        + std::to_string(encoderPositions) + ", or zero for the whole window, and "
+        + std::to_string(positions) + " is not one of them"};
 }
 
 void Whisper::setAudioContext(int positions)
@@ -212,7 +295,17 @@ void Whisper::setAudioContext(int positions)
                             "and this one is "
                           + std::to_string(positions)};
 
+    requireAudioContextForBackend(positions);
+    requireNoRunInFlight();
+
     audioContextPositions = positions;
+}
+
+void Whisper::requireNoRunInFlight() const
+{
+    if (runInFlight)
+        throw std::logic_error {"this Whisper has a transcribeAsync run in flight, "
+                                "and runs one at a time"};
 }
 
 int Whisper::audioContextForSamples(int sampleCount, double marginSeconds)
@@ -229,27 +322,46 @@ int Whisper::audioContextForSamples(int sampleCount, double marginSeconds)
 
 void Whisper::prepare(Device& device)
 {
+    requireNoRunInFlight();
+    unprepare();
+
     requireLoaded();
     requireWhisperShapes();
+    requireRunnableEncoder();
 
     gpu = &device;
 
+    const auto usesCoreML = chosenEncoderBackend == EncoderBackend::coreML;
+    const auto packing =
+        packedWeights ? WeightPacking::ExactHalf : WeightPacking::Float;
+
     encoder.emplace(
         EncoderShape::fromConfig(modelConfig, modelConfig.encoderInputFrames()));
+
+    // First, since it is the one step here that can take seconds and the one
+    // most likely to fail; a failure leaves this unprepared.
+    if (usesCoreML)
+    {
+        encoderWeights.emplace(
+            *weightsFile, encoder->shape(), packing, WeightPlacement::Host);
+        prepareCoreMLEncoder();
+    }
+
     decoder.emplace(
         DecoderShape::fromConfig(modelConfig, encoder->shape().positions()));
 
     frontEnd.prepare(device);
-    encoder->prepare(device);
+
+    if (!usesCoreML)
+        encoder->prepare(device);
+
     decoder->prepare(device);
     selection.prepare(device, 1, decoder->shape().logitElementCount());
 
-    encoderWeights.emplace(*weightsFile, encoder->shape());
-    decoderWeights.emplace(*weightsFile,
-                           decoder->shape(),
-                           packedLogitsWeight
-                               ? DecoderWeights::LogitsWeight::PackedHalfCopy
-                               : DecoderWeights::LogitsWeight::Tied);
+    if (!usesCoreML)
+        encoderWeights.emplace(*weightsFile, encoder->shape(), packing);
+
+    decoderWeights.emplace(*weightsFile, decoder->shape(), packing);
 
     filterBank.emplace(preprocessor.makeMelFilterBuffer());
 
@@ -292,6 +404,22 @@ void Whisper::prepare()
     prepare(Device::shared());
 }
 
+// Everything isPrepared() and the Core ML accessors read, so a prepare that
+// fails part way cannot leave an earlier prepare's decoder beside no encoder.
+void Whisper::unprepare()
+{
+    decoder.reset();
+    encoder.reset();
+    encoderWeights.reset();
+    decoderWeights.reset();
+    coreMLCacheHit = false;
+    coreMLLoadSeconds = 0.0;
+
+#if EACP_HAS_COREML
+    coreMLEncoder.reset();
+#endif
+}
+
 // Zero-filled to the window, which is HF's own padding: WhisperFeatureExtractor
 // pads to n_samples with zeros rather than reflecting, and the encoder's
 // positional embedding is written against all 1500 positions whatever the
@@ -320,6 +448,9 @@ void Whisper::uploadPrompt()
 // M4 Max over the 30 s window it is 9.9 ms against 9.6 ms.
 double Whisper::encodeAudio()
 {
+    if (chosenEncoderBackend == EncoderBackend::coreML)
+        return encodeAudioOnCoreML();
+
     auto commands = gpu->makeCommandBuffer();
 
     {
@@ -338,6 +469,83 @@ double Whisper::encodeAudio()
 
     return secondsSince(start);
 }
+
+// The mel in a command buffer of its own, waited on, then the prediction: the
+// seam copy reads the mel after the GPU wrote it, and writes the rows the
+// decoder's first step reads before that step is recorded.
+double Whisper::encodeAudioOnCoreML()
+{
+#if EACP_HAS_COREML
+    const auto start = Clock::now();
+    commitMel();
+
+    coreMLEncoder->encode(*melBuffer, *encodedBuffer, encodedPositions());
+    predictSeconds = coreMLEncoder->lastPredictSeconds();
+
+    return secondsSince(start);
+#else
+    throw std::logic_error {"this build has no Core ML encoder to run"};
+#endif
+}
+
+void Whisper::commitMel()
+{
+    const auto start = Clock::now();
+    auto commands = gpu->makeCommandBuffer();
+
+    {
+        auto pass = commands.beginCompute();
+        frontEnd.encode(pass, *sampleBuffer, *filterBank, *melBuffer);
+    }
+
+    commands.commit();
+    melSeconds = secondsSince(start);
+}
+
+int Whisper::encodedPositions() const
+{
+    return audioContextPositions == 0 ? encoder->shape().positions()
+                                      : audioContextPositions;
+}
+
+void Whisper::prepareCoreMLEncoder()
+{
+#if EACP_HAS_COREML
+    const auto contexts = enumeratedAudioContexts();
+
+    auto options = CoreMLEncoderOptions {};
+    options.units = toCoreMLUnits(chosenComputeUnits);
+    options.cacheDirectory = coreMLCacheDirectory;
+
+    coreMLEncoder.emplace(encoder->shape(),
+                          Span<const int> {contexts.data(), contexts.size()});
+
+    const auto loaded = coreMLEncoder->prepare(*encoderWeights, options);
+
+    if (!loaded.ok)
+    {
+        coreMLEncoder.reset();
+        throw ModelError {"Core ML could not compile or load the encoder: "
+                          + loaded.error};
+    }
+
+    coreMLCacheHit = coreMLEncoder->wasCacheHit();
+    coreMLLoadSeconds = coreMLEncoder->lastLoadSeconds();
+#else
+    throw std::logic_error {"this build has no Core ML encoder to prepare"};
+#endif
+}
+
+#if EACP_HAS_COREML
+const eacp::ML::ComputePlan& Whisper::encoderComputePlan()
+{
+    if (!coreMLEncoder)
+        throw std::logic_error {"the encoder's compute plan is Core ML's, and "
+                                "this Whisper was not prepared with it"};
+
+    return coreMLEncoder->computePlan();
+}
+#endif
 
 BufferRange Whisper::sequenceSlots(int first, int count) const
 {
@@ -414,17 +622,87 @@ TokenId Whisper::endOfTextToken() const
                : vocabulary->specials().endOfText;
 }
 
-// The search is HF's greedy generate, one command buffer to a step and
-// stepsInFlight of them in the air: step k + 1 is recorded and submitted before
-// the host asks the GPU for step k, so the two overlap instead of taking turns.
-// Each step's token is read out of that step's own command buffer, which waits
-// for it alone — Buffer::read waits for the newest submission, and would
-// therefore wait for the step still running — and the run ends on
-// `<|endoftext|>`, the token limit or the window's end, with only the steps
-// already in the air computed past it.
 Vector<TokenId> Whisper::transcribe(Span<const float> samples)
 {
+    beginRun(samples);
+    encodeSeconds = encodeAudio();
+
+    return decodeTranscript();
+}
+
+// The mel is committed and read into the prediction's input before the
+// encoder's Async exists, so the samples, the mel and the sample buffer are
+// free the moment this returns; only the rows and the decoder's state wait
+// for the resolve, and runInFlight keeps a second run off them until then.
+eacp::Threads::Async<Vector<TokenId>>
+    Whisper::transcribeAsync(Span<const float> samples)
+{
+    const auto promise = eacp::Threads::AsyncPromise<Vector<TokenId>> {};
+
+    if (chosenEncoderBackend != EncoderBackend::coreML)
+    {
+        promise.resolve(transcribe(samples));
+        return promise.get();
+    }
+
+#if EACP_HAS_COREML
+    beginRun(samples);
+
+    const auto start = Clock::now();
+    commitMel();
+
+    auto encoded =
+        coreMLEncoder->encodeAsync(*melBuffer, *encodedBuffer, encodedPositions());
+    runInFlight = true;
+
+    const auto decode = [this, promise, start](const eacp::ML::Result& result)
+    {
+        runInFlight = false;
+        encodeSeconds = secondsSince(start);
+        predictSeconds = coreMLEncoder->lastPredictSeconds();
+
+        if (!result.ok)
+        {
+            promise.reject("Core ML refused the encoder's prediction: "
+                           + result.error);
+            return;
+        }
+
+        // Resolved outside the try, so that a caller's continuation that
+        // throws is not taken for a failed decode and swallowed.
+        auto tokens = Vector<TokenId> {};
+
+        try
+        {
+            tokens = decodeTranscript();
+        }
+        catch (const std::exception& failure)
+        {
+            promise.reject(failure.what());
+            return;
+        }
+
+        promise.resolve(tokens);
+    };
+
+    const auto fail = [this, promise](const std::string& error)
+    {
+        runInFlight = false;
+        promise.reject(error);
+    };
+
+    encoded.then(decode, fail);
+
+    return promise.get();
+#else
+    throw std::logic_error {"this build has no Core ML encoder to run"};
+#endif
+}
+
+void Whisper::beginRun(Span<const float> samples)
+{
     requirePrepared();
+    requireNoRunInFlight();
 
     if (samples.size() > windowSamples)
         throw ModelError {"this run holds " + std::to_string(samples.size())
@@ -437,9 +715,21 @@ Vector<TokenId> Whisper::transcribe(Span<const float> samples)
     uploadPrompt();
 
     decodeSeconds = 0.0;
+    predictSeconds = 0.0;
+    melSeconds = 0.0;
     stepCount = 0;
-    encodeSeconds = encodeAudio();
+}
 
+// The search is HF's greedy generate, one command buffer to a step and
+// stepsInFlight of them in the air: step k + 1 is recorded and submitted before
+// the host asks the GPU for step k, so the two overlap instead of taking turns.
+// Each step's token is read out of that step's own command buffer, which waits
+// for it alone — Buffer::read waits for the newest submission, and would
+// therefore wait for the step still running — and the run ends on
+// `<|endoftext|>`, the token limit or the window's end, with only the steps
+// already in the air computed past it.
+Vector<TokenId> Whisper::decodeTranscript()
+{
     const auto endOfText = endOfTextToken();
     const auto promptLength = promptTokens.size();
 

@@ -17,15 +17,16 @@ std::string encoderName(std::string_view suffix)
 
 // The word every refusal below uses for this loader, which is all the checks
 // in Model/TensorLoader.h have to be told to serve it as well as the decoder.
-TensorLoader encoderTensors(const SafeTensors& file)
+TensorLoader encoderTensors(const SafeTensors& file, WeightPlacement placement)
 {
-    return TensorLoader {file, "encoder"};
+    return TensorLoader {file, "encoder", placement};
 }
 
 TensorBuffer loadPositionalEmbedding(const SafeTensors& file,
-                                     const EncoderShape& shape)
+                                     const EncoderShape& shape,
+                                     WeightPlacement placement)
 {
-    const auto tensors = encoderTensors(file);
+    const auto tensors = encoderTensors(file, placement);
     const auto name = encoderName("embed_positions.weight");
     const auto& tensor = tensors.require(name);
 
@@ -39,10 +40,10 @@ TensorBuffer loadPositionalEmbedding(const SafeTensors& file,
             "tensor '" + name + "' carries " + std::to_string(tensor.dimension(0))
             + " positions, and this run needs " + std::to_string(shape.positions())};
 
-    auto loaded = file.makeBuffer(name);
-    tensors.rejectPackedHalf(loaded, name, "Add");
+    if (placement == WeightPlacement::Host)
+        return file.makeHostTensor(name);
 
-    return loaded;
+    return file.makeFloatBuffer(name);
 }
 
 std::string encoderLayerPrefix(int index)
@@ -53,88 +54,113 @@ std::string encoderLayerPrefix(int index)
 
 EncoderLayerWeights::EncoderLayerWeights(const SafeTensors& file,
                                          const EncoderShape& shape,
-                                         int index)
-    : attentionNormWeight(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "self_attn_layer_norm.weight",
-          {shape.width},
-          "LayerNorm"))
-    , attentionNormBias(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "self_attn_layer_norm.bias",
-          {shape.width},
-          "LayerNorm"))
-    , queryWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "self_attn.q_proj.weight",
-          {shape.width, shape.width}))
-    , queryBias(encoderTensors(file).loadFloatTensor(encoderLayerPrefix(index)
-                                                         + "self_attn.q_proj.bias",
-                                                     {shape.width},
-                                                     "Linear"))
-    , keyWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "self_attn.k_proj.weight",
-          {shape.width, shape.width}))
-    , valueWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "self_attn.v_proj.weight",
-          {shape.width, shape.width}))
-    , valueBias(encoderTensors(file).loadFloatTensor(encoderLayerPrefix(index)
-                                                         + "self_attn.v_proj.bias",
-                                                     {shape.width},
-                                                     "Linear"))
-    , attentionOutputWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "self_attn.out_proj.weight",
-          {shape.width, shape.width}))
-    , attentionOutputBias(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "self_attn.out_proj.bias",
-          {shape.width},
-          "Linear"))
-    , finalNormWeight(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "final_layer_norm.weight",
-          {shape.width},
-          "LayerNorm"))
-    , finalNormBias(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "final_layer_norm.bias",
-          {shape.width},
-          "LayerNorm"))
-    , feedForwardWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "fc1.weight",
-          {shape.feedForwardWidth, shape.width}))
-    , feedForwardBias(encoderTensors(file).loadFloatTensor(encoderLayerPrefix(index)
-                                                               + "fc1.bias",
-                                                           {shape.feedForwardWidth},
-                                                           "Linear"))
-    , feedForwardOutputWeight(encoderTensors(file).loadProjectionWeight(
-          encoderLayerPrefix(index) + "fc2.weight",
-          {shape.width, shape.feedForwardWidth}))
-    , feedForwardOutputBias(encoderTensors(file).loadFloatTensor(
-          encoderLayerPrefix(index) + "fc2.bias", {shape.width}, "Linear"))
+                                         int index,
+                                         WeightPacking packing,
+                                         WeightPlacement placement)
+    : attentionNormWeight(encoderTensors(file, placement)
+                              .loadFloatTensor(encoderLayerPrefix(index)
+                                                   + "self_attn_layer_norm.weight",
+                                               {shape.width}))
+    , attentionNormBias(encoderTensors(file, placement)
+                            .loadFloatTensor(encoderLayerPrefix(index)
+                                                 + "self_attn_layer_norm.bias",
+                                             {shape.width}))
+    , queryWeight(encoderTensors(file, placement)
+                      .loadProjectionWeight(encoderLayerPrefix(index)
+                                                + "self_attn.q_proj.weight",
+                                            {shape.width, shape.width},
+                                            packing))
+    , queryBias(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "self_attn.q_proj.bias",
+                               {shape.width}))
+    , keyWeight(encoderTensors(file, placement)
+                    .loadProjectionWeight(encoderLayerPrefix(index)
+                                              + "self_attn.k_proj.weight",
+                                          {shape.width, shape.width},
+                                          packing))
+    , valueWeight(encoderTensors(file, placement)
+                      .loadProjectionWeight(encoderLayerPrefix(index)
+                                                + "self_attn.v_proj.weight",
+                                            {shape.width, shape.width},
+                                            packing))
+    , valueBias(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "self_attn.v_proj.bias",
+                               {shape.width}))
+    , attentionOutputWeight(
+          encoderTensors(file, placement)
+              .loadProjectionWeight(encoderLayerPrefix(index)
+                                        + "self_attn.out_proj.weight",
+                                    {shape.width, shape.width},
+                                    packing))
+    , attentionOutputBias(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "self_attn.out_proj.bias",
+                               {shape.width}))
+    , finalNormWeight(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "final_layer_norm.weight",
+                               {shape.width}))
+    , finalNormBias(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "final_layer_norm.bias",
+                               {shape.width}))
+    , feedForwardWeight(
+          encoderTensors(file, placement)
+              .loadProjectionWeight(encoderLayerPrefix(index) + "fc1.weight",
+                                    {shape.feedForwardWidth, shape.width},
+                                    packing))
+    , feedForwardBias(encoderTensors(file, placement)
+                          .loadFloatTensor(encoderLayerPrefix(index) + "fc1.bias",
+                                           {shape.feedForwardWidth}))
+    , feedForwardOutputWeight(
+          encoderTensors(file, placement)
+              .loadProjectionWeight(encoderLayerPrefix(index) + "fc2.weight",
+                                    {shape.width, shape.feedForwardWidth},
+                                    packing))
+    , feedForwardOutputBias(
+          encoderTensors(file, placement)
+              .loadFloatTensor(encoderLayerPrefix(index) + "fc2.bias",
+                               {shape.width}))
 {
 }
 
 EncoderWeights::EncoderWeights(const SafeTensors& file,
-                               const EncoderShape& shapeToUse)
+                               const EncoderShape& shapeToUse,
+                               WeightPacking packingToUse,
+                               WeightPlacement placementToUse)
     : shape(shapeToUse)
+    , placement(placementToUse)
     , firstConvolutionWeight(
-          encoderTensors(file).loadFloatTensor(encoderName("conv1.weight"),
-                                               {shapeToUse.width,
-                                                shapeToUse.melBins,
-                                                EncoderShape::convolutionKernelSize},
-                                               "Conv1d"))
-    , firstConvolutionBias(encoderTensors(file).loadFloatTensor(
-          encoderName("conv1.bias"), {shapeToUse.width}, "Conv1d"))
-    , secondConvolutionWeight(encoderTensors(file).loadFloatTensor(
-          encoderName("conv2.weight"),
-          {shapeToUse.width, shapeToUse.width, EncoderShape::convolutionKernelSize},
-          "Conv1d"))
-    , secondConvolutionBias(encoderTensors(file).loadFloatTensor(
-          encoderName("conv2.bias"), {shapeToUse.width}, "Conv1d"))
-    , positionalEmbedding(loadPositionalEmbedding(file, shapeToUse))
-    , finalNormWeight(encoderTensors(file).loadFloatTensor(
-          encoderName("layer_norm.weight"), {shapeToUse.width}, "LayerNorm"))
-    , finalNormBias(encoderTensors(file).loadFloatTensor(
-          encoderName("layer_norm.bias"), {shapeToUse.width}, "LayerNorm"))
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("conv1.weight"),
+                               {shapeToUse.width,
+                                shapeToUse.melBins,
+                                EncoderShape::convolutionKernelSize}))
+    , firstConvolutionBias(
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("conv1.bias"), {shapeToUse.width}))
+    , secondConvolutionWeight(
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("conv2.weight"),
+                               {shapeToUse.width,
+                                shapeToUse.width,
+                                EncoderShape::convolutionKernelSize}))
+    , secondConvolutionBias(
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("conv2.bias"), {shapeToUse.width}))
+    , positionalEmbedding(loadPositionalEmbedding(file, shapeToUse, placementToUse))
+    , finalNormWeight(
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("layer_norm.weight"), {shapeToUse.width}))
+    , finalNormBias(
+          encoderTensors(file, placementToUse)
+              .loadFloatTensor(encoderName("layer_norm.bias"), {shapeToUse.width}))
 {
     layers.reserve(shapeToUse.layers);
 
     for (auto index = 0; index < shapeToUse.layers; ++index)
-        layers.emplace_back(file, shapeToUse, index);
+        layers.emplace_back(file, shapeToUse, index, packingToUse, placementToUse);
 }
 } // namespace WSP
