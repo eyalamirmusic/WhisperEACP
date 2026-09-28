@@ -341,3 +341,215 @@ auto tTranscribeAsyncOnCoreML = test("Whisper/transcribeAsyncOnCoreML") = []
          ++index)
         check(reduced[index] == reducedAsync[index]);
 };
+
+namespace
+{
+bool canSwitch()
+{
+    return eacp::GPU::Device::shared().isValid() && hasWhisperModel()
+           && hasSampleFile(jfkSample);
+}
+
+bool canSwitchToCoreML()
+{
+    return canSwitch() && Whisper::supportsEncoderBackend(EncoderBackend::coreML);
+}
+
+// A runtime of its own rather than one of the shared two, since every test
+// below leaves it on whichever backend it got to.
+std::unique_ptr<Whisper> kernelModelToSwitch()
+{
+    auto whisper = std::make_unique<Whisper>();
+    whisper->load(modelDirectory());
+    whisper->setEncoderCacheDirectory(sharedCoreMLCacheDirectory());
+    whisper->prepare();
+
+    return whisper;
+}
+
+bool sameTokens(const Vector<TokenId>& first, const Vector<TokenId>& second)
+{
+    if (first.size() != second.size())
+        return false;
+
+    for (auto index = 0; index < first.size(); ++index)
+        if (first[index] != second[index])
+            return false;
+
+    return true;
+}
+} // namespace
+
+// Unprepared, a switch is the setter; prepared, a switch to the backend in use
+// is nothing, and one this Whisper cannot make is refused before anything
+// changes, leaving it transcribing where it was.
+auto tSwitchRefusesWhatItCannotRun =
+    test("Whisper/switchRefusesWhatItCannotRun") = []
+{
+    auto unprepared = Whisper {};
+    unprepared.switchEncoderBackend(EncoderBackend::coreML);
+    check(unprepared.encoderBackend() == EncoderBackend::coreML);
+    check(!unprepared.isPrepared());
+
+    auto resolved = unprepared.switchEncoderBackendAsync(EncoderBackend::kernels);
+    check(resolved.isResolved());
+    check(unprepared.encoderBackend() == EncoderBackend::kernels);
+
+    if (!canSwitch())
+        return;
+
+    auto whisper = kernelModelToSwitch();
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    whisper->switchEncoderBackend(EncoderBackend::kernels);
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+
+    whisper->setAudioContext(600);
+
+    const auto refusal = modelErrorFrom(
+        [&] { whisper->switchEncoderBackend(EncoderBackend::coreML); });
+    check(mentions(refusal, "Core ML"));
+    check(throwsModelError(
+        [&] { whisper->switchEncoderBackendAsync(EncoderBackend::coreML); }));
+
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+    check(!whisper->isSwitchingEncoder());
+    check(whisper->isPrepared());
+
+    whisper->setAudioContext(0);
+
+    if (!Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+        check(throwsModelError(
+            [&] { whisper->switchEncoderBackend(EncoderBackend::coreML); }));
+
+    check(trimmed(whisper->transcribeText(samples)) == jfkTranscript);
+};
+
+// Kernels, Core ML, kernels, on one prepared runtime: the kernels' tokens are
+// the same run before and after, and Core ML's transcript is the pinned one,
+// which is how every other test here holds the two backends to each other.
+auto tSwitchRoundTrip = test("Whisper/switchKernelsCoreMLKernels") = []
+{
+    if (!canSwitchToCoreML())
+        return;
+
+    auto whisper = kernelModelToSwitch();
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    const auto kernelTokens = whisper->transcribe(samples);
+    check(trimmed(whisper->textForTokens(kernelTokens)) == jfkTranscript);
+
+    whisper->switchEncoderBackend(EncoderBackend::coreML);
+
+    check(whisper->encoderBackend() == EncoderBackend::coreML);
+    check(whisper->isPrepared());
+    check(whisper->encoderLoadSeconds() > 0.0);
+
+    const auto coreMLTokens = whisper->transcribe(samples);
+    check(trimmed(whisper->textForTokens(coreMLTokens)) == jfkTranscript);
+    check(whisper->lastEncoderPredictSeconds() > 0.0);
+
+    whisper->setAudioContext(576);
+    check(!whisper->transcribe(samples).empty());
+    whisper->setAudioContext(0);
+
+    whisper->switchEncoderBackend(EncoderBackend::kernels);
+
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+    check(!whisper->encoderWasCacheHit());
+    check(whisper->encoderLoadSeconds() == 0.0);
+
+#if EACP_HAS_COREML
+    check(throwsLogicError([&] { whisper->encoderComputePlan(); }));
+#endif
+
+    const auto kernelTokensAgain = whisper->transcribe(samples);
+    check(sameTokens(kernelTokensAgain, kernelTokens));
+    check(whisper->lastEncoderPredictSeconds() == 0.0);
+
+    whisper->setAudioContext(600);
+    check(whisper->audioContext() == 600);
+    check(!whisper->transcribe(samples).empty());
+};
+
+// The switch to Core ML with the load on the model's queue. Until it settles
+// the runtime is still on the kernels and refuses to run, prepare, change its
+// context or switch again; once it resolves it runs on Core ML, and the switch
+// back is the blocking one, resolved before it returns.
+auto tSwitchAsync = test("Whisper/switchEncoderBackendAsync") = []
+{
+    if (!canSwitchToCoreML())
+        return;
+
+    auto whisper = kernelModelToSwitch();
+    const auto samples = readWavFile(sampleFile(jfkSample));
+    const auto kernelTokens = whisper->transcribe(samples);
+
+    auto resolvedOnMain = false;
+    auto switching = whisper->switchEncoderBackendAsync(EncoderBackend::coreML);
+    switching.then([&resolvedOnMain]
+                   { resolvedOnMain = eacp::Threads::isMainThread(); });
+
+    check(!switching.isReady());
+    check(whisper->isSwitchingEncoder());
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+    check(whisper->isPrepared());
+
+    check(throwsLogicError([&] { whisper->transcribe(samples); }));
+    check(throwsLogicError([&] { whisper->transcribeAsync(samples); }));
+    check(throwsLogicError([&] { whisper->setAudioContext(576); }));
+    check(throwsLogicError([&] { whisper->prepare(); }));
+    check(throwsLogicError(
+        [&] { whisper->switchEncoderBackend(EncoderBackend::kernels); }));
+    check(throwsLogicError(
+        [&] { whisper->switchEncoderBackendAsync(EncoderBackend::coreML); }));
+
+    switching.waitFor(eacp::Time::MS {120000});
+
+    check(switching.isResolved());
+    check(resolvedOnMain);
+    check(!whisper->isSwitchingEncoder());
+    check(whisper->encoderBackend() == EncoderBackend::coreML);
+
+    const auto coreMLTokens =
+        whisper->transcribeAsync(samples).waitFor(eacp::Time::MS {30000});
+    check(trimmed(whisper->textForTokens(coreMLTokens)) == jfkTranscript);
+
+    auto back = whisper->switchEncoderBackendAsync(EncoderBackend::kernels);
+
+    check(back.isResolved());
+    check(!whisper->isSwitchingEncoder());
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+    check(sameTokens(whisper->transcribe(samples), kernelTokens));
+};
+
+// A Core ML run in the air holds the rows the decoder is about to read, so no
+// switch is made under it, blocking or not, and the runtime stays where it is.
+auto tSwitchRefusedWhileARunIsInFlight =
+    test("Whisper/switchIsRefusedWhileARunIsInFlight") = []
+{
+    if (!canSwitchToCoreML())
+        return;
+
+    auto whisper = kernelModelToSwitch();
+    const auto samples = readWavFile(sampleFile(jfkSample));
+
+    whisper->switchEncoderBackend(EncoderBackend::coreML);
+
+    auto run = whisper->transcribeAsync(samples);
+    check(whisper->isTranscribing());
+
+    check(throwsLogicError(
+        [&] { whisper->switchEncoderBackend(EncoderBackend::kernels); }));
+    check(throwsLogicError(
+        [&] { whisper->switchEncoderBackendAsync(EncoderBackend::kernels); }));
+    check(!whisper->isSwitchingEncoder());
+    check(whisper->encoderBackend() == EncoderBackend::coreML);
+
+    const auto tokens = run.waitFor(eacp::Time::MS {30000});
+    check(trimmed(whisper->textForTokens(tokens)) == jfkTranscript);
+
+    whisper->switchEncoderBackend(EncoderBackend::kernels);
+    check(whisper->encoderBackend() == EncoderBackend::kernels);
+    check(trimmed(whisper->transcribeText(samples)) == jfkTranscript);
+};

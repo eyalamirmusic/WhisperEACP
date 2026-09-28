@@ -43,9 +43,65 @@ CoreMLEncoder::CoreMLEncoder(const EncoderShape& shapeToUse,
 eacp::ML::Result CoreMLEncoder::prepare(const EncoderWeights& hostWeights,
                                         const CoreMLEncoderOptions& options)
 {
+    const auto program = record(hostWeights, options);
+
+    const auto start = Clock::now();
+    const auto result = model.load(program.package, program.modelOptions);
+    loadSeconds = secondsSince(start);
+
+    if (result.ok)
+        adopt(program.features);
+
+    return result;
+}
+
+eacp::Threads::Async<eacp::ML::Result>
+    CoreMLEncoder::prepareAsync(const EncoderWeights& hostWeights,
+                                const CoreMLEncoderOptions& options)
+{
+    const auto program = record(hostWeights, options);
+    const auto features = program.features;
+    const auto promise = eacp::Threads::AsyncPromise<eacp::ML::Result> {};
+    const auto start = Clock::now();
+
+    // this outlives both for encodeAsync's reason: the model is a member, and
+    // destroying it abandons the load's Async.
+    const auto loaded =
+        [this, promise, features, start](const eacp::ML::Result& result)
+    {
+        loading = false;
+        loadSeconds = secondsSince(start);
+
+        if (result.ok)
+            adopt(features);
+
+        promise.resolve(result);
+    };
+
+    const auto fail = [this, promise, start](const std::string& error)
+    {
+        loading = false;
+        loadSeconds = secondsSince(start);
+        promise.resolve(eacp::ML::Result::failure(error));
+    };
+
+    loading = true;
+    model.loadAsync(program.package, program.modelOptions).then(loaded, fail);
+
+    return promise.get();
+}
+
+CoreMLEncoder::RecordedProgram
+    CoreMLEncoder::record(const EncoderWeights& hostWeights,
+                          const CoreMLEncoderOptions& options)
+{
     if (isAnyInFlight())
         throw std::logic_error {"the Core ML encoder is prepared again only once "
                                 "every encodeAsync has resolved"};
+
+    if (loading)
+        throw std::logic_error {"the Core ML encoder is prepared again only once "
+                                "its prepareAsync has resolved"};
 
     unprepare();
 
@@ -73,19 +129,18 @@ eacp::ML::Result CoreMLEncoder::prepare(const EncoderWeights& hostWeights,
     modelOptions.units = options.units;
     modelOptions.cacheDirectory = options.cacheDirectory;
 
-    const auto start = Clock::now();
-    const auto result = model.load(net.build(), modelOptions);
-    loadSeconds = secondsSince(start);
+    return {net.build(),
+            modelOptions,
+            {net.inputNames()[0], net.outputNames()[0], options.fusedAttention}};
+}
 
-    if (!result.ok)
-        return result;
-
-    inputName = net.inputNames()[0];
-    outputName = net.outputNames()[0];
-    fusedAttention = options.fusedAttention;
+void CoreMLEncoder::adopt(const ProgramFeatures& features)
+{
+    inputName = features.inputName;
+    outputName = features.outputName;
+    fusedAttention = features.fusedAttention;
+    plan.reset();
     prepared = true;
-
-    return result;
 }
 
 void CoreMLEncoder::unprepare()

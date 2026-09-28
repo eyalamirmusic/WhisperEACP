@@ -60,6 +60,20 @@ public:
     eacp::ML::Result prepare(const EncoderWeights& hostWeights,
                              const CoreMLEncoderOptions& options);
 
+    // The same with the compile and the load on the model's queue, which is
+    // what keeps a window alive through the engine's first compile. The graph
+    // is recorded and built on the calling thread, the main one, so the
+    // weights only have to live for the call here too, and a graph that could
+    // not be recorded throws before anything is queued. Resolves on the main
+    // thread with the load's Result, the encoder prepared when it is ok.
+    // Until then isPreparing() is true and every other prepare, encode and
+    // encodeAsync is a logic_error; destroying the encoder abandons the Async.
+    eacp::Threads::Async<eacp::ML::Result>
+        prepareAsync(const EncoderWeights& hostWeights,
+                     const CoreMLEncoderOptions& options);
+
+    bool isPreparing() const { return loading; }
+
     bool isPrepared() const { return prepared && model.isLoaded(); }
 
     const EncoderShape& shape() const { return encoderShape; }
@@ -110,6 +124,24 @@ private:
         bool inFlight = false;
     };
 
+    struct ProgramFeatures
+    {
+        std::string inputName;
+        std::string outputName;
+        bool fusedAttention = false;
+    };
+
+    struct RecordedProgram
+    {
+        eacp::ML::Package package;
+        eacp::ML::Options modelOptions;
+        ProgramFeatures features;
+    };
+
+    RecordedProgram record(const EncoderWeights& hostWeights,
+                           const CoreMLEncoderOptions& options);
+    void adopt(const ProgramFeatures& features);
+
     Member& memberFor(int positionCount);
     void fillInput(Member& member, const eacp::GPU::Buffer& mel);
     void requireRowsFit(const eacp::GPU::Buffer& rows, int positionCount) const;
@@ -123,6 +155,7 @@ private:
 
     eacp::ML::Model model;
     bool prepared = false;
+    bool loading = false;
     std::string inputName;
     std::string outputName;
     bool fusedAttention = false;

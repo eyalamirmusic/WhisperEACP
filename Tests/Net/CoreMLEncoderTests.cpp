@@ -498,6 +498,62 @@ auto tAsyncMatchesBlocking = test("Net/CoreML/encodeAsyncMatchesEncode") = []
           <= repeatBoundFor(ComputeUnits::cpuAndNeuralEngine));
 };
 
+// The load on the model's queue, which is the ~14 s a first compile costs:
+// while it runs the encoder refuses everything but waiting, and what it
+// prepares runs as the blocking prepare's does.
+auto tPrepareAsyncMatchesPrepare = test("Net/CoreML/prepareAsyncMatchesPrepare") = []
+{
+    if (!canRun())
+        return;
+
+    auto& blockingEncoder = coreMLEncoder(ComputeUnits::cpuAndNeuralEngine);
+
+    if (!blockingEncoder.isPrepared())
+        return;
+
+    constexpr auto context = 576;
+    auto& model = tinyEn();
+
+    auto options = CoreMLEncoderOptions {};
+    options.cacheDirectory = sharedCoreMLCacheDirectory();
+
+    auto encoder = CoreMLEncoder {model.shape, audioContextSpan()};
+    auto rows = outputFor(model.shape.elementCount());
+    auto resolvedOnMain = false;
+
+    const auto noteThread = [&resolvedOnMain](const eacp::ML::Result&)
+    { resolvedOnMain = eacp::Threads::isMainThread(); };
+
+    auto pending = encoder.prepareAsync(model.hostWeights, options);
+    pending.then(noteThread);
+
+    check(encoder.isPreparing());
+    check(!encoder.isPrepared());
+    check(throwsLogicError([&] { encoder.encode(model.melBuffer, rows, context); }));
+    check(throwsLogicError(
+        [&] { encoder.encodeAsync(model.melBuffer, rows, context); }));
+    check(throwsLogicError([&] { encoder.prepare(model.hostWeights, options); }));
+    check(
+        throwsLogicError([&] { encoder.prepareAsync(model.hostWeights, options); }));
+
+    const auto result = pending.waitFor(eacp::Time::MS {120000});
+
+    check(result.ok);
+    check(resolvedOnMain);
+    check(!encoder.isPreparing());
+    check(encoder.isPrepared());
+    check(encoder.lastLoadSeconds() > 0.0);
+
+    if (!encoder.isPrepared())
+        return;
+
+    const auto blocking = encodeOnCoreML(blockingEncoder, context);
+    const auto asynchronous = encodeOnCoreML(encoder, context);
+
+    check(agreement(asynchronous.rows, blocking.rows).maxAbs
+          <= repeatBoundFor(ComputeUnits::cpuAndNeuralEngine));
+};
+
 // Each context has one pair of arrays, so a second encodeAsync at a context
 // whose first is still pending, or a blocking encode there, would overwrite
 // the input the queued prediction reads. Both are refused until it resolves.

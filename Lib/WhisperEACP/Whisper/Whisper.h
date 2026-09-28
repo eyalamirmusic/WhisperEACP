@@ -12,6 +12,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -133,8 +134,8 @@ public:
     // Recorded rather than hidden: it is a seam in the loader, not in this.
     //
     // A prepare that throws leaves this unprepared, whatever an earlier one
-    // had prepared; one while a transcribeAsync run is in flight is a
-    // std::logic_error.
+    // had prepared; one while a transcribeAsync run or an encoder switch is in
+    // flight is a std::logic_error.
     void prepare(eacp::GPU::Device& device);
     void prepare();
 
@@ -193,11 +194,41 @@ public:
     void setPacksWeights(bool shouldPack);
 
     // The kernels by default. Set before prepare(), which builds the encoder
-    // for it; a call after is a std::logic_error. prepare() refuses a backend
-    // this build or this machine cannot run with a ModelError, and under
-    // coreML an audio context outside enumeratedAudioContexts() as well.
+    // for it; a call after is a std::logic_error, and switchEncoderBackend is
+    // the way to move a prepared one. prepare() refuses a backend this build
+    // or this machine cannot run with a ModelError, and under coreML an audio
+    // context outside enumeratedAudioContexts() as well.
     EncoderBackend encoderBackend() const { return chosenEncoderBackend; }
     void setEncoderBackend(EncoderBackend backend);
+
+    // Moves a prepared Whisper's encoder to the other backend and re-prepares
+    // the encoder alone: the front-end, the decoder and every buffer they
+    // share stay as they are, since both encoders write the same rows into
+    // the same buffer. The kernels' pipelines and device weights are released
+    // on the way to Core ML and rebuilt on the way back. Unprepared, this is
+    // setEncoderBackend; the backend already in use is a no-op.
+    //
+    // The new encoder is built beside the old one and replaces it only once
+    // it is ready, so a switch that fails — a backend this machine cannot
+    // run, a context Core ML is not compiled for, a model Core ML will not
+    // load — throws a ModelError and leaves this on the backend it was on.
+    // While a run or another switch is in flight it is a std::logic_error.
+    //
+    // Blocking: to Core ML that is the engine's compile, about 14 s the first
+    // time on a machine and milliseconds from the cache after it.
+    void switchEncoderBackend(EncoderBackend backend);
+
+    // The same with Core ML's compile and load on its model's queue, resolved
+    // on the main thread once the switch is made, or rejected with why it was
+    // not, this still on the backend it was on. Until it settles
+    // isSwitchingEncoder() is true, encoderBackend() is the old backend, and
+    // every run, prepare, setAudioContext and switch is a std::logic_error.
+    // What switchEncoderBackend refuses up front is thrown here the same way,
+    // and a switch to the kernels, or to nothing new, is that one, resolved
+    // before this returns. Destroying the Whisper abandons the Async.
+    eacp::Threads::Async<void> switchEncoderBackendAsync(EncoderBackend backend);
+
+    bool isSwitchingEncoder() const { return switchInFlight; }
 
     // coreML wherever this build has eacp's Core ML runner and the OS loads a
     // specification 8 program, the floor for the encoder with its attention
@@ -415,7 +446,8 @@ private:
     void requirePrepared() const;
     void requireWhisperShapes() const;
     void requireRunnableEncoder() const;
-    void requireAudioContextForBackend(int positions) const;
+    void requireRunnableEncoder(EncoderBackend backend) const;
+    void requireAudioContextForBackend(EncoderBackend backend, int positions) const;
 
     void buildPrompt();
     void buildSuppressionMasks();
@@ -425,6 +457,8 @@ private:
     void buildGenerationConfig();
 
     void requireNoRunInFlight() const;
+    void requireNoSwitchInFlight() const;
+    void requireIdle() const;
 
     void uploadSamples(Span<const float> samples);
     void uploadPrompt();
@@ -443,6 +477,16 @@ private:
     int encodedPositions() const;
     void prepareCoreMLEncoder();
     void unprepare();
+
+    WeightPacking weightPacking() const;
+    void switchEncoderToKernels();
+    void switchEncoderToCoreML();
+
+#if EACP_HAS_COREML
+    CoreMLEncoderOptions coreMLEncoderOptions() const;
+    std::unique_ptr<CoreMLEncoder> makeCoreMLEncoder() const;
+    void adoptCoreMLEncoder(std::unique_ptr<CoreMLEncoder> prepared);
+#endif
 
     // Step zero opens the sequence and decodes the prompt; step j embeds the
     // token step j - 1 sampled. Every step samples into slot
@@ -517,8 +561,11 @@ private:
 
 #if EACP_HAS_COREML
     // After everything a pending encodeAsync writes into or its decode reads,
-    // so that destroying it, which abandons the run, comes first.
-    std::optional<CoreMLEncoder> coreMLEncoder;
+    // so that destroying it, which abandons the run, comes first. Owned
+    // through a pointer so a switch can hand over the one it prepared beside
+    // it, which is also what the pending one is while it loads.
+    std::unique_ptr<CoreMLEncoder> coreMLEncoder;
+    std::unique_ptr<CoreMLEncoder> pendingCoreMLEncoder;
 #endif
 
     double encodeSeconds = 0.0;
@@ -527,5 +574,6 @@ private:
     double melSeconds = 0.0;
     int stepCount = 0;
     bool runInFlight = false;
+    bool switchInFlight = false;
 };
 } // namespace WSP

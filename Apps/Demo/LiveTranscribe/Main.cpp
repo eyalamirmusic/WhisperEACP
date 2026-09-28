@@ -32,9 +32,11 @@ constexpr auto usage =
     "  --autostart      open the default input as soon as the model is ready,\n"
     "                   and log a status line a second to stdout, so a run can\n"
     "                   be checked without a hand on the mouse.\n"
-    "  --coreml         run the encoder on Core ML's Neural Engine rather than\n"
-    "                   the GPU kernels, where the machine can. The first run on\n"
-    "                   a machine compiles it for the engine, about 14 s.\n";
+    "  --coreml         start with the encoder on Core ML's Neural Engine rather\n"
+    "                   than the GPU kernels, where the machine can; the encoder\n"
+    "                   box switches between the two at any time. The first\n"
+    "                   switch on a machine compiles it for the engine, about\n"
+    "                   14 s, with the window live throughout.\n";
 
 constexpr auto ticksPerSecond = 30;
 constexpr auto ticksBetweenDeviceScans = ticksPerSecond * 5;
@@ -78,7 +80,7 @@ eacp::Graphics::WindowOptions makeWindowOptions()
 
     options.width = 900;
     options.height = 640;
-    options.minWidth = 600;
+    options.minWidth = 720;
     options.minHeight = 420;
     options.title = "Live Transcribe";
 
@@ -157,10 +159,13 @@ struct App
         const auto level = session.capture().level();
         const auto live = session.liveStats();
 
-        std::printf("%5.1fs  %-9s  %d Hz  block %d  blocks %lld  peak %.4f  "
-                    "rms %.4f  runs %d  pending %.1fs  %s\n",
+        std::printf("%5.1fs  %-9s  %-11s  %d Hz  block %d  blocks %lld  "
+                    "peak %.4f  rms %.4f  runs %d  pending %.1fs  %s\n",
                     (double) ticks / ticksPerSecond,
                     session.isCapturing() ? "capturing" : "idle",
+                    session.isSwitchingBackend()
+                        ? "switching"
+                        : backendName(session.encoderBackend()).c_str(),
                     stream.sampleRate,
                     stream.blockSize,
                     stream.blocks,

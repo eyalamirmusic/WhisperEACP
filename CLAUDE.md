@@ -401,19 +401,36 @@ in the app's constructor, so the window is up before anything slow begins: on a
 first run it says `downloading model   model.safetensors (4 of 4)   41.2 of
 151.1 MB   27%`, polled off the same timer as the meter, and then "loading
 model..." for the half second of mapping and kernel compilation. `ModelState` is
-`Downloading`, `Loading`, `Ready` or `Failed`, and `Session::onModelSettled` is
-what the `--autostart` switch hangs off, since "after the model loaded" is no
-longer a place in a function.
+`Downloading`, `Loading`, `Ready`, `SwitchingBackend` or `Failed`, and
+`Session::onModelSettled` is what the `--autostart` switch hangs off, since
+"after the model loaded" is no longer a place in a function.
 
-`--coreml` puts the encoder on Core ML's Neural Engine. `LiveTranscriber` runs
-through `Whisper::transcribeAsync` either way: on the kernels that resolves
-before it returns, so a run still starts and ends inside one tick; on Core ML
-it comes back on a later tick, the prediction on the model's queue and the
-decode on the main thread, and until then `update()` starts nothing and the
-audio waits in the queue. A `Whisper` with a run in flight refuses
-`transcribe`, `transcribeAsync`, `setAudioContext` and `prepare` with a
-`std::logic_error`. The first `--coreml` start on a machine is the engine
-compile, about 14 s.
+The encoder box beside the device and channel boxes moves the encoder between
+the kernels, "GPU (Metal)", and Core ML's Neural Engine at runtime. It is
+there only where `Whisper::supportsEncoderBackend(EncoderBackend::coreML)`
+holds, and it follows the session rather than the click. The model is always
+prepared on the kernels. `--coreml` only makes Core ML the first switch.
+`Session::requestEncoderBackend` remembers the choice. The first tick with no
+run in flight begins the switch, and the tick after issues
+`Whisper::switchEncoderBackendAsync`, so the status line already says
+"compiling encoder for Core ML..." or "switching to GPU..." before anything
+blocks. That call re-prepares the encoder alone. To Core ML, the recording is
+on the main thread and the compile and load are on the model's queue
+(`CoreMLEncoder::prepareAsync` over `ML::Model::loadAsync`). The first compile
+on a machine takes about 14 s, and the window stays live throughout. To the
+kernels, it is blocking and fast. Until the switch settles, no run starts,
+Stop defers its flush, and the audio waits in the queue. A switch that fails
+leaves the model `Ready` on the backend it was on, with the reason on the
+error line. The new encoder is built beside the old one, so a failed switch
+changes nothing.
+
+`LiveTranscriber` runs through `Whisper::transcribeAsync` on either backend.
+On the kernels that call resolves before it returns, so a run still starts and
+ends inside one tick. On Core ML it comes back on a later tick, with the
+prediction on the model's queue and the decode on the main thread, and until
+then `update()` starts nothing. A `Whisper` with a run or a switch in flight
+refuses `transcribe`, `transcribeAsync`, `setAudioContext`, `prepare` and
+another switch with a `std::logic_error`.
 
 Two build-side requirements. The bundle needs an `Info.plist.in` of its own
 carrying `NSMicrophoneUsageDescription` — set **after**

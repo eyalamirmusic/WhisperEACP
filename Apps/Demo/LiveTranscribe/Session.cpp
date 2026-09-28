@@ -17,11 +17,18 @@ double secondsSince(std::chrono::steady_clock::time_point start)
 }
 } // namespace
 
+std::string backendName(WSP::EncoderBackend backend)
+{
+    return backend == WSP::EncoderBackend::coreML ? "Core ML" : "GPU (Metal)";
+}
+
 Session::Session(std::string modelDirectoryToUse, bool encoderOnCoreML)
     : modelDirectory(std::move(modelDirectoryToUse))
-    , usesCoreML(encoderOnCoreML)
 {
     message = "loading model...";
+
+    if (encoderOnCoreML)
+        requestedBackend = WSP::EncoderBackend::coreML;
 }
 
 // A directory on the command line is already on disk; anything else is the
@@ -77,10 +84,6 @@ void Session::loadModel()
     {
         whisper.load(modelDirectory.empty() ? WSP::ModelFetch::directory().string()
                                             : modelDirectory);
-
-        if (usesCoreML)
-            whisper.setEncoderBackend(WSP::EncoderBackend::coreML);
-
         whisper.prepare();
     }
     catch (const std::exception& failure)
@@ -139,6 +142,17 @@ void Session::stopCapture()
     if (!live.has_value())
         return;
 
+    if (hasSwitchWaiting())
+    {
+        flushWhenSwitched = true;
+        return;
+    }
+
+    flushTranscriber();
+}
+
+void Session::flushTranscriber()
+{
     try
     {
         live->flush();
@@ -168,7 +182,121 @@ bool Session::tick()
     if (!captured.empty())
         live->push(captured);
 
-    return runTranscriber();
+    const auto settled = std::exchange(switchSettled, false);
+
+    if (hasSwitchWaiting())
+        return advanceSwitch() || settled;
+
+    return runTranscriber() || settled;
+}
+
+bool Session::hasModel() const
+{
+    return modelState == ModelState::Ready
+           || modelState == ModelState::SwitchingBackend;
+}
+
+WSP::EncoderBackend Session::wantedEncoderBackend() const
+{
+    if (modelState == ModelState::SwitchingBackend)
+        return switchTarget;
+
+    return requestedBackend.value_or(whisper.encoderBackend());
+}
+
+bool Session::canUseCoreML()
+{
+    return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML);
+}
+
+void Session::requestEncoderBackend(WSP::EncoderBackend backend)
+{
+    if (modelState == ModelState::SwitchingBackend)
+        return;
+
+    requestedBackend = backend;
+}
+
+bool Session::isSwitchingBackend() const
+{
+    return modelState == ModelState::SwitchingBackend;
+}
+
+bool Session::hasSwitchWaiting() const
+{
+    return requestedBackend.has_value()
+           || modelState == ModelState::SwitchingBackend;
+}
+
+// A run in flight is left to land, and update() is still called for it since
+// that starts nothing while one is in the air; the switch begins on the first
+// tick with nothing running, so the transcript it was working on is kept.
+bool Session::advanceSwitch()
+{
+    if (modelState == ModelState::SwitchingBackend)
+    {
+        if (!switchIssued)
+            issueSwitch();
+
+        return false;
+    }
+
+    if (modelState != ModelState::Ready)
+        return false;
+
+    if (live->isRunning())
+        return runTranscriber();
+
+    if (!whisper.isTranscribing())
+        beginSwitch();
+
+    return false;
+}
+
+void Session::beginSwitch()
+{
+    switchTarget = *std::exchange(requestedBackend, std::nullopt);
+
+    if (switchTarget == whisper.encoderBackend())
+        return;
+
+    modelState = ModelState::SwitchingBackend;
+    switchIssued = false;
+    message = switchTarget == WSP::EncoderBackend::coreML
+                  ? "compiling encoder for Core ML..."
+                  : "switching to GPU...";
+}
+
+void Session::issueSwitch()
+{
+    switchIssued = true;
+
+    try
+    {
+        whisper.switchEncoderBackendAsync(switchTarget)
+            .then([this] { finishSwitch({}); },
+                  [this](const std::string& error) { finishSwitch(error); });
+    }
+    catch (const std::exception& failure)
+    {
+        finishSwitch(failure.what());
+    }
+}
+
+void Session::finishSwitch(const std::string& error)
+{
+    modelState = ModelState::Ready;
+    switchSettled = true;
+    message = "encoder on " + backendName(whisper.encoderBackend());
+
+    if (error.empty())
+        errorText.clear();
+    else
+        errorText = "the encoder stayed on " + backendName(whisper.encoderBackend())
+                    + ": " + error;
+
+    if (std::exchange(flushWhenSwitched, false))
+        flushTranscriber();
 }
 
 // A model failure must not escape the timer: the window carries on with the

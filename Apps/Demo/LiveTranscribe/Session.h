@@ -8,14 +8,18 @@
 
 namespace LiveTranscribe
 {
+std::string backendName(WSP::EncoderBackend backend);
+
 // Whether there is a model to run: the four files are arriving from
-// HuggingFace, one is being mapped and its kernels compiled, one is running, or
-// it failed and the message says why.
+// HuggingFace, one is being mapped and its kernels compiled, one is running,
+// its encoder is moving to the other backend, or it failed and the message
+// says why.
 enum class ModelState
 {
     Downloading,
     Loading,
     Ready,
+    SwitchingBackend,
     Failed
 };
 
@@ -31,9 +35,9 @@ enum class ModelState
 class Session
 {
 public:
-    // encoderOnCoreML runs the encoder on Core ML (the Neural Engine) instead
-    // of the kernels, where the build and the machine can; the run then comes
-    // back on a later tick and the window is never held for the encode.
+    // encoderOnCoreML asks for the encoder on Core ML (the Neural Engine) from
+    // the start: the model is prepared on the kernels and switched as soon as
+    // it is Ready, exactly as requestEncoderBackend would.
     Session(std::string modelDirectoryToUse, bool encoderOnCoreML);
 
     // Called once the state has settled on Ready or Failed, which is what the
@@ -56,6 +60,27 @@ public:
     const std::string& stateMessage() const { return message; }
     bool isReady() const { return modelState == ModelState::Ready; }
     double loadSeconds() const { return modelLoadSeconds; }
+
+    // Whether the model is up, whatever its encoder is doing: what Start
+    // needs, since capture queues the audio through a switch.
+    bool hasModel() const;
+
+    // The encoder the model runs on now, and the one it will run on once a
+    // requested switch has been made; the two differ only while one is
+    // pending or in progress, and after a switch that failed they agree again
+    // on the backend the model stayed on.
+    WSP::EncoderBackend encoderBackend() const { return whisper.encoderBackend(); }
+    WSP::EncoderBackend wantedEncoderBackend() const;
+
+    static bool canUseCoreML();
+
+    // Remembered, and made on the first tick when no run is in flight; until
+    // it is made and settled no run starts and the audio waits in the queue.
+    // A request while a switch is in progress is ignored, and one before the
+    // model is Ready is made once it is. A switch that fails leaves the model
+    // Ready on the backend it was on, with lastError() saying why.
+    void requestEncoderBackend(WSP::EncoderBackend backend);
+    bool isSwitchingBackend() const;
 
     WSP::Capture& capture() { return microphone; }
     const WSP::Capture& capture() const { return microphone; }
@@ -87,9 +112,15 @@ private:
     void loadModel();
     void failWith(std::string reason);
     bool runTranscriber();
+    void flushTranscriber();
+
+    bool hasSwitchWaiting() const;
+    bool advanceSwitch();
+    void beginSwitch();
+    void issueSwitch();
+    void finishSwitch(const std::string& error);
 
     std::string modelDirectory;
-    bool usesCoreML = false;
     WSP::ModelFetch::Download download;
     ModelState modelState = ModelState::Loading;
     std::string message;
@@ -102,6 +133,15 @@ private:
     // Built once the model is prepared, since it holds a reference to a runtime
     // that can transcribe.
     std::optional<WSP::LiveTranscriber> live;
+
+    // A switch is requested, then begun on a tick with no run in flight, and
+    // issued on the tick after, so the window has drawn what it is waiting
+    // for before a switch that blocks — the one to the kernels — holds it.
+    std::optional<WSP::EncoderBackend> requestedBackend;
+    WSP::EncoderBackend switchTarget = WSP::EncoderBackend::kernels;
+    bool switchIssued = false;
+    bool flushWhenSwitched = false;
+    bool switchSettled = false;
 
     WSP::Vector<float> captured;
     bool deviceChanged = false;

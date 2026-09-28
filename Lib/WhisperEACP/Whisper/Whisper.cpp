@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -264,16 +265,22 @@ void Whisper::setEncoderCacheDirectory(const eacp::FilePath& directory)
 
 void Whisper::requireRunnableEncoder() const
 {
-    requireAudioContextForBackend(audioContextPositions);
+    requireRunnableEncoder(chosenEncoderBackend);
+}
 
-    if (!supportsEncoderBackend(chosenEncoderBackend))
+void Whisper::requireRunnableEncoder(EncoderBackend backend) const
+{
+    requireAudioContextForBackend(backend, audioContextPositions);
+
+    if (!supportsEncoderBackend(backend))
         throw ModelError {"this Whisper was asked to run its encoder on Core ML, "
                           "which this build or this machine cannot do"};
 }
 
-void Whisper::requireAudioContextForBackend(int positions) const
+void Whisper::requireAudioContextForBackend(EncoderBackend backend,
+                                            int positions) const
 {
-    if (chosenEncoderBackend != EncoderBackend::coreML || positions == 0
+    if (backend != EncoderBackend::coreML || positions == 0
         || isEnumeratedAudioContext(positions))
         return;
 
@@ -295,8 +302,8 @@ void Whisper::setAudioContext(int positions)
                             "and this one is "
                           + std::to_string(positions)};
 
-    requireAudioContextForBackend(positions);
-    requireNoRunInFlight();
+    requireAudioContextForBackend(chosenEncoderBackend, positions);
+    requireIdle();
 
     audioContextPositions = positions;
 }
@@ -306,6 +313,19 @@ void Whisper::requireNoRunInFlight() const
     if (runInFlight)
         throw std::logic_error {"this Whisper has a transcribeAsync run in flight, "
                                 "and runs one at a time"};
+}
+
+void Whisper::requireNoSwitchInFlight() const
+{
+    if (switchInFlight)
+        throw std::logic_error {"this Whisper is switching its encoder backend, "
+                                "and does nothing else until the switch settles"};
+}
+
+void Whisper::requireIdle() const
+{
+    requireNoRunInFlight();
+    requireNoSwitchInFlight();
 }
 
 int Whisper::audioContextForSamples(int sampleCount, double marginSeconds)
@@ -322,7 +342,7 @@ int Whisper::audioContextForSamples(int sampleCount, double marginSeconds)
 
 void Whisper::prepare(Device& device)
 {
-    requireNoRunInFlight();
+    requireIdle();
     unprepare();
 
     requireLoaded();
@@ -332,8 +352,7 @@ void Whisper::prepare(Device& device)
     gpu = &device;
 
     const auto usesCoreML = chosenEncoderBackend == EncoderBackend::coreML;
-    const auto packing =
-        packedWeights ? WeightPacking::ExactHalf : WeightPacking::Float;
+    const auto packing = weightPacking();
 
     encoder.emplace(
         EncoderShape::fromConfig(modelConfig, modelConfig.encoderInputFrames()));
@@ -508,31 +527,188 @@ int Whisper::encodedPositions() const
                                       : audioContextPositions;
 }
 
+namespace
+{
+std::string coreMLLoadFailure(const std::string& error)
+{
+    return "Core ML could not compile or load the encoder: " + error;
+}
+} // namespace
+
 void Whisper::prepareCoreMLEncoder()
 {
 #if EACP_HAS_COREML
-    const auto contexts = enumeratedAudioContexts();
-
-    auto options = CoreMLEncoderOptions {};
-    options.units = toCoreMLUnits(chosenComputeUnits);
-    options.cacheDirectory = coreMLCacheDirectory;
-
-    coreMLEncoder.emplace(encoder->shape(),
-                          Span<const int> {contexts.data(), contexts.size()});
-
-    const auto loaded = coreMLEncoder->prepare(*encoderWeights, options);
+    auto candidate = makeCoreMLEncoder();
+    const auto loaded = candidate->prepare(*encoderWeights, coreMLEncoderOptions());
 
     if (!loaded.ok)
-    {
-        coreMLEncoder.reset();
-        throw ModelError {"Core ML could not compile or load the encoder: "
-                          + loaded.error};
-    }
+        throw ModelError {coreMLLoadFailure(loaded.error)};
 
+    coreMLEncoder = std::move(candidate);
     coreMLCacheHit = coreMLEncoder->wasCacheHit();
     coreMLLoadSeconds = coreMLEncoder->lastLoadSeconds();
 #else
     throw std::logic_error {"this build has no Core ML encoder to prepare"};
+#endif
+}
+
+#if EACP_HAS_COREML
+CoreMLEncoderOptions Whisper::coreMLEncoderOptions() const
+{
+    auto options = CoreMLEncoderOptions {};
+    options.units = toCoreMLUnits(chosenComputeUnits);
+    options.cacheDirectory = coreMLCacheDirectory;
+
+    return options;
+}
+
+std::unique_ptr<CoreMLEncoder> Whisper::makeCoreMLEncoder() const
+{
+    const auto contexts = enumeratedAudioContexts();
+
+    return std::make_unique<CoreMLEncoder>(
+        encoder->shape(), Span<const int> {contexts.data(), contexts.size()});
+}
+
+// The kernels' pipelines, scratch and device weights go, since under Core ML
+// the kernel encoder is the shape and nothing more.
+void Whisper::adoptCoreMLEncoder(std::unique_ptr<CoreMLEncoder> prepared)
+{
+    const auto shape = encoder->shape();
+    encoder.emplace(shape);
+    encoderWeights.reset();
+
+    coreMLEncoder = std::move(prepared);
+    coreMLCacheHit = coreMLEncoder->wasCacheHit();
+    coreMLLoadSeconds = coreMLEncoder->lastLoadSeconds();
+    chosenEncoderBackend = EncoderBackend::coreML;
+}
+#endif
+
+WeightPacking Whisper::weightPacking() const
+{
+    return packedWeights ? WeightPacking::ExactHalf : WeightPacking::Float;
+}
+
+void Whisper::switchEncoderBackend(EncoderBackend backend)
+{
+    requireIdle();
+
+    if (!isPrepared())
+    {
+        chosenEncoderBackend = backend;
+        return;
+    }
+
+    if (backend == chosenEncoderBackend)
+        return;
+
+    requireRunnableEncoder(backend);
+
+    if (backend == EncoderBackend::kernels)
+        switchEncoderToKernels();
+    else
+        switchEncoderToCoreML();
+}
+
+// Core ML reads none of encoderWeights once it is loaded, so replacing them
+// first cannot leave the Core ML encoder unable to run if the compile after it
+// throws.
+void Whisper::switchEncoderToKernels()
+{
+    encoderWeights.emplace(*weightsFile, encoder->shape(), weightPacking());
+    encoder->prepare(*gpu);
+
+#if EACP_HAS_COREML
+    coreMLEncoder.reset();
+#endif
+
+    coreMLCacheHit = false;
+    coreMLLoadSeconds = 0.0;
+    chosenEncoderBackend = EncoderBackend::kernels;
+}
+
+void Whisper::switchEncoderToCoreML()
+{
+#if EACP_HAS_COREML
+    const auto hostWeights = EncoderWeights {
+        *weightsFile, encoder->shape(), weightPacking(), WeightPlacement::Host};
+
+    auto candidate = makeCoreMLEncoder();
+    const auto loaded = candidate->prepare(hostWeights, coreMLEncoderOptions());
+
+    if (!loaded.ok)
+        throw ModelError {coreMLLoadFailure(loaded.error)};
+
+    adoptCoreMLEncoder(std::move(candidate));
+#else
+    throw std::logic_error {"this build has no Core ML encoder to switch to"};
+#endif
+}
+
+eacp::Threads::Async<void> Whisper::switchEncoderBackendAsync(EncoderBackend backend)
+{
+    const auto promise = eacp::Threads::AsyncPromise<void> {};
+
+    if (!isPrepared() || backend != EncoderBackend::coreML
+        || backend == chosenEncoderBackend)
+    {
+        switchEncoderBackend(backend);
+        promise.resolve();
+        return promise.get();
+    }
+
+#if EACP_HAS_COREML
+    requireIdle();
+    requireRunnableEncoder(backend);
+
+    const auto hostWeights = EncoderWeights {
+        *weightsFile, encoder->shape(), weightPacking(), WeightPlacement::Host};
+
+    pendingCoreMLEncoder = makeCoreMLEncoder();
+
+    auto loading = eacp::Threads::Async<eacp::ML::Result> {};
+
+    try
+    {
+        loading =
+            pendingCoreMLEncoder->prepareAsync(hostWeights, coreMLEncoderOptions());
+    }
+    catch (...)
+    {
+        pendingCoreMLEncoder.reset();
+        throw;
+    }
+
+    switchInFlight = true;
+
+    const auto loaded = [this, promise](const eacp::ML::Result& result)
+    {
+        switchInFlight = false;
+
+        if (!result.ok)
+        {
+            pendingCoreMLEncoder.reset();
+            promise.reject(coreMLLoadFailure(result.error));
+            return;
+        }
+
+        adoptCoreMLEncoder(std::move(pendingCoreMLEncoder));
+        promise.resolve();
+    };
+
+    const auto fail = [this, promise](const std::string& error)
+    {
+        switchInFlight = false;
+        pendingCoreMLEncoder.reset();
+        promise.reject(coreMLLoadFailure(error));
+    };
+
+    loading.then(loaded, fail);
+
+    return promise.get();
+#else
+    throw std::logic_error {"this build has no Core ML encoder to switch to"};
 #endif
 }
 
@@ -702,7 +878,7 @@ eacp::Threads::Async<Vector<TokenId>>
 void Whisper::beginRun(Span<const float> samples)
 {
     requirePrepared();
-    requireNoRunInFlight();
+    requireIdle();
 
     if (samples.size() > windowSamples)
         throw ModelError {"this run holds " + std::to_string(samples.size())

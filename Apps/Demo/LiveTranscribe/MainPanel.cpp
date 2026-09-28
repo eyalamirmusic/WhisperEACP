@@ -70,7 +70,8 @@ MainRoot::MainRoot(Session& sessionToUse)
     title.setFontSize(15.f);
     status.setJustification(UI::Justification::Right);
 
-    for (auto* label: {&status, &inputCaption, &channelCaption, &footer})
+    for (auto* label:
+         {&status, &inputCaption, &channelCaption, &backendCaption, &footer})
     {
         label->setColour(UI::defaultTheme().dimText);
         label->setFontSize(smallText);
@@ -82,11 +83,34 @@ MainRoot::MainRoot(Session& sessionToUse)
     startButton.setToggleable(true);
     transcriptScroll.setContent(transcript);
 
+    fillBackendBox();
     wireControls();
 
     addChildren({title, status, inputCaption, deviceBox});
-    addChildren({channelCaption, channelBox, startButton, clearButton});
+    addChildren({channelCaption, channelBox, backendCaption, backendBox});
+    addChildren({startButton, clearButton});
     addChildren({meter, transcriptScroll, footer, errorLine});
+}
+
+// One backend is no choice, so where Core ML cannot run there is no box.
+void MainRoot::fillBackendBox()
+{
+    backendValues.clear();
+    backendBox.clear();
+
+    backendValues.add(WSP::EncoderBackend::kernels);
+
+    if (Session::canUseCoreML())
+        backendValues.add(WSP::EncoderBackend::coreML);
+
+    for (auto backend: backendValues)
+        backendBox.addItem(backendName(backend));
+
+    const auto offersAChoice = backendValues.size() > 1;
+    backendBox.setVisible(offersAChoice);
+    backendCaption.setVisible(offersAChoice);
+
+    applyBackendBoxState();
 }
 
 void MainRoot::wireControls()
@@ -101,6 +125,7 @@ void MainRoot::wireControls()
 
     deviceBox.onChange = [this](int index) { applyDeviceSelection(index); };
     channelBox.onChange = [this](int index) { applyChannelSelection(index); };
+    backendBox.onChange = [this](int index) { applyBackendSelection(index); };
 }
 
 void MainRoot::refresh(bool rebuildDevices)
@@ -111,6 +136,7 @@ void MainRoot::refresh(bool rebuildDevices)
     meter.setLevel(session.capture().level());
 
     applyStartButtonState();
+    applyBackendBoxState();
 
     setLabelText(status, statusText());
     setLabelText(footer, footerText());
@@ -165,7 +191,40 @@ void MainRoot::applyStartButtonState()
 
 bool MainRoot::canCapture() const
 {
-    return session.isReady();
+    return session.hasModel();
+}
+
+void MainRoot::applyBackendBoxState()
+{
+    const auto available = !session.isSwitchingBackend();
+
+    if (available != backendBoxIsAvailable)
+    {
+        backendBoxIsAvailable = available;
+        backendBox.setAccentColour(available ? UI::defaultTheme().accent
+                                             : UI::defaultTheme().outline);
+    }
+
+    if (backendBox.isPopupOpen())
+        return;
+
+    const auto wanted = session.wantedEncoderBackend();
+    const auto isWanted = [wanted](WSP::EncoderBackend backend)
+    { return backend == wanted; };
+
+    auto* found = backendValues.findIf(isWanted);
+    const auto index = found != nullptr ? (int) (found - backendValues.data()) : 0;
+
+    if (backendBox.getSelectedIndex() != index)
+        backendBox.setSelectedIndex(index);
+}
+
+void MainRoot::applyBackendSelection(int index)
+{
+    if (index >= 0 && index < backendValues.size() && !session.isSwitchingBackend())
+        session.requestEncoderBackend(backendValues[index]);
+
+    refresh(false);
 }
 
 void MainRoot::toggleCapture()
@@ -223,6 +282,7 @@ std::string MainRoot::statusText() const
         case ModelState::Loading:
             return "loading model...";
 
+        case ModelState::SwitchingBackend:
         case ModelState::Failed:
             return session.stateMessage();
 
@@ -231,14 +291,15 @@ std::string MainRoot::statusText() const
     }
 
     const auto loaded = "model ready in " + secondsText(session.loadSeconds());
+    const auto encoder = "encoder " + backendName(session.encoderBackend());
     const auto stream = session.capture().status();
 
     if (!stream.running)
-        return loaded + "   idle";
+        return loaded + "   " + encoder + "   idle";
 
     return deviceBox.getText() + "   " + std::to_string(stream.sampleRate) + " Hz   "
            + (stream.native ? "native 16 kHz" : "resampled") + "   block "
-           + std::to_string(stream.blockSize) + "   encode "
+           + std::to_string(stream.blockSize) + "   " + encoder + "   encode "
            + milliseconds(session.lastEncodeSeconds()) + "   decode "
            + milliseconds(session.lastDecodeSeconds());
 }
@@ -275,6 +336,13 @@ void MainRoot::resized()
     controls.removeFromRight(8.f);
     startButton.setBounds(controls.removeFromRight(80.f));
     controls.removeFromRight(14.f);
+
+    if (backendBox.isVisible())
+    {
+        backendBox.setBounds(controls.removeFromRight(120.f));
+        backendCaption.setBounds(controls.removeFromRight(52.f));
+        controls.removeFromRight(12.f);
+    }
 
     inputCaption.setBounds(controls.removeFromLeft(40.f));
     deviceBox.setBounds(controls.removeFromLeft(controls.w * 0.55f));
