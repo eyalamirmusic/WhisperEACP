@@ -8,12 +8,29 @@
 
 namespace LiveTranscribe
 {
+// Where the decoder runs: its backend, and on Core ML the units it is built
+// for, the CPU or the Neural Engine. The units mean nothing on the kernels,
+// and two choices of the kernels are the same choice whatever they say.
+struct DecoderChoice
+{
+    WSP::DecoderBackend backend = WSP::DecoderBackend::kernels;
+    WSP::DecoderComputeUnits units = WSP::DecoderComputeUnits::cpu;
+
+    bool operator==(const DecoderChoice& other) const;
+};
+
+inline constexpr auto decoderOnTheCpu =
+    DecoderChoice {WSP::DecoderBackend::coreML, WSP::DecoderComputeUnits::cpu};
+inline constexpr auto decoderOnTheEngine = DecoderChoice {
+    WSP::DecoderBackend::coreML, WSP::DecoderComputeUnits::cpuAndNeuralEngine};
+
 std::string backendName(WSP::EncoderBackend backend);
+std::string backendName(const DecoderChoice& choice);
 
 // Whether there is a model to run: the four files are arriving from
 // HuggingFace, one is being mapped and its kernels compiled, one is running,
-// its encoder is moving to the other backend, or it failed and the message
-// says why.
+// its encoder or its decoder is moving to the other backend, or it failed and
+// the message says why.
 enum class ModelState
 {
     Downloading,
@@ -36,9 +53,15 @@ class Session
 {
 public:
     // encoderOnCoreML asks for the encoder on Core ML (the Neural Engine) from
-    // the start: the model is prepared on the kernels and switched as soon as
-    // it is Ready, exactly as requestEncoderBackend would.
-    Session(std::string modelDirectoryToUse, bool encoderOnCoreML);
+    // the start, and decoderOnCoreML the decoder (the CPU): the model is
+    // prepared on the kernels and switched as soon as it is Ready, exactly as
+    // the two request calls would. allOnTheEngine asks for everything on the
+    // Neural Engine instead, the mel with the encoder and the decoder too,
+    // Whisper::setNeuralEngineThroughout() made as two switches.
+    Session(std::string modelDirectoryToUse,
+            bool encoderOnCoreML,
+            bool decoderOnCoreML,
+            bool allOnTheEngine);
 
     // Called once the state has settled on Ready or Failed, which is what the
     // app's autostart hangs off: the model arrives over the network now, so
@@ -74,12 +97,21 @@ public:
 
     static bool canUseCoreML();
 
+    // The same pair for the decoder, which switches apart from the encoder.
+    DecoderChoice decoderChoice() const;
+    DecoderChoice wantedDecoderChoice() const;
+
+    static bool canDecodeOnCoreML();
+
     // Remembered, and made on the first tick when no run is in flight; until
     // it is made and settled no run starts and the audio waits in the queue.
     // A request while a switch is in progress is ignored, and one before the
     // model is Ready is made once it is. A switch that fails leaves the model
-    // Ready on the backend it was on, with lastError() saying why.
+    // Ready on the backend it was on, with lastError() saying why. With both
+    // halves asked for, the encoder's switch is made first and the decoder's
+    // on the tick after it settles.
     void requestEncoderBackend(WSP::EncoderBackend backend);
+    void requestDecoderChoice(const DecoderChoice& choice);
     bool isSwitchingBackend() const;
 
     WSP::Capture& capture() { return microphone; }
@@ -114,11 +146,18 @@ private:
     bool runTranscriber();
     void flushTranscriber();
 
+    enum class Half
+    {
+        encoder,
+        decoder
+    };
+
     bool hasSwitchWaiting() const;
     bool advanceSwitch();
     void beginSwitch();
     void issueSwitch();
     void finishSwitch(const std::string& error);
+    std::string halfDescription(std::string_view where) const;
 
     std::string modelDirectory;
     WSP::ModelFetch::Download download;
@@ -138,7 +177,10 @@ private:
     // issued on the tick after, so the window has drawn what it is waiting
     // for before a switch that blocks — the one to the kernels — holds it.
     std::optional<WSP::EncoderBackend> requestedBackend;
+    std::optional<DecoderChoice> requestedDecoder;
+    Half switchingHalf = Half::encoder;
     WSP::EncoderBackend switchTarget = WSP::EncoderBackend::kernels;
+    DecoderChoice decoderTarget;
     bool switchIssued = false;
     bool flushWhenSwitched = false;
     bool switchSettled = false;

@@ -186,7 +186,10 @@ void checkProgram(const CoreMLNet& net,
 CoreMLNet
     recordedNet(const EncoderShape& shape, const EncoderWeights& weights, bool fused)
 {
-    auto net = CoreMLNet {audioContextSpan(), CoreMLNetOptions {fused, 2}};
+    auto options = CoreMLNetOptions {};
+    options.fusedAttention = fused;
+
+    auto net = CoreMLNet {audioContextSpan(), options};
     recordCoreMLEncoder(net, shape, weights);
     return net;
 }
@@ -400,4 +403,163 @@ auto tRecordsTinyEn = test("Net/CoreML/recordsTinyEn") = []
     // 8.2 million encoder parameters at two bytes each, in 64-byte records.
     check(package.weights.size() > 16'000'000);
     check(package.weights.size() < 17'000'000);
+};
+
+namespace
+{
+struct DecoderNets
+{
+    std::unique_ptr<CoreMLNet> start;
+    std::unique_ptr<CoreMLNet> step;
+    DecoderCaches caches;
+};
+
+void addCaches(Vector<Cache>& caches, Net& net, int layers, int rows, int width)
+{
+    for (auto index = 0; index < layers; ++index)
+        caches.add(net.makeCache(rows, width));
+}
+
+DecoderCaches makeDecoderCaches(Net& net, const DecoderShape& shape)
+{
+    auto caches = DecoderCaches {};
+    addCaches(caches.selfKeys, net, shape.layers, shape.maxPositions, shape.width);
+    addCaches(caches.selfValues, net, shape.layers, shape.maxPositions, shape.width);
+    addCaches(
+        caches.crossKeys, net, shape.layers, shape.crossPositions, shape.width);
+    addCaches(
+        caches.crossValues, net, shape.layers, shape.crossPositions, shape.width);
+    return caches;
+}
+
+void recordStep(CoreMLNet& net,
+                const DecoderShape& shape,
+                const DecoderWeights& weights,
+                DecoderCaches& caches,
+                int tokenCount)
+{
+    recordDecoderStep(net,
+                      shape,
+                      weights,
+                      caches,
+                      namedBinding({shape.maxPositions}, "tokens"),
+                      tokenCount,
+                      0,
+                      namedBinding({}, "hidden_states"),
+                      namedBinding({}, "logits"));
+}
+
+bool hasName(const Vector<std::string>& names, const std::string& name)
+{
+    return names.contains(name);
+}
+} // namespace
+
+// The two decoder programs CoreMLDecoder compiles, recorded from the real
+// weights with no device: the sequence start writes every cross cache whole
+// out of the encoder rows; the step reads every cache and both masks, puts out
+// only the self caches' new rows and the token its argmax chose, and holds the
+// embedding once for the gather and the logits.
+auto tRecordsTheDecoderPrograms = test("Net/CoreML/recordsTheDecoderPrograms") = []
+{
+    if (!hasWhisperModel())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile("config.json"));
+    const auto shape = DecoderShape::fromConfig(config, encoderPositions);
+    const auto file = SafeTensors::fromFile(modelFile("model.safetensors"));
+    const auto weights =
+        DecoderWeights {file, shape, WeightPacking::Float, WeightPlacement::Host};
+
+    auto start = CoreMLNet {CoreMLNetOptions {}};
+    auto startCaches = makeDecoderCaches(start, shape);
+    recordSequenceStart(start,
+                        shape,
+                        weights,
+                        startCaches,
+                        namedBinding({shape.crossPositions, shape.width}, "rows"),
+                        shape.crossPositions);
+
+    check(start.isValid());
+    check(start.inputNames().size() == 1);
+    check(start.outputNames().size() == 2 * shape.layers);
+
+    for (const auto& cache: startCaches.crossKeys)
+        check(hasName(start.outputNames(), CoreMLNet::cacheFeature(cache)));
+
+    auto options = CoreMLNetOptions {};
+    options.selection = CoreMLSelection {};
+    options.omittedOutputs = {"hidden_states", "logits"};
+
+    auto step = CoreMLNet {options};
+    auto caches = makeDecoderCaches(step, shape);
+    recordStep(step, shape, weights, caches, 1);
+
+    check(step.isValid());
+
+    const auto& inputs = step.inputNames();
+    check(inputs.size() == 4 * shape.layers + 5);
+    check(hasName(inputs, "tokens"));
+    check(hasName(inputs, CoreMLNet::positionFeature));
+    check(hasName(inputs, CoreMLNet::selfMaskFeature));
+    check(hasName(inputs, CoreMLNet::crossMaskFeature));
+    check(hasName(inputs, "suppression"));
+
+    const auto& outputs = step.outputNames();
+    check(outputs.size() == 2 * shape.layers + 1);
+    check(hasName(outputs, "next_token"));
+    check(!hasName(outputs, "logits"));
+    check(hasName(outputs, CoreMLNet::appendedRowsFeature(caches.selfKeys[0])));
+
+    const auto text = step.graph().toText();
+    check(text.find("reduce_argmax") != std::string::npos);
+    check(text.find("scaled_dot_product_attention") != std::string::npos);
+
+    // embed_tokens, 51864 x 384 at two bytes, once for both of its readers.
+    const auto blob = step.build().weights.size();
+    check(blob > 40'000'000);
+    check(blob < 60'000'000);
+};
+
+// A step of more than one token, or causal attention over rows, is something
+// a fixed program with a mask over one appended row cannot express, and the
+// net says so rather than recording it.
+auto tRefusesWhatADecoderStepCannotRun =
+    test("Net/CoreML/refusesWhatADecoderStepCannotRun") = []
+{
+    if (!hasWhisperModel())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile("config.json"));
+    const auto shape = DecoderShape::fromConfig(config, encoderPositions);
+    const auto file = SafeTensors::fromFile(modelFile("model.safetensors"));
+    const auto weights =
+        DecoderWeights {file, shape, WeightPacking::Float, WeightPlacement::Host};
+
+    auto prompt = CoreMLNet {CoreMLNetOptions {}};
+    auto caches = makeDecoderCaches(prompt, shape);
+    check(throwsLogicError([&] { recordStep(prompt, shape, weights, caches, 2); }));
+
+    auto net = CoreMLNet {CoreMLNetOptions {}};
+    check(throwsLogicError([&] { net.cached(Cache {3, 0}); }));
+    check(throwsLogicError([&] { net.rows(weights.positionalEmbedding, 0, 4); }));
+    check(throwsLogicError([&] { net.makeCache(0, 4); }));
+
+    const auto rows =
+        net.input(namedBinding({4, 384}, "rows"), {4, 384}, DType::float32);
+    check(throwsLogicError([&] { net.attention(rows, rows, rows, 6, true); }));
+    check(throwsLogicError(
+        [&]
+        {
+            net.embed(rows, weights.tokenEmbedding, weights.positionalEmbedding, 0);
+        }));
+
+    if (eacp::GPU::Device::shared().isValid())
+    {
+        const auto deviceWeights = DecoderWeights {file, shape};
+        auto device = CoreMLNet {CoreMLNetOptions {}};
+        auto deviceCaches = makeDecoderCaches(device, shape);
+        check(throwsLogicError(
+            [&] { recordStep(device, shape, deviceWeights, deviceCaches, 1); }));
+    }
 };

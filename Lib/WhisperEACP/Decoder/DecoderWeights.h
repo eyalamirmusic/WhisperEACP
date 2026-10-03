@@ -27,7 +27,8 @@ struct DecoderLayerWeights
     DecoderLayerWeights(const SafeTensors& file,
                         const DecoderShape& shape,
                         int index,
-                        WeightPacking packing);
+                        WeightPacking packing,
+                        WeightPlacement placement = WeightPlacement::Device);
 
     TensorBuffer selfAttentionNormWeight;
     TensorBuffer selfAttentionNormBias;
@@ -55,6 +56,11 @@ struct DecoderLayerWeights
     TensorBuffer feedForwardBias;
     TensorBuffer feedForwardOutputWeight;
     TensorBuffer feedForwardOutputBias;
+
+private:
+    struct Loader;
+
+    DecoderLayerWeights(const Loader& load, const DecoderShape& shape);
 };
 
 // Every decoder tensor of a safetensors file, uploaded and checked against the
@@ -110,13 +116,21 @@ struct DecoderLayerWeights
 // out identical to the last bit. A repo genuinely saved in fp32 keeps the
 // float weights it shipped and the tied logits weight, which is why this asks
 // for half the bytes rather than promising them.
+//
+// Under WeightPlacement::Host nothing is uploaded, packing is moot and there
+// is no packed copy: every tensor is checked the same way and kept as its
+// shape and its bytes in the file, for the Core ML decoder, which writes one
+// embed_tokens into its blob for both the gather and the logits. The
+// SafeTensors has to outlive the weights then.
 struct DecoderWeights
 {
     DecoderWeights(const SafeTensors& file,
                    const DecoderShape& shapeToUse,
-                   WeightPacking packingToUse = WeightPacking::Float);
+                   WeightPacking packingToUse = WeightPacking::Float,
+                   WeightPlacement placementToUse = WeightPlacement::Device);
 
     DecoderShape shape;
+    WeightPlacement placement = WeightPlacement::Device;
 
     // [vocabularySize, width]. Both the gather's table and, unless a packed
     // copy was asked for, the logits projection's weight — which is what ties

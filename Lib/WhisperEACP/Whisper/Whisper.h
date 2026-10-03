@@ -1,5 +1,6 @@
 #pragma once
 
+#include <WhisperEACP/Decoder/CoreMLDecoder.h>
 #include <WhisperEACP/Decoder/Decoder.h>
 #include <WhisperEACP/Encoder/CoreMLEncoder.h>
 #include <WhisperEACP/Encoder/Encoder.h>
@@ -18,24 +19,45 @@
 
 namespace WSP
 {
-// What runs the encoder. The decoder is on the kernels either way.
+// What runs the encoder, and, chosen apart from it, what runs the decoder.
+//
+// coreMLWithMel is Core ML with the mel front end on Core ML too, a model of
+// its own in front of the encoder's (Net/CoreMLMel.h, CoreMLFrontEnd): the
+// window's samples go in and the encoder's rows come out, so the encode puts
+// nothing on the GPU, where coreML runs the mel as a Metal command buffer in
+// front of the prediction.
 enum class EncoderBackend
+{
+    kernels,
+    coreML,
+    coreMLWithMel
+};
+
+constexpr bool isOnCoreML(EncoderBackend backend)
+{
+    return backend != EncoderBackend::kernels;
+}
+
+enum class DecoderBackend
 {
     kernels,
     coreML
 };
 
-// Where Core ML may place the encoder under EncoderBackend::coreML, Core ML's
-// own four settings. cpuAndNeuralEngine is the default because it is the only
-// one that reaches the engine: under all, Core ML places the whole encoder on
-// the GPU.
-enum class EncoderComputeUnits
+// Where Core ML may place a model, Core ML's own four settings. The encoder's
+// default is cpuAndNeuralEngine, the only one that reaches the engine: under
+// all, Core ML places the whole encoder on the GPU. The decoder's is cpu,
+// where a step of one token measured fastest.
+enum class CoreMLComputeUnits
 {
     all,
     cpuAndNeuralEngine,
     cpuAndGPU,
     cpu
 };
+
+using EncoderComputeUnits = CoreMLComputeUnits;
+using DecoderComputeUnits = CoreMLComputeUnits;
 
 // The whole runtime, from 30 s of samples to text: the mel front-end, the
 // encoder, the decoder's KV-cached loop, and the greedy search that turns the
@@ -196,16 +218,17 @@ public:
     // The kernels by default. Set before prepare(), which builds the encoder
     // for it; a call after is a std::logic_error, and switchEncoderBackend is
     // the way to move a prepared one. prepare() refuses a backend this build
-    // or this machine cannot run with a ModelError, and under coreML an audio
-    // context outside enumeratedAudioContexts() as well.
+    // or this machine cannot run with a ModelError, and on either Core ML
+    // backend an audio context outside enumeratedAudioContexts() as well.
     EncoderBackend encoderBackend() const { return chosenEncoderBackend; }
     void setEncoderBackend(EncoderBackend backend);
 
-    // Moves a prepared Whisper's encoder to the other backend and re-prepares
+    // Moves a prepared Whisper's encoder to another backend and re-prepares
     // the encoder alone: the front-end, the decoder and every buffer they
-    // share stay as they are, since both encoders write the same rows into
+    // share stay as they are, since every encoder writes the same rows into
     // the same buffer. The kernels' pipelines and device weights are released
-    // on the way to Core ML and rebuilt on the way back. Unprepared, this is
+    // on the way to Core ML and rebuilt on the way back, and a move between
+    // the two Core ML backends builds the other model. Unprepared, this is
     // setEncoderBackend; the backend already in use is a no-op.
     //
     // The new encoder is built beside the old one and replaces it only once
@@ -230,27 +253,90 @@ public:
 
     bool isSwitchingEncoder() const { return switchInFlight; }
 
-    // coreML wherever this build has eacp's Core ML runner and the OS loads a
-    // specification 8 program, the floor for the encoder with its attention
-    // unfused; where it also loads 9, the fused program is built instead.
+    // Both Core ML backends wherever this build has eacp's Core ML runner and
+    // the OS loads a specification 8 program, the floor for the encoder with
+    // its attention unfused; where it also loads 9, the fused program is built
+    // instead.
     static bool supportsEncoderBackend(EncoderBackend backend);
 
-    // Set before prepare(), like the backend, and read only under coreML.
+    // Set before prepare(), like the backend, and read only on Core ML.
     EncoderComputeUnits encoderComputeUnits() const { return chosenComputeUnits; }
     void setEncoderComputeUnits(EncoderComputeUnits units);
 
-    // Where the compiled Core ML encoder is cached, set before prepare() like
-    // the units; empty, the default, is eacp::ML::defaultCacheDirectory(), the
-    // app's own, so binaries that share one directory compile the model once.
-    const eacp::FilePath& encoderCacheDirectory() const
-    {
-        return coreMLCacheDirectory;
-    }
+    // Where the compiled Core ML models are cached, the encoder's and the
+    // decoder's both, set before prepare() like the units; empty, the default,
+    // is eacp::ML::defaultCacheDirectory(), the app's own, so binaries that
+    // share one directory compile each model once. The encoder's name for it
+    // is the older one and the same setting.
+    const eacp::FilePath& coreMLCacheDirectory() const { return cacheDirectory; }
+    void setCoreMLCacheDirectory(const eacp::FilePath& directory);
+
+    const eacp::FilePath& encoderCacheDirectory() const { return cacheDirectory; }
     void setEncoderCacheDirectory(const eacp::FilePath& directory);
 
     // Whether prepare() found the compiled Core ML encoder in the cache
     // rather than compiling it. False on the kernels.
     bool encoderWasCacheHit() const { return coreMLCacheHit; }
+
+    // The decoder's backend, apart from the encoder's: the kernels by
+    // default, and chosen before prepare() the same way. Under coreML the
+    // decoder is CoreMLDecoder, two Core ML models, and the greedy search is
+    // this class's as before: the suppression masks go into each step as an
+    // input and the argmax is the step's own, so what comes back is a token.
+    //
+    // With both halves on Core ML the encoder's rows stay in its fp16 array
+    // and are copied row for row into the decoder's, never reaching the GPU.
+    DecoderBackend decoderBackend() const { return chosenDecoderBackend; }
+    void setDecoderBackend(DecoderBackend backend);
+
+    // switchEncoderBackend's twin: the decoder alone is rebuilt on the other
+    // backend beside the one in use, which it replaces only once ready, so a
+    // switch that fails throws a ModelError and changes nothing; one while a
+    // run or any switch is in flight is a std::logic_error.
+    void switchDecoderBackend(DecoderBackend backend);
+
+    // And switchEncoderBackendAsync's: both Core ML loads on the models'
+    // queues, isSwitchingDecoder() true until it settles, and everything a
+    // switch in flight refuses refused. A switch to the kernels, or to the
+    // backend in use, resolves before it returns.
+    eacp::Threads::Async<void> switchDecoderBackendAsync(DecoderBackend backend);
+
+    // The two switches with the units a Core ML decoder is built for, which
+    // are decoderComputeUnits() once it is: to coreML with other units than
+    // the ones in use rebuilds the Core ML decoder, which is how a prepared
+    // Whisper moves its decoder between the CPU and the Neural Engine. The
+    // units are ignored on the way to the kernels.
+    void switchDecoderBackend(DecoderBackend backend, DecoderComputeUnits units);
+    eacp::Threads::Async<void> switchDecoderBackendAsync(DecoderBackend backend,
+                                                         DecoderComputeUnits units);
+
+    bool isSwitchingDecoder() const { return decoderSwitchInFlight; }
+
+    // coreML wherever this build has eacp's Core ML runner and the OS loads a
+    // specification 8 program; where it loads 9 the masked attentions are
+    // fused.
+    static bool supportsDecoderBackend(DecoderBackend backend);
+
+    // Under cpuAndNeuralEngine the decoder's step takes its position by a
+    // one-hot product and its argmax out of reductions, the forms the engine
+    // runs (CoreMLDecoderOptions), and gathers its token on the CPU, the one
+    // op of a step left there, since the token's product reads the whole
+    // vocabulary table and measured slower. Under every other setting it
+    // gathers both and argmaxes with reduce_argmax.
+    DecoderComputeUnits decoderComputeUnits() const { return chosenDecoderUnits; }
+    void setDecoderComputeUnits(DecoderComputeUnits units);
+
+    bool decoderWasCacheHit() const { return coreMLDecoderCacheHit; }
+    double decoderLoadSeconds() const { return coreMLDecoderLoadSeconds; }
+
+    // Everything on the Neural Engine: the mel, the encoder and the decoder's
+    // two models, all under cpuAndNeuralEngine, so a run puts no work on the
+    // GPU, and on the CPU only the host's side of the loop, the seam copies
+    // and each step's token gather. Set before prepare(), since it is the four
+    // settings above; isOnNeuralEngineThroughout() says whether the four are
+    // that.
+    void setNeuralEngineThroughout();
+    bool isOnNeuralEngineThroughout() const;
 
     // whisper.cpp's audio_ctx: how many of the encoder's 1500 positions a run
     // computes. Zero, the default, is the whole 30 s window, and every
@@ -274,7 +360,7 @@ public:
     // count are measured in Tests/Whisper and in plan.md rather than assumed,
     // and that is why this is off by default.
     //
-    // Under EncoderBackend::coreML the count is zero or one of
+    // On either Core ML backend the count is zero or one of
     // enumeratedAudioContexts(), since that encoder is compiled for those
     // shapes alone, and anything else is a ModelError.
     int audioContext() const { return audioContextPositions; }
@@ -367,7 +453,9 @@ public:
     // before this returns, the prediction runs on the model's queue, and the
     // decode runs on the main thread when it resolves, which is when this
     // resolves; the GPU and the main thread are free while the engine works.
-    // On the kernels this is transcribe(), resolved before it returns.
+    // Under coreMLWithMel the samples are narrowed into the model's array
+    // instead, and there is no mel to commit. On the kernels this is
+    // transcribe(), resolved before it returns.
     //
     // One run at a time: transcribe(), transcribeAsync() or setAudioContext()
     // while a run is in flight is a std::logic_error. The misuse transcribe()
@@ -407,12 +495,23 @@ public:
     // only GPU work in that encode; zero on the kernels, where the mel shares
     // the encoder's command buffer. What is left of the encode after the two
     // is the seam: the mel read back and narrowed, the rows widened back.
+    //
+    // Under coreMLWithMel the mel is the prediction's, so lastEncoderMelSeconds()
+    // is zero and the seam is the samples narrowed into the model's array, and
+    // the rows widened back only when the decoder is on the kernels.
     double lastEncodeSeconds() const { return encodeSeconds; }
     double lastDecodeSeconds() const { return decodeSeconds; }
     double lastEncoderPredictSeconds() const { return predictSeconds; }
     double lastEncoderMelSeconds() const { return melSeconds; }
 
-    // Under coreML, how long prepare() took to load the compiled encoder, or
+    // Under DecoderBackend::coreML, the decode's two predictions apart: the
+    // sequence start's, and every step's summed. What is left of
+    // lastDecodeSeconds() after them is the host's side of the loop. Zero on
+    // the kernels.
+    double lastSequenceStartSeconds() const { return sequenceStartSeconds; }
+    double lastDecoderPredictSeconds() const { return decoderPredictSeconds; }
+
+    // On Core ML, how long prepare() took to load the compiled encoder, or
     // to compile and load it on a cache miss; zero on the kernels.
     double encoderLoadSeconds() const { return coreMLLoadSeconds; }
 
@@ -420,8 +519,17 @@ public:
     // Where Core ML placed the encoder's ops, read once and kept. Under
     // cpuAndNeuralEngine the read costs the engine compile again, about 14 s,
     // so only a caller that prints or asserts it should ask. A
-    // std::logic_error unless prepared with EncoderBackend::coreML.
+    // std::logic_error unless the encoder is on Core ML.
     const eacp::ML::ComputePlan& encoderComputePlan();
+
+    // The mel model's, under coreMLWithMel; a std::logic_error otherwise.
+    eacp::ML::ComputePlan melComputePlan() const;
+
+    // The decoder's two models, the sequence start's and the step's, read on
+    // every call and at the same price. A std::logic_error unless prepared
+    // with DecoderBackend::coreML.
+    eacp::ML::ComputePlan sequenceStartComputePlan() const;
+    eacp::ML::ComputePlan decoderStepComputePlan() const;
 #endif
 
     // How many decoder steps the last run consumed, which is one for the
@@ -448,6 +556,7 @@ private:
     void requireRunnableEncoder() const;
     void requireRunnableEncoder(EncoderBackend backend) const;
     void requireAudioContextForBackend(EncoderBackend backend, int positions) const;
+    void requireRunnableDecoder(DecoderBackend backend) const;
 
     void buildPrompt();
     void buildSuppressionMasks();
@@ -470,22 +579,42 @@ private:
     // The decoder's steps, from the first to the one that ends the run, over
     // whatever the encode left in encodedBuffer.
     Vector<TokenId> decodeTranscript();
+    Vector<TokenId> decodeTranscriptOnCoreML();
+
+    // Both halves on Core ML: the encoder's rows are read by the decoder out
+    // of the encoder's own array, and never widened into encodedBuffer.
+    bool rowsStayInCoreML() const;
 
     double encodeAudio();
     double encodeAudioOnCoreML();
     void commitMel();
     int encodedPositions() const;
     void prepareCoreMLEncoder();
+    void prepareCoreMLDecoder(const DecoderShape& shape);
     void unprepare();
 
     WeightPacking weightPacking() const;
     void switchEncoderToKernels();
-    void switchEncoderToCoreML();
+    void switchEncoderToCoreML(EncoderBackend backend);
+
+    void switchDecoderToKernels();
+    void switchDecoderToCoreML(DecoderComputeUnits units);
+    bool isDecoderAlready(DecoderBackend backend, DecoderComputeUnits units) const;
 
 #if EACP_HAS_COREML
-    CoreMLEncoderOptions coreMLEncoderOptions() const;
+    CoreMLEncoderOptions coreMLEncoderOptions(EncoderBackend backend) const;
     std::unique_ptr<CoreMLEncoder> makeCoreMLEncoder() const;
-    void adoptCoreMLEncoder(std::unique_ptr<CoreMLEncoder> prepared);
+    void adoptCoreMLEncoder(std::unique_ptr<CoreMLEncoder> prepared,
+                            EncoderBackend backend);
+
+    CoreMLDecoderOptions coreMLDecoderOptions(DecoderComputeUnits units) const;
+    DecoderWeights hostDecoderWeights() const;
+    void adoptCoreMLDecoder(std::unique_ptr<CoreMLDecoder> prepared,
+                            DecoderComputeUnits units);
+    const CoreMLDecoder& requireCoreMLDecoder() const;
+
+    // transcribeAsync's encode, from the samples or from a committed mel.
+    eacp::Threads::Async<eacp::ML::Result> startCoreMLEncode();
 #endif
 
     // Step zero opens the sequence and decodes the prompt; step j embeds the
@@ -523,9 +652,13 @@ private:
     bool packedWeights = true;
     EncoderBackend chosenEncoderBackend = EncoderBackend::kernels;
     EncoderComputeUnits chosenComputeUnits = EncoderComputeUnits::cpuAndNeuralEngine;
-    eacp::FilePath coreMLCacheDirectory;
+    DecoderBackend chosenDecoderBackend = DecoderBackend::kernels;
+    DecoderComputeUnits chosenDecoderUnits = DecoderComputeUnits::cpu;
+    eacp::FilePath cacheDirectory;
     bool coreMLCacheHit = false;
     double coreMLLoadSeconds = 0.0;
+    bool coreMLDecoderCacheHit = false;
+    double coreMLDecoderLoadSeconds = 0.0;
     int audioContextPositions = 0;
 
     MelSpectrogram frontEnd;
@@ -566,14 +699,24 @@ private:
     // it, which is also what the pending one is while it loads.
     std::unique_ptr<CoreMLEncoder> coreMLEncoder;
     std::unique_ptr<CoreMLEncoder> pendingCoreMLEncoder;
+
+    // The same for the decoder, with the two suppression masks as the
+    // additive rows its steps read.
+    std::unique_ptr<CoreMLDecoder> coreMLDecoder;
+    std::unique_ptr<CoreMLDecoder> pendingCoreMLDecoder;
+    eacp::ML::MultiArray firstStepSuppressionRow;
+    eacp::ML::MultiArray laterStepSuppressionRow;
 #endif
 
     double encodeSeconds = 0.0;
     double decodeSeconds = 0.0;
     double predictSeconds = 0.0;
     double melSeconds = 0.0;
+    double sequenceStartSeconds = 0.0;
+    double decoderPredictSeconds = 0.0;
     int stepCount = 0;
     bool runInFlight = false;
     bool switchInFlight = false;
+    bool decoderSwitchInFlight = false;
 };
 } // namespace WSP

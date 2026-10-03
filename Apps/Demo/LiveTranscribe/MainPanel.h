@@ -35,18 +35,23 @@ private:
     void wireControls();
     void rebuildDeviceBoxes();
     void fillBackendBox();
+    void fillDecoderBox();
     void layOutTranscript();
 
     void toggleCapture();
     void applyDeviceSelection(int index);
     void applyChannelSelection(int index);
     void applyBackendSelection(int index);
+    void applyDecoderSelection(int index);
 
-    // The box follows the session rather than the click: the backend the
-    // encoder is on or is being moved to, and back on the one it stayed on
-    // after a switch that failed. Greyed while a switch is in progress, the
-    // same fake disabled state as Start.
+    // The boxes follow the session rather than the click: the backend each
+    // half is on or is being moved to, and back on the one it stayed on after
+    // a switch that failed. Both greyed while either half switches, the same
+    // fake disabled state as Start, since the session makes one switch at a
+    // time.
     void applyBackendBoxState();
+    void applyDecoderBoxState();
+    bool hasBackendRow() const;
 
     std::string statusText() const;
     std::string footerText() const;
@@ -65,10 +70,12 @@ private:
     UI::Label inputCaption {"input"};
     UI::Label channelCaption {"channels"};
     UI::Label backendCaption {"encoder"};
+    UI::Label decoderCaption {"decoder"};
 
     UI::ComboBox deviceBox {"device"};
     UI::ComboBox channelBox {"channels"};
     UI::ComboBox backendBox {"encoder"};
+    UI::ComboBox decoderBox {"decoder"};
 
     UI::Button startButton {"Start"};
     UI::Button clearButton {"Clear"};
@@ -86,7 +93,9 @@ private:
     WSP::Vector<int> deviceIds;
     WSP::Vector<int> channelValues;
     WSP::Vector<WSP::EncoderBackend> backendValues;
+    WSP::Vector<DecoderChoice> decoderValues;
     bool backendBoxIsAvailable = true;
+    bool decoderBoxIsAvailable = true;
 
     // What the button is already showing, so a tick that changed nothing about
     // it does not repaint it.

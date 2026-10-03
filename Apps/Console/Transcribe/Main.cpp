@@ -44,6 +44,10 @@ constexpr auto usage =
     "  --audio-ctx=N    encode N of the encoder's 1500 positions rather than\n"
     "                   the whole 30 s window, or 'audio' for the count the\n"
     "                   recording itself fills\n"
+    "  --ane            everything on the Neural Engine through Core ML: the\n"
+    "                   mel, the encoder and the decoder, the GPU left idle.\n"
+    "                   The first run on a machine compiles for the engine,\n"
+    "                   some seconds; every later one loads from the cache\n"
     "\n"
     "The built-in sample is 11 s of Kennedy's inaugural address. The fetched\n"
     "model is openai/whisper-tiny.en, downloaded once into this machine's own\n"
@@ -73,6 +77,12 @@ void report(const WSP::Whisper& whisper, int tokenCount, double loading)
 
     std::printf("  load and upload       %8.3f s\n", loading);
     std::printf("  mel + encoder         %8.3f s\n", whisper.lastEncodeSeconds());
+
+    if (whisper.isOnNeuralEngineThroughout())
+        std::printf("    mel %.3f s, encoder %.3f s, on the Neural Engine\n",
+                    whisper.lastEncoderMelSeconds(),
+                    whisper.lastEncoderPredictSeconds());
+
     std::printf("  decode, %3d tokens    %8.3f s   %5.1f ms per step over %d\n",
                 tokenCount,
                 whisper.lastDecodeSeconds(),
@@ -96,6 +106,9 @@ struct Request
 
     static constexpr int fromTheAudio = -1;
 
+    // Whisper::setNeuralEngineThroughout().
+    bool onTheNeuralEngine = false;
+
     bool usesFetchedModel() const { return modelDirectory.empty(); }
     bool usesEmbeddedSample() const { return wavFile.empty(); }
 
@@ -116,12 +129,15 @@ struct Request
         else if (audioContext > 0)
             std::printf("context: %d of 1500 encoder positions\n", audioContext);
 
+        if (onTheNeuralEngine)
+            std::printf("runs on: the Neural Engine, mel, encoder and decoder\n");
+
         std::printf("\n");
     }
 };
 
-// Each argument is the audio context if it is that flag, and a path otherwise,
-// in the order the two forms above take them.
+// Each argument is one of the two flags, or a path, in the order the two forms
+// above take them.
 bool parse(const WSP::Vector<std::string>& arguments, Request& request)
 {
     constexpr auto flag = std::string_view {"--audio-ctx="};
@@ -130,6 +146,12 @@ bool parse(const WSP::Vector<std::string>& arguments, Request& request)
     for (auto index = 1; index < arguments.size(); ++index)
     {
         const auto& argument = arguments[index];
+
+        if (argument == "--ane")
+        {
+            request.onTheNeuralEngine = true;
+            continue;
+        }
 
         if (!std::string_view {argument}.starts_with(flag))
         {
@@ -173,6 +195,10 @@ void run(const Request& request)
 
     auto whisper = WSP::Whisper {};
     whisper.load(request.modelPath());
+
+    if (request.onTheNeuralEngine)
+        whisper.setNeuralEngineThroughout();
+
     whisper.prepare();
 
     const auto samples = request.usesEmbeddedSample()

@@ -2,6 +2,7 @@ nano_add_executable(NetTests
         NO_MAIN
         SOURCES
         CoreMLEncoderTests.cpp
+        CoreMLMelTests.cpp
         CoreMLNetTests.cpp
         ${WHISPER_MODEL_TEST_MAIN}
         TARGETS whisper-runtime)

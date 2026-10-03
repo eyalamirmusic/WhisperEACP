@@ -9,8 +9,11 @@
 nano_add_executable(WhisperTests
         NO_MAIN
         SOURCES
+        CoreMLDecoderTests.cpp
+        DecoderBackendTests.cpp
         EncoderBackendTests.cpp
         LiveTranscriberTests.cpp
+        NeuralEngineTests.cpp
         PackedWeightsTests.cpp
         TranscribeTests.cpp
         WhisperTests.cpp

@@ -76,7 +76,15 @@ cmake --build build-release --target Benchmark
 ./build-release/Benchmark/Benchmark 30 recording.wav
 ./build-release/Benchmark/Benchmark 30 --units=all --plan
 ./build-release/Benchmark/Benchmark --live --audio-ctx=audio
+./build-release/Benchmark/Benchmark 20 --coreml-decoder=cpu,cpuAndNeuralEngine
+./build-release/Benchmark/Benchmark 500 --only="EACP ML dec cpu"
 ```
+
+`--coreml-decoder=` adds a column per decoder setting, `EACP ML dec <units>`,
+with both halves on Core ML and the decode split into the sequence start and
+the step predictions. `--only=` times one column alone and none of
+whisper.cpp's, which is how the GPU's utilization for one configuration is
+watched from outside (`ioreg -r -c AGXAccelerator`).
 
 Where the build has eacp's Core ML runner and the OS loads its programs, a
 fourth column, `WhisperEACP ANE`, runs the runtime with its encoder on Core ML
@@ -84,9 +92,15 @@ fourth column, `WhisperEACP ANE`, runs the runtime with its encoder on Core ML
 column, which stays the transcript reference. Its encode is split into the
 mel's own command buffer, the prediction and the seam copies. `--units=` picks
 the compute units (`cpuAndNeuralEngine` by default, `all`, `cpuAndGPU`, `cpu`)
-and `--plan` prints where Core ML placed the encoder's ops, which under the
-engine settings costs the engine compile again, about 14 s, so it is off by
-default. `--live` streams twice, kernels then Core ML, into one table.
+and `--plan` prints where Core ML placed every Core ML model of every column
+(the mel, the encoder, the decoder's sequence start and step), which under the
+engine settings can cost the engine compile again, so it is off by default.
+`--live` streams every column of ours, then whisper.cpp's, into one table.
+
+The last of ours, `EACP all ANE`, is `Whisper::setNeuralEngineThroughout()`:
+the mel, the encoder and the decoder all on Core ML under `cpuAndNeuralEngine`,
+whatever `--units` says, and nothing on the GPU. Its `mel` row is the mel
+model's own prediction on the engine.
 
 whisper.cpp is fetched once, in the root `CMakeLists.txt`, through
 `CMake/WhisperCpp.cmake`, because its targets (`ggml`, `whisper`) are named
@@ -147,6 +161,13 @@ CPM fetches the current develop.
 so the plain fetch has them. A build directory configured against an older eacp
 fails to build `whisper-net` and `CoreMLEncoder`; reconfigure so CPM fetches the
 current develop.
+
+**The Core ML decoder is on eacp's develop, and this tree requires it.**
+`CoreMLDecoder` uses `Graph::argmax` (G8), the run-time-mask
+`scaledDotProductAttention` (G9) and `MultiArray::copyRows`, which landed on
+develop as `259c3bee` (eacp PR #65), so the plain fetch has them. A build
+directory configured against an older eacp fails to build `whisper-net` and
+`CoreMLDecoder`; reconfigure so CPM fetches the current develop.
 
 ## Architecture
 
@@ -215,16 +236,63 @@ written against once (`recordEncoder`, `recordSequenceStart`,
 `recordDecoderStep`), and a backend is what runs it. `KernelNet` dispatches
 the kernels above; `CoreMLNet` records the encoder into an `eacp::ML` graph,
 the mel an fp16 input enumerated over the eighteen audio contexts and every
-weight a blob constant named after its safetensors key. `whisper-net` links
-`eacp-ml-graph`, which builds everywhere.
+weight a blob constant named after its safetensors key. Its second
+constructor records a fixed-shape decoder program instead: a cache is a
+feature of its own (`cacheFeature`), written out whole by a projection that
+fills it (the sequence start's cross keys and values) and read in by a
+shorter one, which appends one token's rows after all 448 capacity rows and
+puts them out as `appendedRowsFeature` for the caller to write back; which
+rows are valid is the `self_mask` and `cross_mask` inputs, the position is
+the `position` input, and `CoreMLNetOptions::selection` adds the suppression
+input and eacp's argmax, so a step's output is a token. Three step ops Core ML
+keeps on the CPU have engine forms beside them: the token and the position
+looked up by a one-hot product (`embedsTokenByProduct`,
+`embedsPositionByProduct`, the token as two base-256 fp16 digits since fp16
+counts exactly only to 2048), and the argmax out of reductions
+(`CoreMLSelection::onTheEngine`, exact, ties to the lowest index).
+`CoreMLMel` is the mel front end as a graph: the samples a hop to a row, the
+STFT as one product per row offset against a Hann-windowed DFT basis, the
+reflect padding a product against a permutation, and two gains (the samples to
+a peak of one, the spectrum to a power peak of 2^15) that put Whisper's eight
+decades inside fp16's range, their logs taken back off before the floor and
+clamp. `whisper-net` links `eacp-ml-graph`, which builds everywhere.
 
 **Encoder/** and **Decoder/** — HF's two halves out of those kernels, the second
 over a KV cache. `CoreMLEncoder` (Apple only, behind `if (TARGET eacp-ml)`) is
 the encoder as one Core ML model: recorded through `CoreMLNet`, compiled and
 cached by `eacp::ML::Model`, run blocking or through `encodeAsync`, with the mel
-copied in and the rows widened out across the seam. **Whisper/** — the whole
-runtime, and the greedy search the
-decoder leaves to a layer that can hold the generation config. `LiveTranscriber`
+copied in and the rows widened out across the seam — or, when the decoder is
+on Core ML too, left fp16 in its array (`rowsAt`) for the decoder to copy row
+for row, never reaching the GPU. `CoreMLDecoder` (Apple only, the same guard)
+is the decoder as two Core ML models recorded from `recordSequenceStart` and
+`recordDecoderStep`: the start projects every cross cache out of the window's
+encoder rows straight into the arrays the step reads, and a step takes one
+token, the caches and the masks as inputs and gives back the next token and
+the eight new key and value rows, which it writes into the cache arrays at the
+position. A prompt goes in a token a step. Its masked attentions are
+matmul, an additive mask, softmax and matmul by default: eacp's fused masked
+op is correct but measured 2.24 ms a step against 0.68 on the CPU.
+`CoreMLEncoderOptions::frontEnd` puts the mel on Core ML too, as a model of its
+own in front of the encoder's: samples in, the frames-major mel out, the
+context's first rows copied into a frames-major encoder input. Not one fused
+model, because Core ML allows one enumerated input and runs a flexible model
+with a fixed input beside it on the CPU (the reason is in `CoreMLEncoder.h`).
+**Whisper/** — the whole runtime, and the greedy search the
+decoder leaves to a layer that can hold the generation config. The encoder and
+the decoder each run on the kernels or on Core ML (`EncoderBackend`,
+`DecoderBackend`), chosen before `prepare()` or switched at run time
+(`switchEncoderBackend[Async]`, `switchDecoderBackend[Async]`), one switch at a
+time and none while a run is in flight; the decoder's Core ML units default to
+`cpu`, where a step measured fastest, and the suppression masks reach its
+steps as additive fp16 rows, so its tokens match the kernels'.
+`EncoderBackend::coreMLWithMel` is the encoder with the Core ML mel in front,
+and the two-argument decoder switch moves the decoder between its units at run
+time. `setNeuralEngineThroughout()` is the preset for all of it on the engine:
+`coreMLWithMel`, and the decoder on Core ML under `cpuAndNeuralEngine`, which
+builds the step with its position and argmax in the engine forms and its token
+still gathered on the CPU, the one op of a run left there on purpose (the
+token's product reads the 40 MB table a step, 1.33 ms against 1.07).
+`LiveTranscriber`
 sits above it: 16 kHz mono samples in and a growing transcript out, with the
 open segment re-run as audio arrives and closed into `committed()` on silence or
 on length. Every clock in it is audio time rather than wall time, so a run over
@@ -363,7 +431,12 @@ Three forms, and the app says which one it took before printing the transcript:
 ./build/Apps/Console/Transcribe/Transcribe recording.wav            # fetched model
 ./build/Apps/Console/Transcribe/Transcribe path/to/model recording.wav
 ./build/Apps/Console/Transcribe/Transcribe --audio-ctx=audio recording.wav   # encode only the audio there is
+./build/Apps/Console/Transcribe/Transcribe --ane recording.wav      # everything on the Neural Engine
 ```
+
+`--ane` is `Whisper::setNeuralEngineThroughout()`, and the report then splits
+the encode into the mel's prediction and the encoder's. The first `--ane` run
+on a machine compiles for the engine, about 15 s, into the app's own cache.
 
 `--audio-ctx=N|audio` is `Whisper::setAudioContext`, whisper.cpp's `audio_ctx`:
 the encoder runs over N of its 1500 positions, or over what the recording
@@ -405,12 +478,24 @@ model..." for the half second of mapping and kernel compilation. `ModelState` is
 `Session::onModelSettled` is what the `--autostart` switch hangs off, since
 "after the model loaded" is no longer a place in a function.
 
-The encoder box beside the device and channel boxes moves the encoder between
-the kernels, "GPU (Metal)", and Core ML's Neural Engine at runtime. It is
-there only where `Whisper::supportsEncoderBackend(EncoderBackend::coreML)`
-holds, and it follows the session rather than the click. The model is always
-prepared on the kernels. `--coreml` only makes Core ML the first switch.
-`Session::requestEncoderBackend` remembers the choice. The first tick with no
+The encoder and decoder boxes, on a row of their own under the device and
+channel boxes, move each half between the kernels, "GPU (Metal)", and Core ML
+at runtime — the encoder to the Neural Engine with the mel on the GPU, "Core
+ML", or with the mel on Core ML too, "Core ML + mel"; the decoder to the CPU,
+"Core ML (CPU)", or to the engine, "Core ML (engine)", a `DecoderChoice` of
+backend and units. The last of each is everything on the Neural Engine, which
+`--ane` asks for from the start. Two
+boxes rather than one of every combination, because the runtime switches the
+halves apart and so does `Session`: each box is one request, and a second row
+because the first has no room for two more boxes at the window's minimum
+width. Each is there only where its `Whisper::supports...Backend` holds, and
+each follows the session rather than the click; both grey out while either
+half switches, since the session makes one switch at a time, the encoder's
+first when both are asked for. The model is always prepared on the kernels.
+`--coreml`, `--coreml-decoder` and `--ane` only make Core ML the first switches.
+`Session::requestEncoderBackend` and `requestDecoderChoice` remember the
+choice. What follows is the encoder's switch, and the decoder's is the same
+through `switchDecoderBackendAsync(backend, units)`. The first tick with no
 run in flight begins the switch, and the tick after issues
 `Whisper::switchEncoderBackendAsync`, so the status line already says
 "compiling encoder for Core ML..." or "switching to GPU..." before anything
@@ -426,9 +511,12 @@ changes nothing.
 
 `LiveTranscriber` runs through `Whisper::transcribeAsync` on either backend.
 On the kernels that call resolves before it returns, so a run still starts and
-ends inside one tick. On Core ML it comes back on a later tick, with the
-prediction on the model's queue and the decode on the main thread, and until
-then `update()` starts nothing. A `Whisper` with a run or a switch in flight
+ends inside one tick. With the encoder on Core ML it comes back on a later
+tick, with the prediction on the model's queue and the decode on the main
+thread, and until then `update()` starts nothing. The decoder is blocking on
+either backend: on Core ML it is one prediction a token on the main thread,
+about 19 ms for jfk.wav in Release against the kernels' 9. A `Whisper` with a
+run or a switch in flight
 refuses `transcribe`, `transcribeAsync`, `setAudioContext`, `prepare` and
 another switch with a `std::logic_error`.
 
@@ -506,9 +594,19 @@ runs against MSL on Apple and HLSL on Windows.
 
 `Tests/Net` runs the encoder on Core ML against the kernels' rows under each
 compute-unit setting, and `Tests/Whisper` and the oracle run the whole runtime
-on it. Every Core ML model they compile goes to one fixed cache,
+on it. `Tests/Whisper/CoreMLDecoderTests.cpp` runs the Core ML decoder against
+the kernel decoder's logits and tokens under each setting, over the window
+and at a context only the cross mask holds to, and the whole runtime with
+either or both halves on Core ML, with the step's engine forms as well;
+`DecoderBackendTests.cpp` is the decoder's switch. `Tests/Net/CoreMLMelTests.cpp`
+holds the Core ML mel to the kernels' cell by cell over speech, full-scale
+tones, quiet noise and silence, and `CoreMLEncoderTests.cpp` the encoder run
+from samples through it; `Tests/Whisper/NeuralEngineTests.cpp` is the
+all-on-the-engine preset, its transcript, where Core ML placed its four models,
+and the switches that reach it at run time. Every Core ML model they compile
+goes to one fixed cache,
 `<temp>/whisper-eacp-tests/CoreML` (`sharedCoreMLCacheDirectory()` in
-`Tests/Model/Common.h`, handed over through `Whisper::setEncoderCacheDirectory`
+`Tests/Model/Common.h`, handed over through `Whisper::setCoreMLCacheDirectory`
 and `CoreMLEncoderOptions::cacheDirectory`), so the 13.5 s engine compile is
 paid once per machine rather than once per test binary. The macOS CI runner
 places everything on the CPU, so `Tests/Net` holds every setting to the CPU's

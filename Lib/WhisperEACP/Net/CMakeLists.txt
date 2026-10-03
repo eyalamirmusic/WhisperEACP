@@ -1,8 +1,10 @@
 add_library(whisper-net STATIC)
 
-target_link_libraries(whisper-net PUBLIC whisper-kernels whisper-model eacp-ml-graph)
+target_link_libraries(whisper-net
+        PUBLIC whisper-kernels whisper-mel whisper-model eacp-ml-graph)
 
 target_sources(whisper-net PRIVATE
+        CoreMLMel.cpp
         CoreMLNet.cpp
         KernelNet.cpp
         Net.cpp)

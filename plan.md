@@ -1883,3 +1883,184 @@ Every row a Release tree of its own, since a benchmark of a Debug build
 measures the Debug build; and a transcript compared token for token against
 both whisper.cpp columns at every step, since a faster wrong answer is not a
 result.
+
+## The decoder on Core ML, experimental
+
+eacp's phase 4 measurement said a Core ML decode step would not beat the
+Metal one on this machine, and it does not; this builds it anyway, as a
+backend a run can choose, so the GPU can be left free.
+
+### What it is
+
+`CoreMLDecoder`: two programs recorded from `recordSequenceStart` and
+`recordDecoderStep` through `CoreMLNet`'s fixed-shape mode. The KV cache
+crosses as I/O — sixteen fp16 arrays, the self caches 448 rows behind a
+`self_mask`, the cross caches 1500 behind a `cross_mask` — since eacp's
+resident-cache bound showed `MLState` (G10) would buy nothing. The step puts
+out the token (eacp's argmax, G8, over the logits plus the suppression row
+the step is given) and the eight new key and value rows, which the host
+writes into the caches with `MultiArray::copyRows`. With both halves on Core
+ML the encoder's fp16 rows are copied into the decoder's input row for row
+and never reach the GPU; only the mel does.
+
+What it surfaced in eacp, merged to develop as `259c3bee` (PR #65): G8 (`argmax`), G9
+(attention under a mask from the inputs; Core ML honours it on every device),
+and `MultiArray::copyRows` with zeroed fp16 surfaces (G13). G9 is correct but
+slower here: fused, a step took 2.24 ms on the CPU against 0.68 ms unfused,
+2.06 against 1.04 under CPU and engine, and the same on the GPU settings, so
+the decoder spells its masked attention unfused.
+
+### Measured
+
+Release, M5 Max, jfk.wav over the whole window, 20 timed runs, median; two
+passes within 1 ms of each other. The encoder is on the engine in every
+Core ML column; the decoder's units vary.
+
+| | kernels | encoder ANE, decoder Metal | decoder cpu | decoder cpuAndGPU | decoder cpuAndNeuralEngine | decoder all |
+| --- | --- | --- | --- | --- | --- | --- |
+| transcribe | 14.4-15.1 ms | 21.7-22.5 ms | 31.8-32.4 ms | 47.5-48.9 ms | 39.8-40.8 ms | 44.4-45.9 ms |
+| decode | 9.0-9.6 ms | 9.5-10.1 ms | 19.1-19.6 ms | 35.4-37.0 ms | 26.7-27.5 ms | 32.6-34.1 ms |
+| sequence start | - | - | 1.26 ms | 0.95 ms | 0.39 ms | 0.41 ms |
+| step predictions (26) | - | - | 17.3-17.8 ms | 34.0-35.4 ms | 25.8-26.7 ms | 31.6-33.0 ms |
+| per sampled step | 361-382 us | 381-405 us | 762-783 us | 1415-1479 us | 1067-1101 us | 1302-1363 us |
+| GPU utilization, `ioreg` median | 98% | 50% | 10% | | | |
+
+The transcript is the kernels' token for token in every column, and at
+`--audio-ctx=audio` (704 positions) too, where the Core ML decode is the same
+19.5 ms. The GPU's 10% under all-Core-ML is the mel, the one command buffer
+left. `cpu` is the default decoder setting because it is the fastest by a
+third; the engine's step is dearer than its compute, since both gathers sit
+on the CPU and every prediction hands over.
+
+### What is still open
+
+- Multifunction (prefill and step sharing weights) was not needed: the start
+  program holds only the eight cross projections, 2.4 MB, and the 40 MB
+  embedding is in the step alone.
+- The sequence start computes all 1500 cross rows whatever the context; an
+  enumerated start would scale with it, at the enumerated program's cost
+  (eacp's G12).
+- The prompt goes in a token a step, one prediction more than the kernels'.
+
+## Everything on the Neural Engine
+
+The mel, the encoder and the decoder on Core ML under `cpuAndNeuralEngine`,
+the GPU idle: `Whisper::setNeuralEngineThroughout()`, `Transcribe --ane`, the
+Benchmark's `EACP all ANE` column and LiveTranscribe's `--ane` or its two boxes.
+
+### What was off the engine
+
+With the encoder and the decoder both on `cpuAndNeuralEngine` and the mel a
+Metal command buffer: the encoder 90 of 90 ops on the engine, the sequence
+start 8 of 8, the step 193 of 196, its two `gather`s (token and position) and
+`reduce_argmax` on the CPU. And the mel, on the GPU.
+
+### The mel as a graph (`Net/CoreMLMel`)
+
+The samples come in a hop to a row, [3000, 160], since a [1, 480000] vector is
+past what the engine places. Frame t reads the tail of one row, two whole rows
+and the head of a fourth, so the STFT is four products of row slices against
+the matching columns of the Hann-windowed DFT basis, summed; the reflect
+padding is the few rows either side, a product against a 0/1 permutation,
+exact. Then power, the filterbank, log, the floor and Whisper's clamp. 63 ops,
+all on the engine.
+
+fp16 is the constraint: Whisper keeps eight decades below its loudest cell and
+fp16 has about nine between its smallest normal and its largest. The first
+version scaled only the samples to a peak of one and the filterbank to a
+largest row sum of one, and speech's mel peak then sat near 4e3, so eight
+decades down was under fp16's smallest normal and the padded silence clamped
+0.04 too high everywhere (mean error 0.027, the same on every device). A
+second gain, on the spectrum before the square, puts the loudest bin's power
+at 2^15, and the two gains' logs come back off before the floor. Against the
+kernels' fp32 mel on jfk.wav, on the engine: max 0.059, 99.9th percentile
+0.016, mean 0.00044. Two tones and no noise are the hard case, their far bins
+eight decades down where fp16 resolves nothing on any device (0.21 on the
+engine, 0.17 on the GPU); silence is exact. The encoder's rows from that mel
+stay inside the Core ML encoder's own bounds (engine max 0.28 / 0.25 / 0.59 at
+1500 / 576 / 448 against 0.26 / 0.21 / 1.10 from the kernels' mel).
+
+### Why two models and not one
+
+Fusing the mel into the encoder was the plan: samples in, rows out. It
+records, but runs on the CPU, every op of it. The context is the shape of the
+encoder's enumerated input, and with the samples as the input there has to be
+a second one to carry it; Core ML allows one enumerated input ("A model
+supports up to one input feature with enumerated shapes"), and a fixed input
+beside it fails the E5 runtime ("tensor_buffer has known strides while the
+model has FlexibleShapeInfo. Strides must be unknown on all dimensions"), which
+then falls back to the CPU and calls the output dynamic. Carrying the context
+in the samples' own shape instead — [3000 + 2n, 160] — needs a fixed slice of
+an enumerated axis, which `Graph::slice` refuses. Two eacp gaps, below.
+
+So the mel is a fixed-shape model of its own, frames-major out, and the
+encoder's input is frames-major too: a context's frames are the mel's first
+rows, one `MultiArray::copyRows` across. 0.5 ms for the mel's prediction, 0.07
+ms for both seam copies.
+
+### The decoder's three CPU ops
+
+Engine forms for each, in `CoreMLNet`: the position by a one-hot product
+against its 448-row table, the token by a one-hot product against the
+51864-row one (the token as two base-256 digits, since fp16 counts exactly
+only to 2048), and the argmax as reductions — the scores a radix to a row, the
+lowest row holding the maximum, that row picked out by a one-hot product, its
+lowest column holding the maximum. Exact, and a tie goes to the lowest index
+as `reduce_argmax`'s does (Tests/Whisper asserts both agree with every token
+suppressed, where fp16's step at 30000 ties the top of the vocabulary).
+
+Per sampled step, Release, jfk.wav, 40 runs, three passes:
+
+| step form | ops off the engine | per step |
+| --- | --- | --- |
+| both gathers, `reduce_argmax` | 3 | 1078-1107 us |
+| position by product, engine argmax, token gathered | 1 `gather` | 1065-1075 us |
+| every op on the engine | 0 | 1330-1338 us |
+
+The argmax and the position cost nothing on the engine; the token's product
+reads the whole 40 MB table a step, which the gather never does. So the
+default under `cpuAndNeuralEngine` keeps the token's gather on the CPU, the one
+op of a run there; the all-engine step is `CoreMLDecoderOptions` away.
+
+### Measured
+
+Release, M5 Max, jfk.wav over the whole window, 50 timed runs, median. GPU is
+`ioreg` "Device Utilization %" sampled every 0.25 s over a 600-run loop; CPU is
+user + sys per transcription, a 300-run process less a 100-run one over 200.
+
+| | kernels | encoder ANE, mel GPU, decoder Metal | encoder ANE, mel GPU, decoder Core ML cpu | all ANE | all ANE, token by product |
+| --- | --- | --- | --- | --- | --- |
+| transcribe | 14.4 ms | 21.7 ms | 32.2 ms | 38.4 ms | 45.0 ms |
+| encode | 4.96 ms | 11.83 ms | 13.03 ms | 11.60 ms | 11.60 ms |
+| mel | (in encode) | 0.41 ms, GPU | 1.73 ms, GPU | 0.52 ms, engine | 0.52 ms, engine |
+| encoder predict | - | 11.23 ms | 11.23 ms | 11.02 ms | 10.99 ms |
+| decode | 8.99 ms | 9.52 ms | 19.06 ms | 26.63 ms | 33.29 ms |
+| per step | 359 us | 381 us | 763 us | 1065 us | 1332 us |
+| GPU utilization | 98% | 65% | 8% | 0% | 0% |
+| CPU per run | 3.2 ms | 3.5 ms | 64.3 ms | 5.7 ms | 5.7 ms |
+| transcript | reference | same | same | same | same |
+
+All on the engine is the slowest of ours and the only one that leaves both the
+GPU and the CPU alone: 2.6x the kernels' wall time, about a tenth of the CPU
+the Core ML CPU decoder burns, and a GPU at 0%. Its CPU is the host's side of
+each prediction, the sample narrowing and the cache row copies. `--live` streams on it too, 7% duty at a
+0.5 s step with the pinned transcript.
+
+### What this surfaced in eacp
+
+- A Core ML program with an enumerated input and a fixed one beside it fails
+  E5RT (the fixed input's known strides) and runs on the CPU. Either eacp
+  writes a fixed input of a flexible program so E5RT takes it, or a graph
+  carries its context some other way; Core ML allows only one enumerated input.
+- `Graph::slice` refuses a fixed range, or an open-ended one, of an axis an
+  enumerated input left unknown; that is what would let one enumerated input
+  carry both the samples and the context.
+- No gather on the engine, and no dynamic `slice_by_index` begin that it
+  places: a token lookup is either the CPU's gather or a product that reads
+  the whole table.
+
+### What is still open
+
+- The fused mel-and-encoder model, behind the first two gaps.
+- The async encode from samples hops back to the main thread between the two
+  predictions for the row copy.

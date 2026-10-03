@@ -2,6 +2,8 @@
 
 #if EACP_HAS_COREML
 
+#include <WhisperEACP/Net/CoreMLMel.h>
+
 #include <array>
 #include <chrono>
 #include <stdexcept>
@@ -46,13 +48,25 @@ eacp::ML::Result CoreMLEncoder::prepare(const EncoderWeights& hostWeights,
     const auto program = record(hostWeights, options);
 
     const auto start = Clock::now();
-    const auto result = model.load(program.package, program.modelOptions);
+    auto result = model.load(program.package, program.modelOptions);
+
+    if (result.ok)
+        result = loadMel(program);
+
     loadSeconds = secondsSince(start);
 
     if (result.ok)
         adopt(program.features);
 
     return result;
+}
+
+eacp::ML::Result CoreMLEncoder::loadMel(const RecordedProgram& program)
+{
+    if (!program.melPackage)
+        return eacp::ML::Result::success();
+
+    return melModel.load(*program.melPackage, program.modelOptions);
 }
 
 eacp::Threads::Async<eacp::ML::Result>
@@ -64,9 +78,9 @@ eacp::Threads::Async<eacp::ML::Result>
     const auto promise = eacp::Threads::AsyncPromise<eacp::ML::Result> {};
     const auto start = Clock::now();
 
-    // this outlives both for encodeAsync's reason: the model is a member, and
-    // destroying it abandons the load's Async.
-    const auto loaded =
+    // this outlives both for encodeAsync's reason: the models are members,
+    // and destroying one abandons its load's Async.
+    const auto settle =
         [this, promise, features, start](const eacp::ML::Result& result)
     {
         loading = false;
@@ -78,11 +92,19 @@ eacp::Threads::Async<eacp::ML::Result>
         promise.resolve(result);
     };
 
-    const auto fail = [this, promise, start](const std::string& error)
+    const auto fail = [settle](const std::string& error)
+    { settle(eacp::ML::Result::failure(error)); };
+
+    const auto loaded = [this, settle, fail, program](const eacp::ML::Result& result)
     {
-        loading = false;
-        loadSeconds = secondsSince(start);
-        promise.resolve(eacp::ML::Result::failure(error));
+        if (!result.ok || !program.melPackage)
+        {
+            settle(result);
+            return;
+        }
+
+        melModel.loadAsync(*program.melPackage, program.modelOptions)
+            .then(settle, fail);
     };
 
     loading = true;
@@ -109,8 +131,12 @@ CoreMLEncoder::RecordedProgram
         throw ModelError {"the weights were loaded against a different encoder "
                           "shape than this encoder was built for"};
 
-    auto net = CoreMLNet {
-        positionSet, CoreMLNetOptions {options.fusedAttention, framesPerPosition}};
+    auto netOptions = CoreMLNetOptions {};
+    netOptions.fusedAttention = options.fusedAttention;
+    netOptions.framesPerPosition = framesPerPosition;
+    netOptions.framesMajorInput = options.frontEnd.has_value();
+
+    auto net = CoreMLNet {positionSet, netOptions};
 
     // The Core ML net addresses features by name and reads no buffer, so the
     // bindings carry names and nothing else.
@@ -129,9 +155,34 @@ CoreMLEncoder::RecordedProgram
     modelOptions.units = options.units;
     modelOptions.cacheDirectory = options.cacheDirectory;
 
-    return {net.build(),
-            modelOptions,
-            {net.inputNames()[0], net.outputNames()[0], options.fusedAttention}};
+    auto program = RecordedProgram {net.build(),
+                                    modelOptions,
+                                    {net.inputNames()[0],
+                                     net.outputNames()[0],
+                                     options.fusedAttention,
+                                     std::nullopt},
+                                    std::nullopt};
+
+    if (options.frontEnd)
+    {
+        const auto& frontEnd = *options.frontEnd;
+
+        if (frontEnd.shape.melCount != encoderShape.melBins
+            || frontEnd.shape.frameCount < encoderShape.inputFrames)
+            throw std::logic_error {"the Core ML front end makes a mel of another "
+                                    "shape than the encoder reads"};
+
+        const auto mel = recordLogMelProgram(frontEnd.shape, frontEnd.filterBank);
+
+        if (!mel.isValid())
+            throw ModelError {"the Core ML mel could not be recorded: "
+                              + mel.errors()[0]};
+
+        program.melPackage = mel.build();
+        program.features.melShape = frontEnd.shape;
+    }
+
+    return program;
 }
 
 void CoreMLEncoder::adopt(const ProgramFeatures& features)
@@ -139,6 +190,22 @@ void CoreMLEncoder::adopt(const ProgramFeatures& features)
     inputName = features.inputName;
     outputName = features.outputName;
     fusedAttention = features.fusedAttention;
+    computesMel = features.melShape.has_value();
+    samplesIn = {};
+    melOut = {};
+
+    if (computesMel)
+    {
+        melShape = *features.melShape;
+        samplesIn = eacp::ML::MultiArray::create(logMelInputShape(melShape),
+                                                 eacp::ML::DType::float16);
+        melOut = eacp::ML::MultiArray::create(
+            {melShape.frameCount, melShape.melCount}, eacp::ML::DType::float16);
+
+        if (!samplesIn.isValid() || !melOut.isValid())
+            throw ModelError {"Core ML could not make the mel model's arrays"};
+    }
+
     plan.reset();
     prepared = true;
 }
@@ -181,11 +248,14 @@ CoreMLEncoder::Member& CoreMLEncoder::memberFor(int positionCount)
         return *found;
     }
 
+    const auto frames = framesPerPosition * positionCount;
+    const auto inputShape = computesMel
+                                ? eacp::ML::Shape {1, frames, encoderShape.melBins}
+                                : eacp::ML::Shape {1, encoderShape.melBins, frames};
+
     auto member = Member {};
     member.positions = positionCount;
-    member.mel = eacp::ML::MultiArray::create(
-        {1, encoderShape.melBins, framesPerPosition * positionCount},
-        eacp::ML::DType::float16);
+    member.mel = eacp::ML::MultiArray::create(inputShape, eacp::ML::DType::float16);
     member.rows = eacp::ML::MultiArray::create({positionCount, encoderShape.width},
                                                eacp::ML::DType::float16);
 
@@ -199,8 +269,14 @@ CoreMLEncoder::Member& CoreMLEncoder::memberFor(int positionCount)
 
 // The first 2n frames of each band, each band a window's frames apart in the
 // buffer; the copy waits for the GPU work that wrote the mel.
-void CoreMLEncoder::fillInput(Member& member, const eacp::GPU::Buffer& mel)
+CoreMLEncoder::Member& CoreMLEncoder::filledFromMel(const eacp::GPU::Buffer& mel,
+                                                    int positionCount)
 {
+    if (computesMel)
+        throw std::logic_error {"this Core ML encoder computes its own mel, and "
+                                "is run from the samples"};
+
+    auto& member = memberFor(positionCount);
     const auto bandStride = (size_t) encoderShape.inputFrames * sizeof(float);
 
     if (mel.size() < encoderShape.melElementCount() * (int) sizeof(float))
@@ -208,6 +284,83 @@ void CoreMLEncoder::fillInput(Member& member, const eacp::GPU::Buffer& mel)
                                 "window"};
 
     member.mel.copyFrom(mel, 0, bandStride, eacp::ML::DType::float32);
+
+    return member;
+}
+
+// The samples array is the model's one, so no context may still be reading it.
+CoreMLEncoder::Member& CoreMLEncoder::filledFromSamples(Span<const float> samples,
+                                                        int positionCount)
+{
+    if (!computesMel)
+        throw std::logic_error {"this Core ML encoder reads a mel, and is run "
+                                "from the mel buffer"};
+
+    if (samples.size() != melShape.sampleCount)
+        throw std::logic_error {"a Core ML encoder with a front end reads the "
+                                "whole window, "
+                                + std::to_string(melShape.sampleCount)
+                                + " samples, and was handed "
+                                + std::to_string(samples.size())};
+
+    if (isAnyInFlight())
+        throw std::logic_error {"the Core ML encoder's mel arrays are in use by "
+                                "an encodeAsync"};
+
+    auto& member = memberFor(positionCount);
+
+    const auto start = Clock::now();
+    samplesIn.fromFloats(samples);
+    sampleCopySeconds = secondsSince(start);
+
+    return member;
+}
+
+// The mel predicted on the caller's thread and handed over.
+CoreMLEncoder::Member& CoreMLEncoder::melFromSamples(Span<const float> samples,
+                                                     int positionCount)
+{
+    auto& member = filledFromSamples(samples, positionCount);
+
+    auto inputs = eacp::ML::Inputs {};
+    inputs[samplesFeature] = samplesIn;
+
+    auto outputs = eacp::ML::Outputs {};
+    outputs[melFeature] = melOut;
+
+    const auto start = Clock::now();
+    const auto result = melModel.predict(inputs, outputs);
+    melSeconds = secondsSince(start);
+
+    if (!result.ok)
+        throw ModelError {"Core ML refused the mel's prediction: " + result.error};
+
+    copyMelInto(member);
+
+    return member;
+}
+
+// The context's frames are the first rows of the frames-major mel, so the
+// hand-over is one row copy, fp16 to fp16.
+void CoreMLEncoder::copyMelInto(Member& member)
+{
+    member.mel.copyRows(melOut, 0, 0, framesPerPosition * member.positions);
+}
+
+CoreMLEncoder::Member* CoreMLEncoder::findMember(int positionCount)
+{
+    const auto isCount = [positionCount](const Member& member)
+    { return member.positions == positionCount; };
+
+    return members.findIf(isCount);
+}
+
+eacp::ML::Inputs CoreMLEncoder::inputsFor(const Member& member) const
+{
+    auto inputs = eacp::ML::Inputs {};
+    inputs[inputName] = member.mel;
+
+    return inputs;
 }
 
 // MultiArray::copyTo copies nothing into a buffer that is too small, which
@@ -228,44 +381,149 @@ void CoreMLEncoder::encode(const eacp::GPU::Buffer& mel,
                            eacp::GPU::Buffer& rows,
                            int positionCount)
 {
-    auto& member = memberFor(positionCount);
     requireRowsFit(rows, positionCount);
-    fillInput(member, mel);
+    predictInto(filledFromMel(mel, positionCount), &rows);
+}
 
-    auto inputs = eacp::ML::Inputs {};
-    inputs[inputName] = member.mel;
-
-    auto outputs = eacp::ML::Outputs {};
-    outputs[outputName] = member.rows;
-
-    const auto start = Clock::now();
-    const auto result = model.predict(inputs, outputs);
-    predictSeconds = secondsSince(start);
-
-    if (!result.ok)
-        throw ModelError {"Core ML refused the encoder's prediction at "
-                          + std::to_string(positionCount)
-                          + " positions: " + result.error};
-
-    member.rows.copyTo(rows, eacp::ML::DType::float32);
+void CoreMLEncoder::encode(const eacp::GPU::Buffer& mel, int positionCount)
+{
+    predictInto(filledFromMel(mel, positionCount), nullptr);
 }
 
 eacp::Threads::Async<eacp::ML::Result> CoreMLEncoder::encodeAsync(
     const eacp::GPU::Buffer& mel, eacp::GPU::Buffer& rows, int positionCount)
 {
-    auto& member = memberFor(positionCount);
     requireRowsFit(rows, positionCount);
-    fillInput(member, mel);
+    return predictAsyncInto(filledFromMel(mel, positionCount), &rows);
+}
+
+eacp::Threads::Async<eacp::ML::Result>
+    CoreMLEncoder::encodeAsync(const eacp::GPU::Buffer& mel, int positionCount)
+{
+    return predictAsyncInto(filledFromMel(mel, positionCount), nullptr);
+}
+
+void CoreMLEncoder::encode(Span<const float> samples,
+                           eacp::GPU::Buffer& rows,
+                           int positionCount)
+{
+    requireRowsFit(rows, positionCount);
+    predictInto(melFromSamples(samples, positionCount), &rows);
+}
+
+void CoreMLEncoder::encode(Span<const float> samples, int positionCount)
+{
+    predictInto(melFromSamples(samples, positionCount), nullptr);
+}
+
+eacp::Threads::Async<eacp::ML::Result> CoreMLEncoder::encodeAsync(
+    Span<const float> samples, eacp::GPU::Buffer& rows, int positionCount)
+{
+    requireRowsFit(rows, positionCount);
+    return predictAsyncFromSamples(filledFromSamples(samples, positionCount), &rows);
+}
+
+eacp::Threads::Async<eacp::ML::Result>
+    CoreMLEncoder::encodeAsync(Span<const float> samples, int positionCount)
+{
+    return predictAsyncFromSamples(filledFromSamples(samples, positionCount),
+                                   nullptr);
+}
+
+// The mel on its model's queue, the hand-over on the main thread, and the
+// encoder on its own queue after it. The context is marked in flight from the
+// start, so the shared mel arrays are not touched by another encode until the
+// whole chain has settled.
+eacp::Threads::Async<eacp::ML::Result>
+    CoreMLEncoder::predictAsyncFromSamples(Member& member, eacp::GPU::Buffer* rows)
+{
+    const auto positionCount = member.positions;
+    const auto promise = eacp::Threads::AsyncPromise<eacp::ML::Result> {};
 
     auto inputs = eacp::ML::Inputs {};
-    inputs[inputName] = member.mel;
+    inputs[samplesFeature] = samplesIn;
+
+    auto outputs = eacp::ML::Outputs {};
+    outputs[melFeature] = melOut;
+
+    const auto fail = [this, promise, positionCount](const std::string& error)
+    {
+        finishAsync(positionCount);
+        promise.resolve(eacp::ML::Result::failure(error));
+    };
+
+    const auto settle = [promise](const eacp::ML::Result& result)
+    { promise.resolve(result); };
+
+    const auto settleFailure = [promise](const std::string& error)
+    { promise.resolve(eacp::ML::Result::failure(error)); };
+
+    const auto encodeMel = [this, fail, settle, settleFailure, positionCount, rows](
+                               const eacp::ML::Prediction& done)
+    {
+        melSeconds = done.predictSeconds;
+        auto* waiting = findMember(positionCount);
+
+        if (!done.ok || waiting == nullptr)
+        {
+            fail(done.error);
+            return;
+        }
+
+        copyMelInto(*waiting);
+        predictAsyncInto(*waiting, rows).then(settle, settleFailure);
+    };
+
+    member.inFlight = true;
+    melModel.predictAsync(inputs, outputs).then(encodeMel, fail);
+
+    return promise.get();
+}
+
+const eacp::ML::MultiArray& CoreMLEncoder::rowsAt(int positionCount) const
+{
+    const auto isCount = [positionCount](const Member& member)
+    { return member.positions == positionCount; };
+
+    const auto* found = members.findIf(isCount);
+
+    if (found == nullptr || found->inFlight)
+        throw std::logic_error {"the Core ML encoder has no finished rows at "
+                                + std::to_string(positionCount) + " positions"};
+
+    return found->rows;
+}
+
+void CoreMLEncoder::predictInto(Member& member, eacp::GPU::Buffer* rows)
+{
+    auto outputs = eacp::ML::Outputs {};
+    outputs[outputName] = member.rows;
+
+    const auto start = Clock::now();
+    const auto result = model.predict(inputsFor(member), outputs);
+    predictSeconds = secondsSince(start);
+
+    if (!result.ok)
+        throw ModelError {"Core ML refused the encoder's prediction at "
+                          + std::to_string(member.positions)
+                          + " positions: " + result.error};
+
+    if (rows != nullptr)
+        member.rows.copyTo(*rows, eacp::ML::DType::float32);
+}
+
+eacp::Threads::Async<eacp::ML::Result>
+    CoreMLEncoder::predictAsyncInto(Member& member, eacp::GPU::Buffer* rows)
+{
+    const auto positionCount = member.positions;
+    const auto inputs = inputsFor(member);
 
     auto outputs = eacp::ML::Outputs {};
     outputs[outputName] = member.rows;
 
     const auto promise = eacp::Threads::AsyncPromise<eacp::ML::Result> {};
     const auto output = member.rows;
-    auto* target = &rows;
+    auto* target = rows;
 
     // this outlives both: the model is a member, and destroying it abandons
     // the prediction's Async, so neither runs after the encoder is gone.
@@ -275,7 +533,7 @@ eacp::Threads::Async<eacp::ML::Result> CoreMLEncoder::encodeAsync(
         predictSeconds = done.predictSeconds;
         finishAsync(positionCount);
 
-        if (done.ok)
+        if (done.ok && target != nullptr)
             output.copyTo(*target, eacp::ML::DType::float32);
 
         promise.resolve(eacp::ML::Result {done.ok, done.error});

@@ -59,6 +59,7 @@ constexpr auto buildType = WHISPER_EACP_BUILD_TYPE;
 constexpr auto usage =
     "usage: Benchmark [runs] [wav file] [--audio-ctx=positions|audio]\n"
     "                 [--units=all|cpuAndNeuralEngine|cpuAndGPU|cpu] [--plan]\n"
+    "                 [--coreml-decoder=units[,units...]] [--only=column]\n"
     "       Benchmark --live [seconds] [gap seconds] [wav file] [--step=seconds]\n"
     "                 [--audio-ctx=audio] [--units=...]\n"
     "\n"
@@ -75,6 +76,18 @@ constexpr auto usage =
     "              the engine; under all Core ML puts the encoder on the GPU\n"
     "  --plan      print where Core ML placed the encoder's ops. Reading the\n"
     "              plan costs the Neural Engine compile again, about 14 s\n"
+    "  --coreml-decoder=units[,units...]\n"
+    "              one more column per entry, EACP ML dec <units>, with both\n"
+    "              halves on Core ML: the encoder under --units and the\n"
+    "              decoder under these, cpu the runtime's default\n"
+    "  --only=column\n"
+    "              time that column alone, by its heading - \"EACP ML dec cpu\"\n"
+    "              - and none of whisper.cpp's: for watching one configuration\n"
+    "              from outside, the GPU's utilization for one\n"
+    "\n"
+    "  EACP all ANE, the last of ours, runs wherever the other Core ML columns\n"
+    "  do: the mel, the encoder and the decoder on Core ML under\n"
+    "  cpuAndNeuralEngine, whatever --units says\n"
     "\n"
     "  --live      every contestant through LiveTranscriber, one after another,\n"
     "              streamed at real time: the recording on repeat with a gap of\n"
@@ -126,9 +139,16 @@ struct Run
     double melSeconds = 0.0;
     double predictSeconds = 0.0;
     bool hasEncoderSplit = false;
+    double sequenceStartSeconds = 0.0;
+    double stepPredictSeconds = 0.0;
+    bool hasDecoderSplit = false;
     int steps = 0;
     WSP::Vector<int> tokens;
 };
+
+// The column with the mel, the encoder and the decoder all on Core ML under
+// cpuAndNeuralEngine, Whisper::setNeuralEngineThroughout().
+constexpr auto allOnTheEngineColumn = "EACP all ANE";
 
 class Contestant
 {
@@ -198,20 +218,47 @@ bool canRunTheEncoderOnCoreML()
     return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML);
 }
 
+bool canRunTheDecoderOnCoreML()
+{
+    return WSP::Whisper::supportsDecoderBackend(WSP::DecoderBackend::coreML);
+}
+
+const char* shortNameOf(WSP::DecoderComputeUnits units)
+{
+    switch (units)
+    {
+        case WSP::DecoderComputeUnits::all:
+            return "all";
+        case WSP::DecoderComputeUnits::cpuAndNeuralEngine:
+            return "ane";
+        case WSP::DecoderComputeUnits::cpuAndGPU:
+            return "gpu";
+        case WSP::DecoderComputeUnits::cpu:
+            return "cpu";
+    }
+
+    return "?";
+}
+
 // The kernel column prepares the encoder on the GPU; the ANE column records,
 // compiles (or finds in the cache) and loads the Core ML one, with the decoder
-// on the GPU either way.
+// on the GPU. The ML columns put the decoder on Core ML too, one column per
+// set of decoder units asked for.
 class OurRuntime final : public Contestant
 {
 public:
     OurRuntime(int audioContext,
                WSP::EncoderBackend backendToUse = WSP::EncoderBackend::kernels,
                WSP::EncoderComputeUnits unitsToUse =
-                   WSP::EncoderComputeUnits::cpuAndNeuralEngine)
+                   WSP::EncoderComputeUnits::cpuAndNeuralEngine,
+               WSP::DecoderBackend decoderToUse = WSP::DecoderBackend::kernels,
+               WSP::DecoderComputeUnits decoderUnits = WSP::DecoderComputeUnits::cpu)
     {
         whisper.load(WSP::ModelFetch::directory());
         whisper.setEncoderBackend(backendToUse);
         whisper.setEncoderComputeUnits(unitsToUse);
+        whisper.setDecoderBackend(decoderToUse);
+        whisper.setDecoderComputeUnits(decoderUnits);
 
         const auto start = Clock::now();
         whisper.prepare();
@@ -227,12 +274,29 @@ public:
         if (!usesCoreML())
             return "WhisperEACP on " + gpu;
 
-        return std::string {"WhisperEACP, encoder on Core ML ("}
-               + nameOf(whisper.encoderComputeUnits()) + "), decoder on " + gpu;
+        if (whisper.isOnNeuralEngineThroughout())
+            return "WhisperEACP, mel, encoder and decoder on Core ML "
+                   "(cpuAndNeuralEngine)";
+
+        const auto encoder = std::string {"WhisperEACP, encoder on Core ML ("}
+                             + nameOf(whisper.encoderComputeUnits()) + ")";
+
+        if (!decodesOnCoreML())
+            return encoder + ", decoder on " + gpu;
+
+        return encoder + ", decoder on Core ML ("
+               + nameOf(whisper.decoderComputeUnits()) + ")";
     }
 
     std::string column() const override
     {
+        if (whisper.isOnNeuralEngineThroughout())
+            return allOnTheEngineColumn;
+
+        if (decodesOnCoreML())
+            return std::string {"EACP ML dec "}
+                   + shortNameOf(whisper.decoderComputeUnits());
+
         return usesCoreML() ? "WhisperEACP ANE" : "WhisperEACP";
     }
 
@@ -269,9 +333,11 @@ public:
     }
 
     bool packsWeights() const { return whisper.packsWeights(); }
-    bool usesCoreML() const
+    bool usesCoreML() const { return WSP::isOnCoreML(whisper.encoderBackend()); }
+
+    bool decodesOnCoreML() const
     {
-        return whisper.encoderBackend() == WSP::EncoderBackend::coreML;
+        return whisper.decoderBackend() == WSP::DecoderBackend::coreML;
     }
 
     WSP::Whisper& runtime() { return whisper; }
@@ -288,6 +354,9 @@ private:
         run.melSeconds = whisper.lastEncoderMelSeconds();
         run.predictSeconds = whisper.lastEncoderPredictSeconds();
         run.hasEncoderSplit = usesCoreML();
+        run.sequenceStartSeconds = whisper.lastSequenceStartSeconds();
+        run.stepPredictSeconds = whisper.lastDecoderPredictSeconds();
+        run.hasDecoderSplit = decodesOnCoreML();
         run.steps = whisper.lastStepCount();
 
         return run;
@@ -470,6 +539,9 @@ struct Summary
     double predictMedian = 0.0;
     double seamMedian = 0.0;
     bool hasEncoderSplit = false;
+    double sequenceStartMedian = 0.0;
+    double stepPredictMedian = 0.0;
+    bool hasDecoderSplit = false;
     int steps = 0;
     WSP::Vector<int> tokens;
     std::string text;
@@ -506,10 +578,15 @@ Summary benchmark(Contestant& contestant, WSP::Span<const float> samples, int ru
     auto mel = std::vector<double> {};
     auto predict = std::vector<double> {};
     auto seam = std::vector<double> {};
+    auto sequenceStart = std::vector<double> {};
+    auto stepPredict = std::vector<double> {};
 
     for (auto index = 0; index < runs; ++index)
     {
         const auto run = contestant.transcribe(samples);
+        sequenceStart.push_back(run.sequenceStartSeconds);
+        stepPredict.push_back(run.stepPredictSeconds);
+        summary.hasDecoderSplit = run.hasDecoderSplit;
         wall.push_back(run.wallSeconds);
         encode.push_back(run.encodeSeconds);
         decode.push_back(run.decodeSeconds);
@@ -527,6 +604,8 @@ Summary benchmark(Contestant& contestant, WSP::Span<const float> samples, int ru
     summary.melMedian = median(mel);
     summary.predictMedian = median(predict);
     summary.seamMedian = median(seam);
+    summary.sequenceStartMedian = median(sequenceStart);
+    summary.stepPredictMedian = median(stepPredict);
 
     return summary;
 }
@@ -625,13 +704,26 @@ void printTable(const std::vector<Summary>& summaries)
         { return s.hasEncoderSplit ? milliseconds(s.*field) : std::string {"-"}; };
     };
 
-    printRow("  mel on the GPU, median", summaries, splitCell(&Summary::melMedian));
+    printRow("  mel, median", summaries, splitCell(&Summary::melMedian));
     printRow("  predict, median", summaries, splitCell(&Summary::predictMedian));
     printRow("  seam copies, median", summaries, splitCell(&Summary::seamMedian));
 
     printRow("decode, median",
              summaries,
              [](const Summary& s) { return milliseconds(s.decodeMedian); });
+
+    const auto decoderCell = [](double Summary::* field)
+    {
+        return [field](const Summary& s)
+        { return s.hasDecoderSplit ? milliseconds(s.*field) : std::string {"-"}; };
+    };
+
+    printRow("  sequence start, median",
+             summaries,
+             decoderCell(&Summary::sequenceStartMedian));
+    printRow("  step predictions, median",
+             summaries,
+             decoderCell(&Summary::stepPredictMedian));
 
     printRow("decode per step, median",
              summaries,
@@ -668,6 +760,11 @@ void printTable(const std::vector<Summary>& summaries)
                 "idle through the predict\n  wherever the plan (--plan) puts "
                 "the encoder on the engine; the seam copies\n  are the encode "
                 "less the other two, per run.\n");
+    std::printf("  For %s the mel is a Core ML model of its own, on the "
+                "engine, and the seam\n  is the samples narrowed into its array "
+                "and the context's frames copied into the\n  encoder's: the "
+                "encode puts nothing on the GPU.\n",
+                allOnTheEngineColumn);
 }
 
 void printBackends()
@@ -701,15 +798,41 @@ void printBuildType()
                             "tree for the real ones");
 }
 
-void printPlan(OurRuntime& contestant)
+#if EACP_HAS_COREML
+template <typename ReadPlan>
+void printPlan(const char* model, ReadPlan readPlan)
+{
+    const auto start = Clock::now();
+    const auto plan = readPlan();
+
+    std::printf("    %s, read in %.1f s\n%s",
+                model,
+                secondsSince(start),
+                WSP::describePlacement(plan, "      ").c_str());
+}
+#endif
+
+// Every Core ML model the column runs: the encoder's, and the decoder's two.
+void printPlans(OurRuntime& contestant)
 {
 #if EACP_HAS_COREML
-    const auto start = Clock::now();
-    const auto& plan = contestant.runtime().encoderComputePlan();
+    auto& whisper = contestant.runtime();
 
-    std::printf("  plan, read in %.1f s\n%s",
-                secondsSince(start),
-                WSP::describePlacement(plan, "    ").c_str());
+    std::printf("  plans for %s\n", contestant.column().c_str());
+
+    if (whisper.encoderBackend() == WSP::EncoderBackend::coreMLWithMel)
+        printPlan("mel", [&whisper] { return whisper.melComputePlan(); });
+
+    if (contestant.usesCoreML())
+        printPlan("encoder", [&whisper] { return whisper.encoderComputePlan(); });
+
+    if (!contestant.decodesOnCoreML())
+        return;
+
+    printPlan("decoder sequence start",
+              [&whisper] { return whisper.sequenceStartComputePlan(); });
+    printPlan("decoder step",
+              [&whisper] { return whisper.decoderStepComputePlan(); });
 #else
     (void) contestant;
 #endif
@@ -732,14 +855,37 @@ struct Request
     // The Core ML contestant's compute units, and whether to read its plan.
     WSP::EncoderComputeUnits units = WSP::EncoderComputeUnits::cpuAndNeuralEngine;
     bool readsPlan = false;
+
+    // One more contestant per entry, both halves on Core ML, the decoder
+    // under these units; and the one column to run, when only one is wanted.
+    std::vector<WSP::DecoderComputeUnits> decoderUnits;
+    std::string only;
+};
+
+// Our runtime on the kernels, ours with the encoder on Core ML where this build
+// and OS can, then whisper.cpp on its GPU backend if this build has one, then
+// whisper.cpp without one. Each loaded once, and the audio context they start
+// on is the one the mode asked for. The two of ours are kept by name as well,
+// since what they packed their weights as, and what the Core ML one compiled
+// for and how long it took to load, are part of what the header says ran.
+struct Contestants
+{
+    std::vector<std::unique_ptr<Contestant>> all;
+    OurRuntime* ours = nullptr;
+    OurRuntime* onCoreML = nullptr;
+
+    // Every one of ours with either half on Core ML, whose plans --plan reads.
+    std::vector<OurRuntime*> withCoreML;
 };
 
 // What the ANE column ran on: the units it was compiled for, whether the load
 // found the compile in the cache, and how long the load and the whole prepare
 // took; and the plan only when asked for, since reading it is another engine
 // compile.
-void printCoreMLContestant(OurRuntime* contestant, const Request& request)
+void printCoreMLContestant(const Contestants& contestants, const Request& request)
 {
+    auto* contestant = contestants.onCoreML;
+
     if (contestant == nullptr)
     {
         std::printf("  WhisperEACP ANE not run: this build or this OS cannot run "
@@ -756,11 +902,16 @@ void printCoreMLContestant(OurRuntime* contestant, const Request& request)
                 whisper.encoderWasCacheHit() ? "cache hit" : "compiled",
                 contestant->lastPrepareSeconds());
 
-    if (request.readsPlan)
-        printPlan(*contestant);
-    else
-        std::printf("  plan not read: --plan reads it, about 14 s on the "
-                    "engine\n");
+    if (!request.readsPlan)
+    {
+        std::printf("  plans not read: --plan reads them, about 14 s each on "
+                    "the engine\n");
+        return;
+    }
+
+    for (auto* withCoreML: contestants.withCoreML)
+        if (request.only.empty() || withCoreML->column() == request.only)
+            printPlans(*withCoreML);
 }
 
 bool parseNumber(const std::string& text, double& value)
@@ -783,11 +934,39 @@ bool parse(const WSP::Vector<std::string>& arguments, Request& request)
     constexpr auto audioContextFlag = std::string_view {"--audio-ctx="};
     constexpr auto unitsFlag = std::string_view {"--units="};
     constexpr auto stepFlag = std::string_view {"--step="};
+    constexpr auto decoderFlag = std::string_view {"--coreml-decoder="};
+    constexpr auto onlyFlag = std::string_view {"--only="};
 
     for (auto index = 1; index < arguments.size(); ++index)
     {
         const auto& argument = arguments[index];
         auto value = 0.0;
+
+        if (std::string_view {argument}.starts_with(onlyFlag))
+        {
+            request.only = argument.substr(onlyFlag.size());
+            continue;
+        }
+
+        if (std::string_view {argument}.starts_with(decoderFlag))
+        {
+            auto list = std::string_view {argument}.substr(decoderFlag.size());
+
+            while (!list.empty())
+            {
+                const auto comma = list.find(',');
+                auto units = WSP::DecoderComputeUnits::cpu;
+
+                if (!parseUnits(list.substr(0, comma), units))
+                    return false;
+
+                request.decoderUnits.push_back(units);
+                list = comma == std::string_view::npos ? std::string_view {}
+                                                       : list.substr(comma + 1);
+            }
+
+            continue;
+        }
 
         if (std::string_view {argument}.starts_with(unitsFlag))
         {
@@ -1157,34 +1336,32 @@ void printLivePolicy(const WSP::LiveOptions& options, int positions)
                     "side\n");
 }
 
-// Our runtime on the kernels, ours with the encoder on Core ML where this build
-// and OS can, then whisper.cpp on its GPU backend if this build has one, then
-// whisper.cpp without one. Each loaded once, and the audio context they start
-// on is the one the mode asked for. The two of ours are kept by name as well,
-// since what they packed their weights as, and what the Core ML one compiled
-// for and how long it took to load, are part of what the header says ran.
-struct Contestants
+OurRuntime* addOurRuntime(
+    Contestants& contestants,
+    int audioContext,
+    WSP::EncoderBackend backend,
+    WSP::EncoderComputeUnits units,
+    WSP::DecoderBackend decoder = WSP::DecoderBackend::kernels,
+    WSP::DecoderComputeUnits decoderUnits = WSP::DecoderComputeUnits::cpu)
 {
-    std::vector<std::unique_ptr<Contestant>> all;
-    OurRuntime* ours = nullptr;
-    OurRuntime* onCoreML = nullptr;
-};
-
-OurRuntime* addOurRuntime(Contestants& contestants,
-                          int audioContext,
-                          WSP::EncoderBackend backend,
-                          WSP::EncoderComputeUnits units)
-{
-    auto runtime = std::make_unique<OurRuntime>(audioContext, backend, units);
+    auto runtime = std::make_unique<OurRuntime>(
+        audioContext, backend, units, decoder, decoderUnits);
     auto* added = runtime.get();
     contestants.all.push_back(std::move(runtime));
+
+    if (added->usesCoreML() || added->decodesOnCoreML())
+        contestants.withCoreML.push_back(added);
 
     return added;
 }
 
-// Loaded before the header, for the reason above.
-Contestants makeOurContestants(int audioContext, WSP::EncoderComputeUnits units)
+// Loaded before the header, for the reason above. The kernels' column is the
+// transcript reference and is always made; --only drops the rest from the run
+// but the one named.
+Contestants makeOurContestants(int audioContext, const Request& request)
 {
+    const auto units = request.units;
+
     auto contestants = Contestants {};
     contestants.ours = addOurRuntime(
         contestants, audioContext, WSP::EncoderBackend::kernels, units);
@@ -1193,11 +1370,46 @@ Contestants makeOurContestants(int audioContext, WSP::EncoderComputeUnits units)
         contestants.onCoreML = addOurRuntime(
             contestants, audioContext, WSP::EncoderBackend::coreML, units);
 
+    if (!canRunTheEncoderOnCoreML() || !canRunTheDecoderOnCoreML())
+        return contestants;
+
+    for (auto decoderUnits: request.decoderUnits)
+        addOurRuntime(contestants,
+                      audioContext,
+                      WSP::EncoderBackend::coreML,
+                      units,
+                      WSP::DecoderBackend::coreML,
+                      decoderUnits);
+
+    addOurRuntime(contestants,
+                  audioContext,
+                  WSP::EncoderBackend::coreMLWithMel,
+                  WSP::EncoderComputeUnits::cpuAndNeuralEngine,
+                  WSP::DecoderBackend::coreML,
+                  WSP::DecoderComputeUnits::cpuAndNeuralEngine);
+
     return contestants;
 }
 
-void addWhisperCppContestants(Contestants& contestants, int audioContext)
+void keepOnly(Contestants& contestants, const std::string& column)
 {
+    if (column.empty())
+        return;
+
+    auto& all = contestants.all;
+    const auto isOther = [&column](const std::unique_ptr<Contestant>& contestant)
+    { return contestant->column() != column; };
+
+    all.erase(std::remove_if(all.begin(), all.end(), isOther), all.end());
+}
+
+void addWhisperCppContestants(Contestants& contestants,
+                              int audioContext,
+                              const Request& request)
+{
+    if (!request.only.empty())
+        return;
+
     auto& all = contestants.all;
 
     if (const auto gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU))
@@ -1225,7 +1437,7 @@ void runLive(const Request& request)
     const auto positions =
         options.encodeOnlyTheAudioThereIs ? 0 : request.audioContext;
 
-    auto contestants = makeOurContestants(positions, request.units);
+    auto contestants = makeOurContestants(positions, request);
 
     std::printf("WhisperEACP live benchmark\n");
     std::printf("  audio %s: %.1f s, on repeat with a %.1f s silence gap\n",
@@ -1245,10 +1457,11 @@ void runLive(const Request& request)
     printLivePolicy(options, positions);
     printBuildType();
     printBackends();
-    printCoreMLContestant(contestants.onCoreML, request);
+    printCoreMLContestant(contestants, request);
     std::printf("\n");
 
-    addWhisperCppContestants(contestants, positions);
+    addWhisperCppContestants(contestants, positions, request);
+    keepOnly(contestants, request.only);
     auto summaries = std::vector<LiveSummary> {};
 
     for (auto& contestant: contestants.all)
@@ -1277,7 +1490,7 @@ void run(const Request& request)
                   (int) std::lround(audioSeconds * WSP::sampleRate))
             : request.audioContext;
 
-    auto contestants = makeOurContestants(audioContext, request.units);
+    auto contestants = makeOurContestants(audioContext, request);
 
     std::printf("WhisperEACP benchmark\n");
     std::printf("  audio %s: %.1f s, zero-filled to the %d s window on both "
@@ -1300,10 +1513,11 @@ void run(const Request& request)
                                         .c_str());
     printBuildType();
     printBackends();
-    printCoreMLContestant(contestants.onCoreML, request);
+    printCoreMLContestant(contestants, request);
     std::printf("\n");
 
-    addWhisperCppContestants(contestants, audioContext);
+    addWhisperCppContestants(contestants, audioContext, request);
+    keepOnly(contestants, request.only);
     auto summaries = std::vector<Summary> {};
 
     for (auto& contestant: contestants.all)

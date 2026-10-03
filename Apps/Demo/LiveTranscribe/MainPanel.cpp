@@ -70,8 +70,12 @@ MainRoot::MainRoot(Session& sessionToUse)
     title.setFontSize(15.f);
     status.setJustification(UI::Justification::Right);
 
-    for (auto* label:
-         {&status, &inputCaption, &channelCaption, &backendCaption, &footer})
+    for (auto* label: {&status,
+                       &inputCaption,
+                       &channelCaption,
+                       &backendCaption,
+                       &decoderCaption,
+                       &footer})
     {
         label->setColour(UI::defaultTheme().dimText);
         label->setFontSize(smallText);
@@ -84,10 +88,12 @@ MainRoot::MainRoot(Session& sessionToUse)
     transcriptScroll.setContent(transcript);
 
     fillBackendBox();
+    fillDecoderBox();
     wireControls();
 
     addChildren({title, status, inputCaption, deviceBox});
     addChildren({channelCaption, channelBox, backendCaption, backendBox});
+    addChildren({decoderCaption, decoderBox});
     addChildren({startButton, clearButton});
     addChildren({meter, transcriptScroll, footer, errorLine});
 }
@@ -101,7 +107,10 @@ void MainRoot::fillBackendBox()
     backendValues.add(WSP::EncoderBackend::kernels);
 
     if (Session::canUseCoreML())
+    {
         backendValues.add(WSP::EncoderBackend::coreML);
+        backendValues.add(WSP::EncoderBackend::coreMLWithMel);
+    }
 
     for (auto backend: backendValues)
         backendBox.addItem(backendName(backend));
@@ -111,6 +120,34 @@ void MainRoot::fillBackendBox()
     backendCaption.setVisible(offersAChoice);
 
     applyBackendBoxState();
+}
+
+void MainRoot::fillDecoderBox()
+{
+    decoderValues.clear();
+    decoderBox.clear();
+
+    decoderValues.add(DecoderChoice {});
+
+    if (Session::canDecodeOnCoreML())
+    {
+        decoderValues.add(decoderOnTheCpu);
+        decoderValues.add(decoderOnTheEngine);
+    }
+
+    for (const auto& choice: decoderValues)
+        decoderBox.addItem(backendName(choice));
+
+    const auto offersAChoice = decoderValues.size() > 1;
+    decoderBox.setVisible(offersAChoice);
+    decoderCaption.setVisible(offersAChoice);
+
+    applyDecoderBoxState();
+}
+
+bool MainRoot::hasBackendRow() const
+{
+    return backendBox.isVisible() || decoderBox.isVisible();
 }
 
 void MainRoot::wireControls()
@@ -126,6 +163,7 @@ void MainRoot::wireControls()
     deviceBox.onChange = [this](int index) { applyDeviceSelection(index); };
     channelBox.onChange = [this](int index) { applyChannelSelection(index); };
     backendBox.onChange = [this](int index) { applyBackendSelection(index); };
+    decoderBox.onChange = [this](int index) { applyDecoderSelection(index); };
 }
 
 void MainRoot::refresh(bool rebuildDevices)
@@ -137,6 +175,7 @@ void MainRoot::refresh(bool rebuildDevices)
 
     applyStartButtonState();
     applyBackendBoxState();
+    applyDecoderBoxState();
 
     setLabelText(status, statusText());
     setLabelText(footer, footerText());
@@ -227,6 +266,39 @@ void MainRoot::applyBackendSelection(int index)
     refresh(false);
 }
 
+void MainRoot::applyDecoderBoxState()
+{
+    const auto available = !session.isSwitchingBackend();
+
+    if (available != decoderBoxIsAvailable)
+    {
+        decoderBoxIsAvailable = available;
+        decoderBox.setAccentColour(available ? UI::defaultTheme().accent
+                                             : UI::defaultTheme().outline);
+    }
+
+    if (decoderBox.isPopupOpen())
+        return;
+
+    const auto wanted = session.wantedDecoderChoice();
+    const auto isWanted = [wanted](const DecoderChoice& choice)
+    { return choice == wanted; };
+
+    auto* found = decoderValues.findIf(isWanted);
+    const auto index = found != nullptr ? (int) (found - decoderValues.data()) : 0;
+
+    if (decoderBox.getSelectedIndex() != index)
+        decoderBox.setSelectedIndex(index);
+}
+
+void MainRoot::applyDecoderSelection(int index)
+{
+    if (index >= 0 && index < decoderValues.size() && !session.isSwitchingBackend())
+        session.requestDecoderChoice(decoderValues[index]);
+
+    refresh(false);
+}
+
 void MainRoot::toggleCapture()
 {
     if (!canCapture())
@@ -291,7 +363,8 @@ std::string MainRoot::statusText() const
     }
 
     const auto loaded = "model ready in " + secondsText(session.loadSeconds());
-    const auto encoder = "encoder " + backendName(session.encoderBackend());
+    const auto encoder = "encoder " + backendName(session.encoderBackend())
+                         + "   decoder " + backendName(session.decoderChoice());
     const auto stream = session.capture().status();
 
     if (!stream.running)
@@ -337,18 +410,30 @@ void MainRoot::resized()
     startButton.setBounds(controls.removeFromRight(80.f));
     controls.removeFromRight(14.f);
 
-    if (backendBox.isVisible())
-    {
-        backendBox.setBounds(controls.removeFromRight(120.f));
-        backendCaption.setBounds(controls.removeFromRight(52.f));
-        controls.removeFromRight(12.f);
-    }
-
     inputCaption.setBounds(controls.removeFromLeft(40.f));
     deviceBox.setBounds(controls.removeFromLeft(controls.w * 0.55f));
     controls.removeFromLeft(12.f);
     channelCaption.setBounds(controls.removeFromLeft(56.f));
     channelBox.setBounds(controls);
+
+    if (hasBackendRow())
+    {
+        area.removeFromTop(8.f);
+        auto backends = area.removeFromTop(rowHeight);
+
+        if (backendBox.isVisible())
+        {
+            backendCaption.setBounds(backends.removeFromLeft(52.f));
+            backendBox.setBounds(backends.removeFromLeft(130.f));
+            backends.removeFromLeft(20.f);
+        }
+
+        if (decoderBox.isVisible())
+        {
+            decoderCaption.setBounds(backends.removeFromLeft(52.f));
+            decoderBox.setBounds(backends.removeFromLeft(130.f));
+        }
+    }
 
     area.removeFromTop(10.f);
     meter.setBounds(area.removeFromTop(meterHeight));

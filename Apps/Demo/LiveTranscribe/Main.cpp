@@ -23,7 +23,8 @@ namespace LiveTranscribe
 namespace
 {
 constexpr auto usage =
-    "usage: LiveTranscribe [--autostart] [--coreml] [model directory]\n"
+    "usage: LiveTranscribe [--autostart] [--coreml] [--coreml-decoder] [--ane]\n"
+    "                      [model directory]\n"
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
     "                   preprocessor_config.json, model.safetensors and\n"
@@ -36,7 +37,12 @@ constexpr auto usage =
     "                   than the GPU kernels, where the machine can; the encoder\n"
     "                   box switches between the two at any time. The first\n"
     "                   switch on a machine compiles it for the engine, about\n"
-    "                   14 s, with the window live throughout.\n";
+    "                   14 s, with the window live throughout.\n"
+    "  --coreml-decoder start with the decoder on Core ML (the CPU) rather than\n"
+    "                   the GPU kernels; the decoder box switches it too.\n"
+    "  --ane            start with everything on the Neural Engine: the encoder\n"
+    "                   box on \"Core ML + mel\" and the decoder box on\n"
+    "                   \"Core ML (engine)\", which leave the GPU idle.\n";
 
 constexpr auto ticksPerSecond = 30;
 constexpr auto ticksBetweenDeviceScans = ticksPerSecond * 5;
@@ -46,6 +52,8 @@ struct Arguments
     std::string modelDirectory;
     bool autostart = false;
     bool coreML = false;
+    bool coreMLDecoder = false;
+    bool allOnTheEngine = false;
     bool understood = true;
 };
 
@@ -61,6 +69,10 @@ Arguments parseArguments(int argc, char* argv[])
             arguments.autostart = true;
         else if (argument == "--coreml")
             arguments.coreML = true;
+        else if (argument == "--coreml-decoder")
+            arguments.coreMLDecoder = true;
+        else if (argument == "--ane")
+            arguments.allOnTheEngine = true;
         else if (arguments.modelDirectory.empty() && !argument.starts_with("--"))
             arguments.modelDirectory = argv[i];
         else
@@ -159,13 +171,14 @@ struct App
         const auto level = session.capture().level();
         const auto live = session.liveStats();
 
-        std::printf("%5.1fs  %-9s  %-11s  %d Hz  block %d  blocks %lld  "
+        std::printf("%5.1fs  %-9s  %-13s  %-16s  %d Hz  block %d  blocks %lld  "
                     "peak %.4f  rms %.4f  runs %d  pending %.1fs  %s\n",
                     (double) ticks / ticksPerSecond,
                     session.isCapturing() ? "capturing" : "idle",
                     session.isSwitchingBackend()
                         ? "switching"
                         : backendName(session.encoderBackend()).c_str(),
+                    backendName(session.decoderChoice()).c_str(),
                     stream.sampleRate,
                     stream.blockSize,
                     stream.blocks,
@@ -178,7 +191,10 @@ struct App
         std::fflush(stdout);
     }
 
-    Session session {arguments.modelDirectory, arguments.coreML};
+    Session session {arguments.modelDirectory,
+                     arguments.coreML,
+                     arguments.coreMLDecoder,
+                     arguments.allOnTheEngine};
 
     MainPanel panel {session};
     eacp::Graphics::Window window {makeWindowOptions()};

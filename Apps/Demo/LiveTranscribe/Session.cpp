@@ -17,18 +17,61 @@ double secondsSince(std::chrono::steady_clock::time_point start)
 }
 } // namespace
 
-std::string backendName(WSP::EncoderBackend backend)
+bool DecoderChoice::operator==(const DecoderChoice& other) const
 {
-    return backend == WSP::EncoderBackend::coreML ? "Core ML" : "GPU (Metal)";
+    return backend == other.backend
+           && (backend == WSP::DecoderBackend::kernels || units == other.units);
 }
 
-Session::Session(std::string modelDirectoryToUse, bool encoderOnCoreML)
+std::string backendName(WSP::EncoderBackend backend)
+{
+    switch (backend)
+    {
+        case WSP::EncoderBackend::kernels:
+            return "GPU (Metal)";
+        case WSP::EncoderBackend::coreML:
+            return "Core ML";
+        case WSP::EncoderBackend::coreMLWithMel:
+            return "Core ML + mel";
+    }
+
+    return "?";
+}
+
+std::string backendName(const DecoderChoice& choice)
+{
+    if (choice.backend == WSP::DecoderBackend::kernels)
+        return "GPU (Metal)";
+
+    return choice.units == WSP::DecoderComputeUnits::cpuAndNeuralEngine
+               ? "Core ML (engine)"
+               : "Core ML (CPU)";
+}
+
+Session::Session(std::string modelDirectoryToUse,
+                 bool encoderOnCoreML,
+                 bool decoderOnCoreML,
+                 bool allOnTheEngine)
     : modelDirectory(std::move(modelDirectoryToUse))
 {
     message = "loading model...";
 
     if (encoderOnCoreML)
         requestedBackend = WSP::EncoderBackend::coreML;
+
+    if (decoderOnCoreML)
+        requestedDecoder = decoderOnTheCpu;
+
+    if (allOnTheEngine)
+    {
+        requestedBackend = WSP::EncoderBackend::coreMLWithMel;
+        requestedDecoder = decoderOnTheEngine;
+    }
+}
+
+DecoderChoice Session::decoderChoice() const
+{
+    return {whisper.decoderBackend(), whisper.decoderComputeUnits()};
 }
 
 // A directory on the command line is already on disk; anything else is the
@@ -198,15 +241,28 @@ bool Session::hasModel() const
 
 WSP::EncoderBackend Session::wantedEncoderBackend() const
 {
-    if (modelState == ModelState::SwitchingBackend)
+    if (modelState == ModelState::SwitchingBackend && switchingHalf == Half::encoder)
         return switchTarget;
 
     return requestedBackend.value_or(whisper.encoderBackend());
 }
 
+DecoderChoice Session::wantedDecoderChoice() const
+{
+    if (modelState == ModelState::SwitchingBackend && switchingHalf == Half::decoder)
+        return decoderTarget;
+
+    return requestedDecoder.value_or(decoderChoice());
+}
+
 bool Session::canUseCoreML()
 {
     return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML);
+}
+
+bool Session::canDecodeOnCoreML()
+{
+    return WSP::Whisper::supportsDecoderBackend(WSP::DecoderBackend::coreML);
 }
 
 void Session::requestEncoderBackend(WSP::EncoderBackend backend)
@@ -217,6 +273,14 @@ void Session::requestEncoderBackend(WSP::EncoderBackend backend)
     requestedBackend = backend;
 }
 
+void Session::requestDecoderChoice(const DecoderChoice& choice)
+{
+    if (modelState == ModelState::SwitchingBackend)
+        return;
+
+    requestedDecoder = choice;
+}
+
 bool Session::isSwitchingBackend() const
 {
     return modelState == ModelState::SwitchingBackend;
@@ -224,7 +288,7 @@ bool Session::isSwitchingBackend() const
 
 bool Session::hasSwitchWaiting() const
 {
-    return requestedBackend.has_value()
+    return requestedBackend.has_value() || requestedDecoder.has_value()
            || modelState == ModelState::SwitchingBackend;
 }
 
@@ -253,29 +317,53 @@ bool Session::advanceSwitch()
     return false;
 }
 
+// The encoder's request first; a decoder request waits for the tick after.
 void Session::beginSwitch()
 {
-    switchTarget = *std::exchange(requestedBackend, std::nullopt);
+    if (requestedBackend.has_value())
+    {
+        switchingHalf = Half::encoder;
+        switchTarget = *std::exchange(requestedBackend, std::nullopt);
 
-    if (switchTarget == whisper.encoderBackend())
-        return;
+        if (switchTarget == whisper.encoderBackend())
+            return;
+    }
+    else
+    {
+        switchingHalf = Half::decoder;
+        decoderTarget = *std::exchange(requestedDecoder, std::nullopt);
+
+        if (decoderTarget == decoderChoice())
+            return;
+    }
+
+    const auto toCoreML = switchingHalf == Half::encoder
+                              ? WSP::isOnCoreML(switchTarget)
+                              : decoderTarget.backend == WSP::DecoderBackend::coreML;
+    const auto half = switchingHalf == Half::encoder ? "encoder" : "decoder";
 
     modelState = ModelState::SwitchingBackend;
     switchIssued = false;
-    message = switchTarget == WSP::EncoderBackend::coreML
-                  ? "compiling encoder for Core ML..."
-                  : "switching to GPU...";
+    message = toCoreML ? std::string {"compiling "} + half + " for Core ML..."
+                       : std::string {"switching "} + half + " to GPU...";
 }
 
 void Session::issueSwitch()
 {
     switchIssued = true;
 
+    const auto settled = [this] { finishSwitch({}); };
+    const auto failed = [this](const std::string& error) { finishSwitch(error); };
+
     try
     {
-        whisper.switchEncoderBackendAsync(switchTarget)
-            .then([this] { finishSwitch({}); },
-                  [this](const std::string& error) { finishSwitch(error); });
+        if (switchingHalf == Half::encoder)
+            whisper.switchEncoderBackendAsync(switchTarget).then(settled, failed);
+        else
+            whisper
+                .switchDecoderBackendAsync(decoderTarget.backend,
+                                           decoderTarget.units)
+                .then(settled, failed);
     }
     catch (const std::exception& failure)
     {
@@ -283,19 +371,27 @@ void Session::issueSwitch()
     }
 }
 
+std::string Session::halfDescription(std::string_view where) const
+{
+    if (switchingHalf == Half::encoder)
+        return "encoder " + std::string {where} + " "
+               + backendName(whisper.encoderBackend());
+
+    return "decoder " + std::string {where} + " " + backendName(decoderChoice());
+}
+
 void Session::finishSwitch(const std::string& error)
 {
     modelState = ModelState::Ready;
     switchSettled = true;
-    message = "encoder on " + backendName(whisper.encoderBackend());
+    message = halfDescription("on");
 
     if (error.empty())
         errorText.clear();
     else
-        errorText = "the encoder stayed on " + backendName(whisper.encoderBackend())
-                    + ": " + error;
+        errorText = "the " + halfDescription("stayed on") + ": " + error;
 
-    if (std::exchange(flushWhenSwitched, false))
+    if (!hasSwitchWaiting() && std::exchange(flushWhenSwitched, false))
         flushTranscriber();
 }
 

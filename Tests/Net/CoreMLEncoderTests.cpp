@@ -86,13 +86,12 @@ const char* nameOf(ComputeUnits units)
     return "?";
 }
 
-// jfk.wav through the kernel front end, zero-filled to the window as Whisper
-// does: an encoder's error on speech, not on a synthetic sinusoid. The
-// synthetic mel stands in where the sample is missing.
-Vector<float> windowMel(const EncoderShape& shape)
+// jfk.wav zero-filled to the window as Whisper does, or nothing where the
+// sample is missing.
+Vector<float> jfkWindow()
 {
     if (!hasSampleFile(jfkSample))
-        return syntheticMel(shape);
+        return {};
 
     const auto recording = readWavFile(sampleFile(jfkSample));
     auto samples = sized(windowSamples);
@@ -100,8 +99,27 @@ Vector<float> windowMel(const EncoderShape& shape)
     for (auto index = 0; index < recording.size() && index < windowSamples; ++index)
         samples[index] = recording[index];
 
-    const auto preprocessor =
+    return samples;
+}
+
+const PreprocessorConfig& preprocessor()
+{
+    static const auto config =
         PreprocessorConfig::fromFile(modelFile("preprocessor_config.json"));
+    return config;
+}
+
+// That window through the kernel front end: an encoder's error on speech, not
+// on a synthetic sinusoid. The synthetic mel stands in where the sample is
+// missing.
+Vector<float> windowMel(const EncoderShape& shape)
+{
+    const auto samples = jfkWindow();
+
+    if (samples.empty())
+        return syntheticMel(shape);
+
+    const auto& preprocessor = ::preprocessor();
     const auto filterBank = preprocessor.makeMelFilterBuffer();
 
     auto frontEnd = MelSpectrogram {};
@@ -187,6 +205,36 @@ CoreMLEncoder& coreMLEncoder(ComputeUnits units)
               << (encoder->usesFusedAttention() ? ", fused attention"
                                                 : ", unfused attention")
               << "\n";
+
+    return *encoders.emplace(units, std::move(encoder)).first->second;
+}
+
+// The same encoder with the mel on Core ML in front of it, run from samples.
+CoreMLEncoder& frontEndEncoder(ComputeUnits units)
+{
+    static auto encoders = std::map<ComputeUnits, std::unique_ptr<CoreMLEncoder>> {};
+
+    if (auto found = encoders.find(units); found != encoders.end())
+        return *found->second;
+
+    auto& model = tinyEn();
+    auto encoder = std::make_unique<CoreMLEncoder>(model.shape, audioContextSpan());
+
+    auto options = CoreMLEncoderOptions {};
+    options.units = units;
+    options.cacheDirectory = sharedCoreMLCacheDirectory();
+    options.frontEnd = CoreMLFrontEnd {MelShape {}, preprocessor().melFilters};
+
+    const auto loaded = encoder->prepare(model.hostWeights, options);
+    check(loaded.ok);
+    check(encoder->includesMel());
+
+    if (!loaded.ok)
+        std::cout << "  " << nameOf(units) << ": " << loaded.error << "\n";
+
+    std::cout << "  " << nameOf(units) << " with the mel: loaded in "
+              << encoder->lastLoadSeconds() * 1000.0 << " ms, "
+              << (encoder->wasCacheHit() ? "cache hit" : "compiled") << "\n";
 
     return *encoders.emplace(units, std::move(encoder)).first->second;
 }
@@ -302,6 +350,20 @@ Tolerance toleranceFor(ComputeUnits units)
     return isAneRequired() ? ownToleranceFor(units) : cpuTolerance;
 }
 
+// The encoder run from samples through the Core ML mel, against the kernels'
+// rows from the kernels' mel, holds to the same bounds: the mel's fp16 adds
+// little to the encoder's own. Measured on the same machine at 1500 / 576 /
+// 448:
+//
+//   engine:  max 0.28 / 0.25 / 0.59, 99.9% 0.060 / 0.083 / 0.082,
+//            mean 0.0076 / 0.0097 / 0.0096
+//   CPU:     max 0.40 / 0.25 / 4.8, 99.9% 0.14 / 0.064 / 0.13,
+//            mean 0.018 / 0.010 / 0.011
+Tolerance frontEndToleranceFor(ComputeUnits units)
+{
+    return toleranceFor(units);
+}
+
 // Max abs per depth, 0 to 4 layers, final norm included, at about three
 // times the worst of 1500 and 448 positions: engine 0.064 / 0.15 / 0.21 /
 // 0.24 / 0.26, GPU 0.0069 / 0.024 / 0.031 / 0.023 / 0.031. The full depth
@@ -371,6 +433,50 @@ void compareAtEachContext(ComputeUnits units)
     }
 }
 
+Encoded encodeFromSamples(CoreMLEncoder& encoder, int context)
+{
+    auto& model = tinyEn();
+    auto rows = outputFor(model.shape.elementCount());
+    const auto samples = jfkWindow();
+
+    const auto start = Clock::now();
+    encoder.encode(samples, rows, context);
+    const auto elapsed = millisecondsSince(start);
+
+    return {readBack(rows, context * model.shape.width),
+            elapsed,
+            encoder.lastPredictSeconds() * 1000.0};
+}
+
+// The rows out of the Core ML mel against the kernels' out of the kernels'
+// mel: the encoder's own error and the mel's fp16 together.
+void compareFromSamplesAtEachContext(ComputeUnits units)
+{
+    auto& encoder = frontEndEncoder(units);
+
+    if (!encoder.isPrepared())
+        return;
+
+    for (auto context: {1500, 576, 448})
+    {
+        const auto first = encodeFromSamples(encoder, context);
+        const auto warm = encodeFromSamples(encoder, context);
+        const auto& expected = kernelRows(context);
+
+        check(warm.rows.size() == expected.size());
+
+        const auto measured = agreement(warm.rows, expected);
+
+        std::cout << "  " << nameOf(units) << " with the mel at " << context << ": "
+                  << measured << "; encode " << warm.encodeMilliseconds
+                  << " ms warm (mel " << encoder.lastMelPredictSeconds() * 1000.0
+                  << " ms, encoder " << warm.predictMilliseconds << " ms)\n";
+
+        checkWithin(measured, frontEndToleranceFor(units));
+        check(agreement(first.rows, warm.rows).maxAbs <= repeatBoundFor(units));
+    }
+}
+
 bool isEncoderOp(const std::string& type)
 {
     return type == "linear" || type == "conv" || type == "layer_norm"
@@ -403,6 +509,101 @@ auto tMatchesKernelsOnTheCPU =
         return;
 
     compareAtEachContext(ComputeUnits::cpu);
+};
+
+auto tFrontEndMatchesKernelsOnTheEngine =
+    test("Net/CoreML/withTheMelMatchesTheKernelsOnTheEngine") = []
+{
+    if (canRun() && hasSampleFile(jfkSample))
+        compareFromSamplesAtEachContext(ComputeUnits::cpuAndNeuralEngine);
+};
+
+auto tFrontEndMatchesKernelsOnTheCPU =
+    test("Net/CoreML/withTheMelMatchesTheKernelsOnTheCPU") = []
+{
+    if (canRun() && hasSampleFile(jfkSample))
+        compareFromSamplesAtEachContext(ComputeUnits::cpu);
+};
+
+// The chain on the queues: the mel, the hop back for the row copy, the
+// encoder; resolved on the main thread with the blocking chain's rows.
+auto tFrontEndAsyncMatchesBlocking =
+    test("Net/CoreML/withTheMelEncodeAsyncMatchesEncode") = []
+{
+    if (!canRun() || !hasSampleFile(jfkSample))
+        return;
+
+    auto& encoder = frontEndEncoder(ComputeUnits::cpuAndNeuralEngine);
+
+    if (!encoder.isPrepared())
+        return;
+
+    constexpr auto context = 576;
+    auto& model = tinyEn();
+    const auto blocking = encodeFromSamples(encoder, context);
+    const auto samples = jfkWindow();
+
+    auto rows = outputFor(model.shape.elementCount());
+    auto otherRows = outputFor(model.shape.elementCount());
+    auto resolvedOnMain = false;
+
+    const auto noteThread = [&resolvedOnMain](const eacp::ML::Result&)
+    { resolvedOnMain = eacp::Threads::isMainThread(); };
+
+    auto pending = encoder.encodeAsync(samples, rows, context);
+    pending.then(noteThread);
+
+    // The mel's arrays are the model's one pair, so every other encode waits.
+    check(throwsLogicError([&] { encoder.encode(samples, otherRows, 448); }));
+    check(throwsLogicError([&] { encoder.encodeAsync(samples, otherRows, 448); }));
+
+    const auto result = pending.waitFor(eacp::Time::MS {30000});
+    check(result.ok);
+    check(resolvedOnMain);
+    check(encoder.lastMelPredictSeconds() > 0.0);
+
+    check(
+        agreement(readBack(rows, context * model.shape.width), blocking.rows).maxAbs
+        <= repeatBoundFor(ComputeUnits::cpuAndNeuralEngine));
+};
+
+// An encoder with the mel reads samples and nothing else, and one without
+// reads a mel and nothing else; a window of any other length is refused.
+auto tFrontEndRefusesTheOtherInput =
+    test("Net/CoreML/withTheMelRefusesTheOtherInput") = []
+{
+    if (!canRun() || !hasSampleFile(jfkSample))
+        return;
+
+    auto& withMel = frontEndEncoder(ComputeUnits::cpuAndNeuralEngine);
+    auto& withoutMel = coreMLEncoder(ComputeUnits::cpuAndNeuralEngine);
+    auto& model = tinyEn();
+    auto rows = outputFor(model.shape.elementCount());
+    const auto samples = jfkWindow();
+    const auto shortWindow = sized(windowSamples - 160);
+
+    check(!withoutMel.includesMel());
+    check(throwsLogicError([&] { withMel.encode(model.melBuffer, rows, 448); }));
+    check(throwsLogicError([&] { withoutMel.encode(samples, rows, 448); }));
+    check(throwsLogicError([&] { withMel.encode(shortWindow, rows, 448); }));
+};
+
+auto tFrontEndPlacedOnTheEngine =
+    test("Net/CoreML/withTheMelIsPlacedOnTheEngine") = []
+{
+    if (!isAneRequired() || !canRun() || !hasSampleFile(jfkSample))
+        return;
+
+    auto& encoder = frontEndEncoder(ComputeUnits::cpuAndNeuralEngine);
+    const auto melPlan = encoder.melComputePlan();
+    const auto& encoderPlan = encoder.computePlan();
+
+    std::cout << "  mel\n"
+              << describePlacement(melPlan, "    ") << "  encoder\n"
+              << describePlacement(encoderPlan, "    ");
+
+    check(melPlan.allOn(eacp::ML::ComputePlan::Device::neuralEngine));
+    check(encoderPlan.allOn(eacp::ML::ComputePlan::Device::neuralEngine));
 };
 
 // The error per stage, since layer norm is where an fp16 encoder drifts
