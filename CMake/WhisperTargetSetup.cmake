@@ -22,7 +22,8 @@ function(whisper_set_default_warnings_level target)
 endfunction()
 
 # The bundle plists come from eacp rather than from a copy here: an app of ours
-# is an eacp app, and CMake/Findeacp.cmake points these at eacp's own templates.
+# is an eacp app, and eacp's TargetSetup publishes EACP_MACOS_PLIST and
+# EACP_IOS_PLIST when it is included, top-level project or not.
 function(whisper_set_default_target_setting target)
     whisper_set_default_warnings_level(${target})
 

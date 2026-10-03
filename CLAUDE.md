@@ -520,13 +520,13 @@ run or a switch in flight
 refuses `transcribe`, `transcribeAsync`, `setAudioContext`, `prepare` and
 another switch with a `std::logic_error`.
 
-Two build-side requirements. The bundle needs an `Info.plist.in` of its own
-carrying `NSMicrophoneUsageDescription` — set **after**
-`whisper_set_default_target_setting`, which points every bundle here at eacp's
-stock template — since macOS blocks a capture app that asks for the microphone
-without one, and blocks it by hanging inside CoreAudio on the thread that asked.
-And `Apps/CMakeLists.txt` adds the tree behind `if (TARGET eacp-ui)`, eacp
-building its widget tier only where it has a Metal or D3D12 backend.
+Two build-side requirements. The bundle's plist needs
+`NSMicrophoneUsageDescription`, since macOS blocks a capture app that asks for
+the microphone without one, and blocks it by hanging inside CoreAudio on the
+thread that asked; `eacp_add_plist_entries` adds it to eacp's template, so
+there is no copy of the plist here. And `Apps/CMakeLists.txt` adds the tree
+behind `if (TARGET eacp-ui)`, eacp building its widget tier only where it has
+a Metal or D3D12 backend.
 
 ## Correctness validation
 

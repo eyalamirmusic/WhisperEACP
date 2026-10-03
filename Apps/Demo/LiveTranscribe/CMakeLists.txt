@@ -20,15 +20,11 @@ set_target_properties(LiveTranscribe PROPERTIES
 eacp_set_gui_subsystem(LiveTranscribe)
 whisper_set_default_target_setting(LiveTranscribe)
 
-# After the defaults, which point every bundle here at eacp's stock plist.
-# Opening the capture side needs NSMicrophoneUsageDescription, which neither
-# eacp's template nor CMake's default carries, and macOS kills an app that asks
-# for the microphone without one. MakeASound's own probe app has the same file
-# for the same reason.
-if (APPLE)
-    set_target_properties(LiveTranscribe PROPERTIES MACOSX_BUNDLE_INFO_PLIST
-            "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist.in")
-endif ()
+# Opening the capture side needs NSMicrophoneUsageDescription, which eacp's
+# template does not carry, and macOS kills an app that asks for the microphone
+# without one.
+eacp_add_plist_entries(LiveTranscribe NSMicrophoneUsageDescription
+        "Live Transcribe reads the microphone to transcribe what it hears.")
 
 # Nothing is copied into Contents/Resources: the four model files are fetched at
 # startup (Model/ModelFetch.h) into a directory every binary in this tree shares,

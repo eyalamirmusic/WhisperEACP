@@ -19,22 +19,6 @@ CPMAddPackage(
 # modules stay reachable by name from this project's CMakeLists.
 list(APPEND CMAKE_MODULE_PATH "${eacp_SOURCE_DIR}/CMake")
 
-# eacp fills these in from eacp_default_setup(), which only runs when eacp is
-# the top-level project. Here it is a subproject, so point the bundle templates
-# at its own copies — without them every .app falls back to CMake's default
-# Info.plist.
-if (APPLE AND eacp_SOURCE_DIR)
-    if (IOS)
-        set(EACP_IOS_PLIST
-                "${eacp_SOURCE_DIR}/CMake/iOSBundleInfo.plist.in"
-                CACHE INTERNAL "")
-    else ()
-        set(EACP_MACOS_PLIST
-                "${eacp_SOURCE_DIR}/CMake/macOSBundleInfo.plist.in"
-                CACHE INTERNAL "")
-    endif ()
-endif ()
-
 # develop rather than main: main trails it, and the compute layer this project
 # is written against moves on develop first. The fetch is the default and the
 # configuration CI and every ordinary build use — nothing here points at a
