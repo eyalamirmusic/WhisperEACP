@@ -203,8 +203,13 @@ CoreMLDecoder::Programs CoreMLDecoder::record(const DecoderWeights& hostWeights,
     if (!options.keepsLogits)
         netOptions.omittedOutputs.add(logitsFeature);
 
+    const auto embedsPromptByProduct = options.embedsTokenByProduct
+                                       || options.embedsPositionByProduct
+                                       || options.selectsOnTheEngine;
+
     auto startOptions = netOptions;
     startOptions.opensSequence = true;
+    startOptions.embedsTokenByProduct = embedsPromptByProduct;
 
     auto startNet = CoreMLNet {startOptions};
     auto startCaches = makeCaches(startNet, decoderShape);
@@ -254,6 +259,7 @@ CoreMLDecoder::Programs CoreMLDecoder::record(const DecoderWeights& hostWeights,
             options.fusedAttention,
             options.keepsLogits,
             options.embedsTokenByProduct,
+            embedsPromptByProduct,
             options.embedsPositionByProduct,
             options.selectsOnTheEngine,
             options.promptLength};
@@ -273,6 +279,7 @@ void CoreMLDecoder::adopt(const Programs& programs)
     fusedAttention = programs.fusedAttention;
     keepsLogits = programs.keepsLogits;
     embedsTokenByProduct = programs.embedsTokenByProduct;
+    embedsPromptByProduct = programs.embedsPromptByProduct;
     embedsPositionByProduct = programs.embedsPositionByProduct;
     selectsOnTheEngine = programs.selectsOnTheEngine;
     openingTokens = programs.promptLength;
@@ -285,15 +292,15 @@ void CoreMLDecoder::adopt(const Programs& programs)
     promptRows.clear();
     appendedRows.clear();
 
-    const auto makeTokens = [&](int count)
+    const auto makeTokens = [&](int count, bool asDigits)
     {
-        return embedsTokenByProduct ? makeArray({count, 2}, half)
-                                    : makeArray({count}, DType::int32);
+        return asDigits ? makeArray({count, 2}, half)
+                        : makeArray({count}, DType::int32);
     };
 
     encoderRows = makeArray({decoderShape.crossPositions, width}, half);
-    promptIn = makeTokens(openingTokens);
-    tokenIn = makeTokens(1);
+    promptIn = makeTokens(openingTokens, embedsPromptByProduct);
+    tokenIn = makeTokens(1, embedsTokenByProduct);
     positionIn = embedsPositionByProduct ? makeArray({1, 1}, half)
                                          : makeArray({1}, DType::int32);
     selfMask = makeArray({1, decoderShape.maxPositions}, half);
@@ -301,11 +308,11 @@ void CoreMLDecoder::adopt(const Programs& programs)
     nextToken =
         selectsOnTheEngine ? makeArray({1, 2}, half) : makeArray({1}, DType::int32);
 
-    const auto tokenFeature =
-        embedsTokenByProduct ? CoreMLNet::tokenDigitsFeature : tokensFeature;
+    const auto tokenFeatureFor = [](bool asDigits)
+    { return asDigits ? CoreMLNet::tokenDigitsFeature : tokensFeature; };
 
     startInputs[encoderRowsFeature] = encoderRows;
-    startInputs[tokenFeature] = promptIn;
+    startInputs[tokenFeatureFor(embedsPromptByProduct)] = promptIn;
     startInputs[CoreMLNet::crossMaskFeature] = crossMask;
     startOutputs[selection.token] = nextToken;
 
@@ -327,7 +334,7 @@ void CoreMLDecoder::adopt(const Programs& programs)
         stepOutputs[CoreMLNet::appendedRowsFeature(cache)] = appendedRows.back();
     }
 
-    stepInputs[tokenFeature] = tokenIn;
+    stepInputs[tokenFeatureFor(embedsTokenByProduct)] = tokenIn;
     stepInputs[CoreMLNet::positionFeature] = positionIn;
     stepInputs[CoreMLNet::selfMaskFeature] = selfMask;
     stepInputs[CoreMLNet::crossMaskFeature] = crossMask;
@@ -412,7 +419,8 @@ int CoreMLDecoder::beginSequence(const eacp::ML::MultiArray& rows,
 }
 
 void CoreMLDecoder::writeTokens(eacp::ML::MultiArray& array,
-                                Span<const int> tokens) const
+                                Span<const int> tokens,
+                                bool asDigits) const
 {
     constexpr auto radix = CoreMLNet::tokenRadix;
 
@@ -420,7 +428,7 @@ void CoreMLDecoder::writeTokens(eacp::ML::MultiArray& array,
 
     for (auto token: tokens)
     {
-        if (embedsTokenByProduct)
+        if (asDigits)
         {
             values.add((float) (token / radix));
             values.add((float) (token % radix));
@@ -469,7 +477,7 @@ int CoreMLDecoder::openSequence(int crossPositionCount,
 
     crossMask.fromFloats(crossAllowed);
 
-    writeTokens(promptIn, prompt);
+    writeTokens(promptIn, prompt, embedsPromptByProduct);
     startInputs[CoreMLSelection {}.suppression] = suppression;
     sequenceOpen = false;
 
@@ -511,7 +519,7 @@ int CoreMLDecoder::step(int token, const eacp::ML::MultiArray& suppression)
                           + " positions this decoder was built for"};
 
     const auto positionValue = (float) decodedPositions;
-    writeTokens(tokenIn, {&token, 1});
+    writeTokens(tokenIn, {&token, 1}, embedsTokenByProduct);
     positionIn.fromFloats({&positionValue, 1});
     stepInputs[CoreMLSelection {}.suppression] = suppression;
 

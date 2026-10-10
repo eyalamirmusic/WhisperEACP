@@ -42,7 +42,9 @@ struct CoreMLDecoderOptions
     // embedsPositionByProduct, CoreMLSelection::onTheEngine): the three ops
     // Core ML otherwise places on the CPU, so with all three the step is the
     // engine's alone under cpuAndNeuralEngine. All off by default, the
-    // decoder's default units being the CPU's.
+    // decoder's default units being the CPU's. The sequence start embeds its
+    // prompt by the product whenever any of the three is on: once a run, so
+    // nothing of the start is left on the CPU.
     bool embedsTokenByProduct = false;
     bool embedsPositionByProduct = false;
     bool selectsOnTheEngine = false;
@@ -164,6 +166,7 @@ private:
         bool fusedAttention = false;
         bool keepsLogits = false;
         bool embedsTokenByProduct = false;
+        bool embedsPromptByProduct = false;
         bool embedsPositionByProduct = false;
         bool selectsOnTheEngine = false;
         int promptLength = 1;
@@ -177,7 +180,9 @@ private:
     int openSequence(int crossPositionCount,
                      Span<const int> prompt,
                      const eacp::ML::MultiArray& suppression);
-    void writeTokens(eacp::ML::MultiArray& array, Span<const int> tokens) const;
+    void writeTokens(eacp::ML::MultiArray& array,
+                     Span<const int> tokens,
+                     bool asDigits) const;
     int chosenToken() const;
 
     DecoderShape decoderShape;
@@ -190,6 +195,7 @@ private:
     bool fusedAttention = false;
     bool keepsLogits = false;
     bool embedsTokenByProduct = false;
+    bool embedsPromptByProduct = false;
     bool embedsPositionByProduct = false;
     bool selectsOnTheEngine = false;
     int openingTokens = 1;

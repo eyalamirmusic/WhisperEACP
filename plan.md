@@ -133,3 +133,21 @@ at every step; a faster wrong answer is not a result.
   alone, so the refusal they drive is tested here by replacing them
   (`CoreMLPlatform`); eacp's own `Model::load` refusal has no such seam and
   is untested on a macOS 27 machine with an engine.
+- Two Core ML CPU-path miscomputations on an M4 Max, macOS 27.0.1 (BNNS,
+  not eacp's MIL, which is a plain `matmul` and `reduce_max`), each worked
+  around in the graph rather than tolerated, and worth a probe in eacp's
+  `MLTests` so the next OS is caught:
+  - `matmul(constant [m, k], input [n, k], transpose_y)` is wrong for most
+    rows once m and n are both large (402 x 3000 x 40: rows 32 to 383 off by
+    up to 15 against values of 10; 33 or 64 rows/columns come out right), and
+    Core ML folds `transpose(matmul(input, constant^T))` into that form. Every
+    other placement of the constant and the transposes is right. It put the
+    Core ML mel off by 1.5 to 2.0 under `cpu`; `CoreMLMel` now records
+    `matmul(frames, basis)` frames major, and no longer offers band major.
+  - `reduce_max` across the last axis of the engine argmax's [203, 256] grid
+    gives `max(row, 0)`, so with every token suppressed every row read 0 and
+    the token came out 2048; it depends on the rest of the program (a cut-down
+    one reproduces it only with the one-hot product beside it). Down axis 0
+    of the transposed grid it is right, and the step's median under
+    `cpuAndNeuralEngine` is unchanged (1.77 / 1.81 ms before, 1.56 / 1.79
+    after, Debug).

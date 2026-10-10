@@ -159,36 +159,36 @@ GraphTensor paddedRows(Graph& graph, GraphTensor rows, const Framing& at)
     return graph.concat(parts, 0);
 }
 
-// The Hann-windowed DFT over taps [first, end), [2 * bins, end - first]: the
-// real parts of every bin in the first bins rows, the imaginary in the rest.
+// The Hann-windowed DFT over taps [first, end), [end - first, 2 * bins]: the
+// real parts of every bin in the first bins columns, the imaginary in the rest.
 Vector<float> windowedBasis(const MelShape& shape, int first, int end)
 {
     const auto bins = shape.binCount();
     const auto length = shape.fftLength;
-    const auto width = end - first;
     const auto window = periodicHannWindow(length);
 
     auto basis = Vector<float> {};
-    basis.resize(2 * bins * width, 0.0f);
+    basis.resize(2 * bins * (end - first), 0.0f);
 
-    for (auto bin = 0; bin < bins; ++bin)
+    for (auto tap = first; tap < end; ++tap)
     {
-        for (auto tap = first; tap < end; ++tap)
+        const auto row = (tap - first) * 2 * bins;
+
+        for (auto bin = 0; bin < bins; ++bin)
         {
             const auto turns = (double) ((bin * tap) % length) / (double) length;
             const auto angle = 2.0 * std::numbers::pi * turns;
             const auto weight = (double) window[tap];
 
-            basis[bin * width + tap - first] = (float) (weight * std::cos(angle));
-            basis[(bins + bin) * width + tap - first] =
-                (float) (-weight * std::sin(angle));
+            basis[row + bin] = (float) (weight * std::cos(angle));
+            basis[row + bins + bin] = (float) (-weight * std::sin(angle));
         }
     }
 
     return basis;
 }
 
-// [2 * bins, frames]: every frame's spectrum, one product per row a frame
+// [frames, 2 * bins]: every frame's spectrum, one product per row a frame
 // reads, summed.
 GraphTensor spectrum(Graph& graph,
                      GraphTensor padded,
@@ -209,10 +209,10 @@ GraphTensor spectrum(Graph& graph,
 
         const auto values = windowedBasis(shape, first, end);
         const auto basis = graph.halfConstant("mel_basis_" + std::to_string(row),
-                                              {2 * shape.binCount(), end - first},
+                                              {end - first, 2 * shape.binCount()},
                                               values);
 
-        const auto product = graph.matmul(basis, frameRows, false, true);
+        const auto product = graph.matmul(frameRows, basis);
         total = row == 0 ? product : graph.apply(total, product, plus);
     }
 
@@ -253,9 +253,7 @@ Graph recordLogMelProgram(const MelShape& shape, Span<const float> filterBank)
     const auto samples = graph.input(
         samplesFeature, logMelInputShape(shape), eacp::ML::DType::float16);
 
-    graph.output(
-        recordLogMel(graph, samples, shape, filterBank, MelLayout::framesMajor),
-        melFeature);
+    graph.output(recordLogMel(graph, samples, shape, filterBank), melFeature);
 
     return graph;
 }
@@ -263,8 +261,7 @@ Graph recordLogMelProgram(const MelShape& shape, Span<const float> filterBank)
 GraphTensor recordLogMel(Graph& graph,
                          GraphTensor samples,
                          const MelShape& shape,
-                         Span<const float> filterBank,
-                         MelLayout layout)
+                         Span<const float> filterBank)
 {
     requireFrameable(shape, filterBank);
 
@@ -281,8 +278,8 @@ GraphTensor recordLogMel(Graph& graph,
 
     const auto frames = spectrum(graph, paddedRows(graph, scaled, at), shape, at);
 
-    const auto real = graph.slice(frames, {0, 0}, {bins, at.frames});
-    const auto imaginary = graph.slice(frames, {bins, 0}, {2 * bins, at.frames});
+    const auto real = graph.slice(frames, {0, 0}, {at.frames, bins});
+    const auto imaginary = graph.slice(frames, {0, bins}, {at.frames, 2 * bins});
 
     const auto squared = [](const Float& re, const Float& im)
     { return re * re + im * im; };
@@ -307,15 +304,16 @@ GraphTensor recordLogMel(Graph& graph,
 
     const auto filterScale = 1.0f / largestRowSum(filterBank, shape);
     auto scaledFilters = Vector<float> {};
+    scaledFilters.resize(filterBank.size(), 0.0f);
 
-    for (auto value: filterBank)
-        scaledFilters.add(value * filterScale);
+    for (auto band = 0; band < shape.melCount; ++band)
+        for (auto bin = 0; bin < bins; ++bin)
+            scaledFilters[bin * shape.melCount + band] =
+                filterBank[band * bins + bin] * filterScale;
 
     const auto filters =
-        graph.halfConstant("mel_filters", {shape.melCount, bins}, scaledFilters);
-    const auto mel = layout == MelLayout::bandMajor
-                         ? graph.matmul(filters, power)
-                         : graph.matmul(power, filters, true, true);
+        graph.halfConstant("mel_filters", {bins, shape.melCount}, scaledFilters);
+    const auto mel = graph.matmul(power, filters);
 
     const auto logMel = graph.apply(
         mel, [](const Float& m) { return log(max(smallestHalf, m)) * log10OfE; });

@@ -342,8 +342,8 @@ Tolerance ownToleranceFor(ComputeUnits units)
     return {};
 }
 
-// The macOS CI runner has no Neural Engine and places every op on the CPU
-// under every setting, so a setting is held to its own device's bound only
+// A machine with no Neural Engine, eacp's macOS CI runner among them, places
+// every op on the CPU under every setting, so a setting is held to its own device's bound only
 // under EACP_REQUIRE_ANE=1, as eacp's MLTests do; otherwise to the CPU's.
 Tolerance toleranceFor(ComputeUnits units)
 {

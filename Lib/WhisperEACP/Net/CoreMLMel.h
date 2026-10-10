@@ -15,17 +15,21 @@ namespace WSP
 // [sampleCount / hopLength, hopLength] fp16: one hop to a row, which keeps
 // every axis of every tensor inside what the engine will place, where a
 // [1, 480000] vector would not be. The output is the normalised mel,
-// [melCount, frameCount] band major, the [bands, frames] a convolution reads,
-// or [frameCount, melCount] frames major, where a context's frames are the
-// first rows and so one MultiArray::copyRows away from an encoder's input.
+// [frameCount, melCount] frames major, where a context's frames are the first
+// rows and so one MultiArray::copyRows away from an encoder's input.
 //
 // The STFT is a product rather than a gather. Frame t is centred on sample
 // hop * t, so it reads the tail of one row, whole rows, and the head of a
-// last one; the product of the hop rows against the columns of the
-// Hann-windowed DFT basis those taps meet, one product per row offset, summed,
-// is every frame's spectrum at once. The reflect padding is the few rows
-// before the first and after the last, made by a product of the edge rows
-// against a permutation, exact in any precision.
+// last one; the product of the hop rows against the rows of the Hann-windowed
+// DFT basis those taps meet, one product per row offset, summed, is every
+// frame's spectrum at once. The reflect padding is the few rows before the
+// first and after the last, made by a product of the edge rows against a
+// permutation, exact in any precision.
+//
+// Every product has its constant on the right and nothing transposed: Core
+// ML's CPU path (an M4 Max, macOS 27.0.1) gets a constant left operand against
+// a transposed input wrong, and folds a transpose of a product into that form,
+// so a band-major mel is not offered.
 //
 // **fp16 is the precision, and the range is the constraint.** Whisper floors
 // the log-mel eight decades below its loudest cell, and fp16 holds about nine
@@ -38,23 +42,16 @@ namespace WSP
 //
 // A window of silence stays finite: the gain is capped at quietestPeak's
 // reciprocal, and every cell lands on HF's -1.5.
-enum class MelLayout
-{
-    bandMajor,
-    framesMajor
-};
-
 eacp::ML::Tensor recordLogMel(eacp::ML::Graph& graph,
                               eacp::ML::Tensor samples,
                               const MelShape& shape,
-                              Span<const float> filterBank,
-                              MelLayout layout = MelLayout::bandMajor);
+                              Span<const float> filterBank);
 
 // The shape of the samples input recordLogMel reads.
 eacp::ML::Shape logMelInputShape(const MelShape& shape);
 
-// A program of the mel alone: samplesFeature in, melFeature out, frames major.
-// What CoreMLEncoder runs in front of an encoder that reads frames-major mel.
+// A program of the mel alone: samplesFeature in, melFeature out. What
+// CoreMLEncoder runs in front of an encoder that reads frames-major mel.
 eacp::ML::Graph recordLogMelProgram(const MelShape& shape,
                                     Span<const float> filterBank);
 

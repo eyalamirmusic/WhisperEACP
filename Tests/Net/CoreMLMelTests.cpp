@@ -191,11 +191,12 @@ struct Tolerance
     double meanAbs = 0.0;
 };
 
-// Each window has two bounds, the CPU's and the engine's and GPU's, since the
-// macOS CI runner places everything on the CPU under every setting, and those
-// two are held to their own only under EACP_REQUIRE_ANE=1. Measured on an M5
-// Max, macOS 27, against the kernels' fp32 mel, and set at about three times
-// the worst setting of each pair:
+// Each window has two bounds, the CPU's and the engine's and GPU's, since a
+// machine with no Neural Engine places everything on the CPU under every
+// setting, and those two are held to their own only under EACP_REQUIRE_ANE=1.
+// Measured on an M5 Max, macOS 27, against the kernels' fp32 mel, the CPU's
+// again on an M4 Max, macOS 27.0.1, to the same figures, and set at about
+// three times the worst setting of each pair:
 //
 //   jfk.wav   engine 0.059 / 0.016 / 0.00044, GPU 0.055 / 0.011 / 0.00033,
 //             CPU 0.080 / 0.013 / 0.00043 (max / 99.9% / mean)

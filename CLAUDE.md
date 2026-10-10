@@ -267,9 +267,14 @@ ops Core ML keeps on the CPU have engine forms beside them: the token and
 the position looked up by a one-hot product (`embedsTokenByProduct`,
 `embedsPositionByProduct`, the token as two base-256 fp16 digits since fp16
 counts exactly only to 2048), and the argmax out of reductions
-(`CoreMLSelection::onTheEngine`, exact, ties to the lowest index).
-`CoreMLMel` is the mel front end as a graph: the samples a hop to a row, the
-STFT as one product per row offset against a Hann-windowed DFT basis, the
+(`CoreMLSelection::onTheEngine`, exact, ties to the lowest index, its row
+maxima taken down the transposed grid because Core ML's CPU path on an M4 Max
+gives `max(row, 0)` across a row).
+`CoreMLMel` is the mel front end as a graph, frames major: the samples a hop
+to a row, the STFT as one product per row offset of the hop rows against a
+Hann-windowed DFT basis, every product with its constant on the right and
+nothing transposed (Core ML's CPU path on an M4 Max gets a constant left
+operand against a transposed input wrong), the
 reflect padding a product against a permutation, and two gains (the samples to
 a peak of one, the spectrum to a power peak of 2^15) that put Whisper's eight
 decades inside fp16's range, their logs taken back off before the floor and
@@ -319,7 +324,9 @@ time. `setNeuralEngineThroughout()` is the preset for all of it on the engine:
 `coreMLWithMel`, and the decoder on Core ML under `cpuAndNeuralEngine`, which
 builds the step with its position and argmax in the engine forms and its token
 still gathered on the CPU, the one op of a run left there on purpose (the
-token's product reads the 40 MB table a step, 1.33 ms against 1.07).
+token's product reads the 40 MB table a step, 1.33 ms against 1.07); the
+sequence start embeds its prompt by the product, once a run, so nothing of
+it is off the engine.
 `LiveTranscriber`
 sits above it: 16 kHz mono samples in and a growing transcript out, with the
 open segment re-run as audio arrives and closed into `committed()` on silence or
@@ -641,9 +648,11 @@ goes to one fixed cache,
 and `CoreMLEncoderOptions::cacheDirectory`), so the 13.5 s engine compile is
 paid once per machine rather than once per test binary, and kept apart from
 the apps' `~/Library/Caches/eacp/CoreML`, whose budget a test's programs would
-otherwise count against. The macOS CI runner
-places everything on the CPU, so `Tests/Net` holds every setting to the CPU's
-tolerance unless `EACP_REQUIRE_ANE=1`; `WHISPER_EACP_SLOW_TESTS=1` adds
+otherwise count against. This repository has no CI of its own; a machine
+with no Neural Engine (eacp's macOS CI runner is one) places everything on
+the CPU, so `Tests/Net` holds every setting to the CPU's tolerance unless
+`EACP_REQUIRE_ANE=1`. The `cpu` setting of the enumerated models has run only
+on macOS 27, since before it eacp refuses to load them there; `WHISPER_EACP_SLOW_TESTS=1` adds
 `Net/CoreML/errorByDepth`, which compiles one fixed program per depth into a
 cache of its own and removes it.
 

@@ -314,7 +314,9 @@ eacp::ML::Tensor CoreMLNet::oneHotTokens(eacp::ML::Tensor digits, int vocabulary
 // The scores a radix to a row, padded with fp16's lowest; the lowest row whose
 // maximum is the whole maximum, as highest - (highest - row) maximised; that
 // row picked out by a one-hot product, exact since every other term is zero;
-// and its lowest column holding the maximum, the same way.
+// and its lowest column holding the maximum, the same way. The row maxima are
+// taken down the transposed grid: across its rows, Core ML's CPU path on an
+// M4 Max (macOS 27.0.1) gives max(row, 0), so a row all below zero reads 0.
 eacp::ML::Tensor CoreMLNet::argmaxDigits(eacp::ML::Tensor scores)
 {
     constexpr auto lowestHalf = -65504.0f;
@@ -338,7 +340,8 @@ eacp::ML::Tensor CoreMLNet::argmaxDigits(eacp::ML::Tensor scores)
 
     grid = program.reshape(grid, {rowCount, tokenRadix});
 
-    const auto rowMaxima = program.max(grid, 1, true);
+    const auto rowMaxima = program.reshape(
+        program.max(program.transpose(grid, {1, 0}), 0, true), {rowCount, 1});
     const auto best = program.max(rowMaxima, 0, true);
 
     const auto earliest = [](const eacp::GPU::Float& value,
