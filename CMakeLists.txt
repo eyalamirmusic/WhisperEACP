@@ -3,10 +3,19 @@ cmake_minimum_required(VERSION 3.31)
 # Claimed before project(), not after: CMake's Darwin module reads the
 # deployment target while it is probing the compiler, so a set() further down is
 # silently ignored and every object ends up built against whatever SDK the build
-# machine happens to have. 11.0 is eacp's own floor.
+# machine happens to have. The floors are eacp's own, which its AppleSetup
+# claims only when eacp is the top-level project; a fetched eacp leaves them to
+# the tree that fetched it. The same variable is the iOS target under
+# -DCMAKE_SYSTEM_NAME=iOS, and IOS is not defined this early, so the test is on
+# the system name.
 if (APPLE AND NOT CMAKE_OSX_DEPLOYMENT_TARGET)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING
-            "Minimum macOS version WhisperEACP targets")
+    if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "15.0" CACHE STRING
+                "Minimum iOS version WhisperEACP targets")
+    else ()
+        set(CMAKE_OSX_DEPLOYMENT_TARGET "11.0" CACHE STRING
+                "Minimum macOS version WhisperEACP targets")
+    endif ()
 endif ()
 
 project(WhisperEACP VERSION 0.1.0 LANGUAGES C CXX)
