@@ -11,7 +11,7 @@
 # whisper-kernels for the same reason: HalfWeightMatMulTests binds a weight this
 # loader uploaded to the kernel that reads it, which is the one assertion
 # neither module can make on its own.
-nano_add_executable(ModelTests
+whisper_add_test_executable(ModelTests
         NO_MAIN
         SOURCES
         ConfigTests.cpp

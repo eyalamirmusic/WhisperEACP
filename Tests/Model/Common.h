@@ -156,9 +156,11 @@ inline bool hasModelFile(std::string_view name)
     return std::filesystem::is_regular_file(modelFile(name), error);
 }
 
-// One Core ML cache for every test binary, fixed rather than per process: the
-// engine compile of the eighteen-context encoder is about 13.5 s, and with
-// each binary's own appCacheDirectory() every one of them paid it.
+// One Core ML cache for every test binary, fixed so the engine compile of the
+// eighteen-context encoder, about 13.5 s, is paid once, and apart from the
+// company's folder the apps compile into (ML::defaultCacheDirectory()), so a
+// test's programs never count against the apps' budget or evict theirs, and a
+// temporary directory is all a clean-up has to remove.
 inline eacp::FilePath sharedCoreMLCacheDirectory()
 {
     return eacp::FilePath::tempDirectory() / "whisper-eacp-tests" / "CoreML";

@@ -165,9 +165,10 @@ struct EngineForms
     bool selection = false;
 };
 
-// The kernels decide the path: the prompt, then each token the kernels chose,
-// fed to both, so a Core ML token that differs is counted rather than
-// followed into a different sequence.
+// The kernels decide the path: the prompt, in one step on the kernels and in
+// the sequence start on Core ML, then each token the kernels chose, fed to
+// both, so a Core ML token that differs is counted rather than followed into
+// a different sequence.
 Comparison compare(ComputeUnits units,
                    int crossPositionCount,
                    bool fused = false,
@@ -192,6 +193,7 @@ Comparison compare(ComputeUnits units,
     options.embedsTokenByProduct = forms.token;
     options.embedsPositionByProduct = forms.position;
     options.selectsOnTheEngine = forms.selection;
+    options.promptLength = prompt.size();
 
     auto coreML = CoreMLDecoder {shape};
     const auto loaded = coreML.prepare(hostWeights, options);
@@ -207,10 +209,6 @@ Comparison compare(ComputeUnits units,
 
     const auto nothingSuppressed = Vector<float> {};
     const auto noSuppression = coreML.makeSuppression(nothingSuppressed);
-    coreML.beginSequence(rows, crossPositionCount);
-
-    for (auto index = 0; index + 1 < prompt.size(); ++index)
-        coreML.step(prompt[index], noSuppression);
 
     auto tokens = std::vector<int> {};
 
@@ -219,15 +217,20 @@ Comparison compare(ComputeUnits units,
 
     auto comparison = Comparison {};
     auto stepTimes = std::vector<double> {};
-    auto next = (int) prompt.back();
+    auto next = 0;
 
     for (auto step = 0; step <= followedTokens; ++step)
     {
         const auto expected = lastRow(kernels.step(tokens).logits, rowLength);
 
         const auto start = Clock::now();
-        const auto chosen = coreML.step(next, noSuppression);
-        stepTimes.push_back(millisecondsSince(start));
+        const auto chosen =
+            step == 0 ? coreML.beginSequence(
+                            rows, crossPositionCount, prompt, noSuppression)
+                      : coreML.step(next, noSuppression);
+
+        if (step > 0)
+            stepTimes.push_back(millisecondsSince(start));
 
         const auto actual = coreML.lastLogits();
         const auto kernelChoice = argmaxOf(expected);
@@ -427,7 +430,7 @@ auto tEngineArgmaxBreaksTiesLow =
         check(decoder.prepare(hostWeights, options).ok);
 
         const auto suppression = decoder.makeSuppression(mask);
-        decoder.beginSequence(rows, 0);
+        decoder.beginSequence(rows, 0, {&token, 1}, suppression);
 
         return decoder.step(token, suppression);
     };
@@ -475,9 +478,19 @@ auto tRefusesMisuse = test("Whisper/CoreMLDecoder/refusesMisuse") = []
     check(throwsLogicError([&] { decoder.step(0, suppression); }));
     check(throwsLogicError([&] { decoder.lastLogits(); }));
 
+    const auto prompt = preparedModel().prompt();
     const auto rows =
         eacp::GPU::Device::shared().makeBuffer(16, eacp::GPU::BufferUsage::Storage);
-    check(throwsLogicError([&] { decoder.beginSequence(rows, 0); }));
+    check(throwsLogicError(
+        [&] { decoder.beginSequence(rows, 0, prompt, suppression); }));
+
+    const auto encoderOutput = syntheticEncoderOutput(shape);
+    const auto window = eacp::GPU::Device::shared().makeBuffer(
+        encoderOutput.data(),
+        encoderOutput.size() * (int) sizeof(float),
+        eacp::GPU::BufferUsage::Storage);
+    check(throwsLogicError(
+        [&] { decoder.beginSequence(window, 0, prompt, suppression); }));
 
     auto small = DecoderShape {shape};
     small.crossPositions = 32;

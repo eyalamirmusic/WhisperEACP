@@ -46,6 +46,11 @@ struct CoreMLDecoderOptions
     bool embedsTokenByProduct = false;
     bool embedsPositionByProduct = false;
     bool selectsOnTheEngine = false;
+
+    // How many tokens a sequence opens with, all of them in the sequence
+    // start's one prediction: tiny.en's prompt, decoder_start and
+    // notimestamps, is two.
+    int promptLength = 1;
 };
 
 // The decoder as two Core ML models, recorded from the same two bodies the
@@ -54,17 +59,16 @@ struct CoreMLDecoderOptions
 //
 // The sequence start projects the cross-attention keys and values of every
 // layer out of the whole window of encoder rows once, straight into the
-// arrays every step reads them from. A step embeds one token at a position
-// given at run time, attends over the self caches, fixed at maxPositions rows
-// behind a mask, and over the cross caches behind a second one, and puts out
-// the token its logits choose once the caller's suppression row is added
-// (eacp's argmax, G8), with the key and value rows it made, which are written
-// into the caches here before the next step. Nothing but those rows and the
-// token crosses back.
-//
-// A prompt is fed a token a step. The kernels decode a prompt in one
-// dispatch; here one fixed program serves every step, and a prompt is two
-// tokens.
+// arrays every step reads them from, and in the same prediction decodes the
+// prompt (CoreMLNetOptions::opensSequence): its tokens at once, attending
+// causally among themselves and over the cross keys it has just projected,
+// and gives back the token that follows it with the prompt's key and value
+// rows. A step embeds one token at a position given at run time, attends over
+// the self caches, fixed at maxPositions rows behind a mask, and over the
+// cross caches behind a second one, and puts out the token its logits choose
+// once the caller's suppression row is added (eacp's argmax, G8), with the
+// key and value rows it made. Those rows are written into the caches here
+// before the next step; nothing but them and the token crosses back.
 //
 // Main thread only, like everything that touches the runtime; the blocking
 // forms predict on the caller's thread.
@@ -102,12 +106,19 @@ public:
     eacp::ML::MultiArray makeSuppression(Span<const float> mask) const;
 
     // Opens a sequence over the first crossPositionCount rows of the encoder's
-    // output: the [crossPositions, width] fp32 buffer the kernels write, or
-    // the fp16 rows the Core ML encoder left in its array. The rows past the
-    // count are never attended to.
-    void beginSequence(const eacp::GPU::Buffer& encoderRows, int crossPositionCount);
-    void beginSequence(const eacp::ML::MultiArray& encoderRows,
-                       int crossPositionCount);
+    // output, the [crossPositions, width] fp32 buffer the kernels write or the
+    // fp16 rows the Core ML encoder left in its array, with the prompt, and
+    // returns the token that follows it under suppression. The rows past the
+    // count are never attended to. A prompt of other than promptLength tokens
+    // is a logic_error.
+    int beginSequence(const eacp::GPU::Buffer& encoderRows,
+                      int crossPositionCount,
+                      Span<const int> prompt,
+                      const eacp::ML::MultiArray& suppression);
+    int beginSequence(const eacp::ML::MultiArray& encoderRows,
+                      int crossPositionCount,
+                      Span<const int> prompt,
+                      const eacp::ML::MultiArray& suppression);
 
     // Appends token at position() and returns the token that follows it.
     // A step past maxPositions is a ModelError, one before beginSequence a
@@ -115,8 +126,10 @@ public:
     int step(int token, const eacp::ML::MultiArray& suppression);
 
     int position() const { return decodedPositions; }
+    int promptLength() const { return openingTokens; }
 
-    // The last step's logits, [vocabularySize]; only under keepsLogits.
+    // The last prediction's logits, the sequence start's or a step's,
+    // [vocabularySize]; only under keepsLogits.
     Vector<float> lastLogits() const;
 
     bool wasCacheHit() const;
@@ -128,7 +141,8 @@ public:
 
     double lastLoadSeconds() const { return loadSeconds; }
 
-    // The sequence start's prediction, and every step's since it, summed.
+    // The sequence start's prediction, the prompt's included, and every
+    // step's since it, summed.
     double lastSequenceStartSeconds() const { return sequenceStartSeconds; }
     double sequencePredictSeconds() const { return stepSeconds; }
 
@@ -152,6 +166,7 @@ private:
         bool embedsTokenByProduct = false;
         bool embedsPositionByProduct = false;
         bool selectsOnTheEngine = false;
+        int promptLength = 1;
     };
 
     Programs record(const DecoderWeights& hostWeights,
@@ -159,7 +174,11 @@ private:
     void adopt(const Programs& programs);
     void unprepare();
     void requireReady() const;
-    void openSequence(int crossPositionCount);
+    int openSequence(int crossPositionCount,
+                     Span<const int> prompt,
+                     const eacp::ML::MultiArray& suppression);
+    void writeTokens(eacp::ML::MultiArray& array, Span<const int> tokens) const;
+    int chosenToken() const;
 
     DecoderShape decoderShape;
     DecoderCaches caches;
@@ -173,15 +192,20 @@ private:
     bool embedsTokenByProduct = false;
     bool embedsPositionByProduct = false;
     bool selectsOnTheEngine = false;
+    int openingTokens = 1;
 
     eacp::ML::MultiArray encoderRows;
+    eacp::ML::MultiArray promptIn;
     eacp::ML::MultiArray tokenIn;
     eacp::ML::MultiArray positionIn;
     eacp::ML::MultiArray selfMask;
     eacp::ML::MultiArray crossMask;
     eacp::ML::MultiArray nextToken;
     eacp::ML::MultiArray logits;
+    eacp::ML::MultiArray promptLogits;
+    const eacp::ML::MultiArray* lastLogitRows = nullptr;
     Vector<eacp::ML::MultiArray> selfArrays;
+    Vector<eacp::ML::MultiArray> promptRows;
     Vector<eacp::ML::MultiArray> appendedRows;
 
     eacp::ML::Inputs startInputs;

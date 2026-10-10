@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <utility>
 
 namespace WSP
 {
@@ -74,7 +75,48 @@ eacp::ML::ComputeUnits toCoreMLUnits(EncoderComputeUnits units)
     return eacp::ML::ComputeUnits::cpuAndNeuralEngine;
 }
 #endif
+
+std::string nameOfUnits(CoreMLComputeUnits units)
+{
+    switch (units)
+    {
+        case CoreMLComputeUnits::all:
+            return "all";
+        case CoreMLComputeUnits::cpuAndGPU:
+            return "cpuAndGPU";
+        case CoreMLComputeUnits::cpu:
+            return "cpu";
+        case CoreMLComputeUnits::cpuAndNeuralEngine:
+            break;
+    }
+
+    return "cpuAndNeuralEngine";
+}
 } // namespace
+
+bool coreMLRunsEnumeratedShapesOnTheCpu()
+{
+#if EACP_HAS_COREML
+    return eacp::ML::enumeratedShapesRunOnTheCpu();
+#else
+    return true;
+#endif
+}
+
+bool coreMLIsCpuOnly(CoreMLComputeUnits units)
+{
+#if EACP_HAS_COREML
+    return eacp::ML::isCpuOnly(toCoreMLUnits(units));
+#else
+    return units == CoreMLComputeUnits::cpu;
+#endif
+}
+
+bool enumeratedShapesTrap(CoreMLComputeUnits units, const CoreMLPlatform& platform)
+{
+    return enumeratedShapesTrap(platform.enumeratedShapesRunOnTheCpu(),
+                                platform.isCpuOnly(units));
+}
 
 void Whisper::load(const std::filesystem::path& modelDirectory)
 {
@@ -230,18 +272,40 @@ void Whisper::setEncoderBackend(EncoderBackend backend)
         throw std::logic_error {"the encoder backend is chosen before prepare(), "
                                 "which builds the encoder for it"};
 
+    requireSupportedEncoder(backend, chosenComputeUnits);
     chosenEncoderBackend = backend;
 }
 
-bool Whisper::supportsEncoderBackend(EncoderBackend backend)
+bool Whisper::supportsEncoderBackend(EncoderBackend backend,
+                                     EncoderComputeUnits units,
+                                     const CoreMLPlatform& platform)
 {
-    if (backend == EncoderBackend::kernels)
-        return true;
+    return encoderBackendRefusal(backend, units, platform).empty();
+}
+
+std::string
+    Whisper::encoderBackendRefusal(EncoderBackend backend,
+                                   [[maybe_unused]] EncoderComputeUnits units,
+                                   [[maybe_unused]] const CoreMLPlatform& platform)
+{
+    if (!isOnCoreML(backend))
+        return {};
 
 #if EACP_HAS_COREML
-    return eacp::ML::isSupported() && eacp::ML::supportsSpecification(8);
+    if (!eacp::ML::isSupported() || !eacp::ML::supportsSpecification(8))
+        return "this OS does not load the encoder's Core ML program, which needs "
+               "macOS 14 or iOS 17";
+
+    if (enumeratedShapesTrap(units, platform))
+        return "Core ML would run the encoder, whose input shapes are "
+               "enumerated, on the CPU alone under "
+               + nameOfUnits(units)
+               + ", which traps before macOS 27; choose units that reach the "
+                 "GPU or the Neural Engine";
+
+    return {};
 #else
-    return false;
+    return "this build has no Core ML";
 #endif
 }
 
@@ -251,7 +315,13 @@ void Whisper::setEncoderComputeUnits(EncoderComputeUnits units)
         throw std::logic_error {"the encoder's compute units are chosen before "
                                 "prepare(), which compiles the encoder for them"};
 
+    requireSupportedEncoder(chosenEncoderBackend, units);
     chosenComputeUnits = units;
+}
+
+void Whisper::setCoreMLPlatform(CoreMLPlatform replacement)
+{
+    platform = std::move(replacement);
 }
 
 void Whisper::setCoreMLCacheDirectory(const eacp::FilePath& directory)
@@ -313,10 +383,17 @@ void Whisper::requireRunnableEncoder() const
 void Whisper::requireRunnableEncoder(EncoderBackend backend) const
 {
     requireAudioContextForBackend(backend, audioContextPositions);
+    requireSupportedEncoder(backend, chosenComputeUnits);
+}
 
-    if (!supportsEncoderBackend(backend))
-        throw ModelError {"this Whisper was asked to run its encoder on Core ML, "
-                          "which this build or this machine cannot do"};
+void Whisper::requireSupportedEncoder(EncoderBackend backend,
+                                      EncoderComputeUnits units) const
+{
+    const auto refusal = encoderBackendRefusal(backend, units, platform);
+
+    if (!refusal.empty())
+        throw ModelError {"this Whisper cannot run its encoder on Core ML: "
+                          + refusal};
 }
 
 void Whisper::requireAudioContextForBackend(EncoderBackend backend,
@@ -682,7 +759,7 @@ void Whisper::switchEncoderBackend(EncoderBackend backend)
 
     if (!isPrepared())
     {
-        chosenEncoderBackend = backend;
+        setEncoderBackend(backend);
         return;
     }
 
@@ -844,6 +921,7 @@ CoreMLDecoderOptions Whisper::coreMLDecoderOptions(DecoderComputeUnits units) co
     options.embedsTokenByProduct = false;
     options.embedsPositionByProduct = onTheEngine;
     options.selectsOnTheEngine = onTheEngine;
+    options.promptLength = promptTokens.size();
 
     return options;
 }
@@ -1020,8 +1098,12 @@ bool Whisper::rowsStayInCoreML() const
 
 void Whisper::setNeuralEngineThroughout()
 {
-    setEncoderBackend(EncoderBackend::coreMLWithMel);
+    if (!isPrepared())
+        requireSupportedEncoder(EncoderBackend::coreMLWithMel,
+                                EncoderComputeUnits::cpuAndNeuralEngine);
+
     setEncoderComputeUnits(EncoderComputeUnits::cpuAndNeuralEngine);
+    setEncoderBackend(EncoderBackend::coreMLWithMel);
     setDecoderBackend(DecoderBackend::coreML);
     setDecoderComputeUnits(DecoderComputeUnits::cpuAndNeuralEngine);
 }
@@ -1361,11 +1443,11 @@ Vector<TokenId> Whisper::decodeTranscript()
 }
 
 // The same search on the Core ML decoder, one blocking prediction a step. The
-// prompt goes in a token a step, all but its last token's choice unread, so
-// the first token sampled is the last prompt token's, under the first step's
-// mask, as it is on the kernels; the limits are the kernels' too. The token a
-// step returns is what the next step embeds, and the host sees each one, since
-// it has to write the step's key and value rows into the caches anyway.
+// prompt goes in with the sequence start, whose prediction is the first step
+// and samples under the first step's mask, as the kernels' prompt step does;
+// the limits are the kernels' too. The token a step returns is what the next
+// step embeds, and the host sees each one, since it has to write the step's
+// key and value rows into the caches anyway.
 Vector<TokenId> Whisper::decodeTranscriptOnCoreML()
 {
 #if EACP_HAS_COREML
@@ -1376,30 +1458,30 @@ Vector<TokenId> Whisper::decodeTranscriptOnCoreML()
 
     const auto decodeStart = Clock::now();
 
-    if (rowsStayInCoreML())
-        coreMLDecoder->beginSequence(coreMLEncoder->rowsAt(encodedPositions()),
-                                     encodedPositions());
-    else
-        coreMLDecoder->beginSequence(*encodedBuffer, encodedPositions());
+    const auto beginOver = [&](const auto& encoderRows)
+    {
+        return (TokenId) coreMLDecoder->beginSequence(
+            encoderRows, encodedPositions(), promptTokens, firstStepSuppressionRow);
+    };
 
-    for (auto index = 0; index + 1 < promptLength; ++index)
-        coreMLDecoder->step(promptTokens[index], laterStepSuppressionRow);
+    auto sampled = rowsStayInCoreML()
+                       ? beginOver(coreMLEncoder->rowsAt(encodedPositions()))
+                       : beginOver(*encodedBuffer);
 
     auto transcript = Vector<TokenId> {};
-    auto next = promptTokens.back();
 
     for (auto step = 0; step < stepLimit; ++step)
     {
-        const auto& suppression =
-            step == 0 ? firstStepSuppressionRow : laterStepSuppressionRow;
-        const auto sampled = (TokenId) coreMLDecoder->step(next, suppression);
+        if (step > 0)
+            sampled =
+                (TokenId) coreMLDecoder->step(sampled, laterStepSuppressionRow);
+
         ++stepCount;
 
         if (sampled == endOfText)
             break;
 
         transcript.add(sampled);
-        next = sampled;
     }
 
     decodeSeconds = secondsSince(decodeStart);

@@ -1,4 +1,5 @@
-nano_add_executable(CoreTests
+whisper_add_test_executable(CoreTests
         SOURCES
+        AppInfoTests.cpp
         VersionTests.cpp
         TARGETS whisper-core)

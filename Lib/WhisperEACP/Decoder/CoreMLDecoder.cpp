@@ -187,10 +187,26 @@ CoreMLDecoder::Programs CoreMLDecoder::record(const DecoderWeights& hostWeights,
         throw std::logic_error {"the Core ML decoder writes host weights into its "
                                 "blob; load them with WeightPlacement::Host"};
 
+    if (options.promptLength < 1
+        || options.promptLength >= decoderShape.maxPositions)
+        throw std::logic_error {"a sequence opens with at least one token and "
+                                "leaves room for the tokens after it"};
+
     auto netOptions = CoreMLNetOptions {};
     netOptions.fusedAttention = options.fusedAttention;
+    netOptions.selection = CoreMLSelection {};
+    netOptions.selection->onTheEngine = options.selectsOnTheEngine;
+    netOptions.embedsTokenByProduct = options.embedsTokenByProduct;
+    netOptions.embedsPositionByProduct = options.embedsPositionByProduct;
+    netOptions.omittedOutputs.add(hiddenFeature);
 
-    auto startNet = CoreMLNet {netOptions};
+    if (!options.keepsLogits)
+        netOptions.omittedOutputs.add(logitsFeature);
+
+    auto startOptions = netOptions;
+    startOptions.opensSequence = true;
+
+    auto startNet = CoreMLNet {startOptions};
     auto startCaches = makeCaches(startNet, decoderShape);
 
     recordSequenceStart(
@@ -201,16 +217,17 @@ CoreMLDecoder::Programs CoreMLDecoder::record(const DecoderWeights& hostWeights,
         named({decoderShape.crossPositions, decoderShape.width}, encoderRowsFeature),
         decoderShape.crossPositions);
 
+    recordDecoderStep(startNet,
+                      decoderShape,
+                      hostWeights,
+                      startCaches,
+                      named({options.promptLength}, tokensFeature),
+                      options.promptLength,
+                      0,
+                      named({}, hiddenFeature),
+                      named({}, logitsFeature));
+
     requireRecorded(startNet, "sequence start");
-
-    netOptions.selection = CoreMLSelection {};
-    netOptions.selection->onTheEngine = options.selectsOnTheEngine;
-    netOptions.embedsTokenByProduct = options.embedsTokenByProduct;
-    netOptions.embedsPositionByProduct = options.embedsPositionByProduct;
-    netOptions.omittedOutputs.add(hiddenFeature);
-
-    if (!options.keepsLogits)
-        netOptions.omittedOutputs.add(logitsFeature);
 
     auto stepNet = CoreMLNet {netOptions};
     caches = makeCaches(stepNet, decoderShape);
@@ -238,12 +255,13 @@ CoreMLDecoder::Programs CoreMLDecoder::record(const DecoderWeights& hostWeights,
             options.keepsLogits,
             options.embedsTokenByProduct,
             options.embedsPositionByProduct,
-            options.selectsOnTheEngine};
+            options.selectsOnTheEngine,
+            options.promptLength};
 }
 
 // Every array a sequence touches, made once and bound once: the start's
 // outputs are the very arrays the step reads its cross caches from, and the
-// step's token and rows come back into arrays of their own.
+// prompt's rows and each step's come back into arrays of their own.
 void CoreMLDecoder::adopt(const Programs& programs)
 {
     using eacp::ML::DType;
@@ -257,17 +275,25 @@ void CoreMLDecoder::adopt(const Programs& programs)
     embedsTokenByProduct = programs.embedsTokenByProduct;
     embedsPositionByProduct = programs.embedsPositionByProduct;
     selectsOnTheEngine = programs.selectsOnTheEngine;
+    openingTokens = programs.promptLength;
 
     startInputs = {};
     startOutputs = {};
     stepInputs = {};
     stepOutputs = {};
     selfArrays.clear();
+    promptRows.clear();
     appendedRows.clear();
 
+    const auto makeTokens = [&](int count)
+    {
+        return embedsTokenByProduct ? makeArray({count, 2}, half)
+                                    : makeArray({count}, DType::int32);
+    };
+
     encoderRows = makeArray({decoderShape.crossPositions, width}, half);
-    tokenIn = embedsTokenByProduct ? makeArray({1, 2}, half)
-                                   : makeArray({1}, DType::int32);
+    promptIn = makeTokens(openingTokens);
+    tokenIn = makeTokens(1);
     positionIn = embedsPositionByProduct ? makeArray({1, 1}, half)
                                          : makeArray({1}, DType::int32);
     selfMask = makeArray({1, decoderShape.maxPositions}, half);
@@ -275,7 +301,13 @@ void CoreMLDecoder::adopt(const Programs& programs)
     nextToken =
         selectsOnTheEngine ? makeArray({1, 2}, half) : makeArray({1}, DType::int32);
 
+    const auto tokenFeature =
+        embedsTokenByProduct ? CoreMLNet::tokenDigitsFeature : tokensFeature;
+
     startInputs[encoderRowsFeature] = encoderRows;
+    startInputs[tokenFeature] = promptIn;
+    startInputs[CoreMLNet::crossMaskFeature] = crossMask;
+    startOutputs[selection.token] = nextToken;
 
     for (const auto& cache: crossCachesOf(caches))
     {
@@ -287,14 +319,15 @@ void CoreMLDecoder::adopt(const Programs& programs)
     for (const auto& cache: selfCachesOf(caches))
     {
         selfArrays.add(makeArray({decoderShape.maxPositions, width}, half));
+        promptRows.add(makeArray({openingTokens, width}, half));
         appendedRows.add(makeArray({1, width}, half));
 
         stepInputs[CoreMLNet::cacheFeature(cache)] = selfArrays.back();
+        startOutputs[CoreMLNet::appendedRowsFeature(cache)] = promptRows.back();
         stepOutputs[CoreMLNet::appendedRowsFeature(cache)] = appendedRows.back();
     }
 
-    stepInputs[embedsTokenByProduct ? CoreMLNet::tokenDigitsFeature
-                                    : tokensFeature] = tokenIn;
+    stepInputs[tokenFeature] = tokenIn;
     stepInputs[CoreMLNet::positionFeature] = positionIn;
     stepInputs[CoreMLNet::selfMaskFeature] = selfMask;
     stepInputs[CoreMLNet::crossMaskFeature] = crossMask;
@@ -303,8 +336,12 @@ void CoreMLDecoder::adopt(const Programs& programs)
     if (keepsLogits)
     {
         logits = makeArray({1, decoderShape.vocabularySize}, half);
+        promptLogits = makeArray({openingTokens, decoderShape.vocabularySize}, half);
         stepOutputs[logitsFeature] = logits;
+        startOutputs[logitsFeature] = promptLogits;
     }
+
+    lastLogitRows = nullptr;
 
     allowedRows.clear();
     allowedRows.resize(decoderShape.maxPositions, 0.0f);
@@ -344,8 +381,10 @@ eacp::ML::MultiArray CoreMLDecoder::makeSuppression(Span<const float> mask) cons
     return array;
 }
 
-void CoreMLDecoder::beginSequence(const eacp::GPU::Buffer& rows,
-                                  int crossPositionCount)
+int CoreMLDecoder::beginSequence(const eacp::GPU::Buffer& rows,
+                                 int crossPositionCount,
+                                 Span<const int> prompt,
+                                 const eacp::ML::MultiArray& suppression)
 {
     requireReady();
 
@@ -354,11 +393,13 @@ void CoreMLDecoder::beginSequence(const eacp::GPU::Buffer& rows,
                                 "decoder's cross positions"};
 
     encoderRows.copyFrom(rows, eacp::ML::DType::float32);
-    openSequence(crossPositionCount);
+    return openSequence(crossPositionCount, prompt, suppression);
 }
 
-void CoreMLDecoder::beginSequence(const eacp::ML::MultiArray& rows,
-                                  int crossPositionCount)
+int CoreMLDecoder::beginSequence(const eacp::ML::MultiArray& rows,
+                                 int crossPositionCount,
+                                 Span<const int> prompt,
+                                 const eacp::ML::MultiArray& suppression)
 {
     requireReady();
 
@@ -367,11 +408,50 @@ void CoreMLDecoder::beginSequence(const eacp::ML::MultiArray& rows,
                                 "sequence attends to"};
 
     encoderRows.copyRows(rows, 0, 0, crossPositionCount);
-    openSequence(crossPositionCount);
+    return openSequence(crossPositionCount, prompt, suppression);
 }
 
-void CoreMLDecoder::openSequence(int crossPositionCount)
+void CoreMLDecoder::writeTokens(eacp::ML::MultiArray& array,
+                                Span<const int> tokens) const
 {
+    constexpr auto radix = CoreMLNet::tokenRadix;
+
+    auto values = Vector<float> {};
+
+    for (auto token: tokens)
+    {
+        if (embedsTokenByProduct)
+        {
+            values.add((float) (token / radix));
+            values.add((float) (token % radix));
+        }
+        else
+            values.add((float) token);
+    }
+
+    array.fromFloats(values);
+}
+
+int CoreMLDecoder::chosenToken() const
+{
+    const auto chosen = nextToken.toFloats();
+
+    if (selectsOnTheEngine)
+        return (int) chosen[0] * CoreMLNet::tokenRadix + (int) chosen[1];
+
+    return (int) chosen[0];
+}
+
+int CoreMLDecoder::openSequence(int crossPositionCount,
+                                Span<const int> prompt,
+                                const eacp::ML::MultiArray& suppression)
+{
+    if (prompt.size() != openingTokens)
+        throw std::logic_error {"this Core ML decoder opens a sequence with "
+                                + std::to_string(openingTokens)
+                                + " prompt tokens and was given "
+                                + std::to_string(prompt.size())};
+
     const auto rows =
         crossPositionCount == 0 ? decoderShape.crossPositions : crossPositionCount;
 
@@ -389,10 +469,9 @@ void CoreMLDecoder::openSequence(int crossPositionCount)
 
     crossMask.fromFloats(crossAllowed);
 
-    for (auto& allowed: allowedRows)
-        allowed = 0.0f;
-
-    selfMask.fromFloats(allowedRows);
+    writeTokens(promptIn, prompt);
+    startInputs[CoreMLSelection {}.suppression] = suppression;
+    sequenceOpen = false;
 
     const auto start = Clock::now();
     const auto result = startModel.predict(startInputs, startOutputs);
@@ -403,8 +482,19 @@ void CoreMLDecoder::openSequence(int crossPositionCount)
         throw ModelError {"Core ML refused the decoder's sequence start: "
                           + result.error};
 
-    decodedPositions = 0;
+    for (auto index = 0; index < selfArrays.size(); ++index)
+        selfArrays[index].copyRows(promptRows[index], 0, 0, openingTokens);
+
+    for (auto row = 0; row < allowedRows.size(); ++row)
+        allowedRows[row] = row < openingTokens ? 1.0f : 0.0f;
+
+    selfMask.fromFloats(allowedRows);
+
+    decodedPositions = openingTokens;
+    lastLogitRows = &promptLogits;
     sequenceOpen = true;
+
+    return chosenToken();
 }
 
 int CoreMLDecoder::step(int token, const eacp::ML::MultiArray& suppression)
@@ -420,14 +510,8 @@ int CoreMLDecoder::step(int token, const eacp::ML::MultiArray& suppression)
                           + std::to_string(decoderShape.maxPositions)
                           + " positions this decoder was built for"};
 
-    constexpr auto radix = CoreMLNet::tokenRadix;
-
-    const auto tokenValues =
-        embedsTokenByProduct
-            ? Array<float, 2> {(float) (token / radix), (float) (token % radix)}
-            : Array<float, 2> {(float) token, 0.0f};
     const auto positionValue = (float) decodedPositions;
-    tokenIn.fromFloats({tokenValues.data(), tokenIn.elementCount()});
+    writeTokens(tokenIn, {&token, 1});
     positionIn.fromFloats({&positionValue, 1});
     stepInputs[CoreMLSelection {}.suppression] = suppression;
 
@@ -444,13 +528,9 @@ int CoreMLDecoder::step(int token, const eacp::ML::MultiArray& suppression)
     allowedRows[decodedPositions] = 1.0f;
     selfMask.fromFloats({allowedRows.data(), decodedPositions + 1});
     ++decodedPositions;
+    lastLogitRows = &logits;
 
-    const auto chosen = nextToken.toFloats();
-
-    if (selectsOnTheEngine)
-        return (int) chosen[0] * radix + (int) chosen[1];
-
-    return (int) chosen[0];
+    return chosenToken();
 }
 
 Vector<float> CoreMLDecoder::lastLogits() const
@@ -459,7 +539,18 @@ Vector<float> CoreMLDecoder::lastLogits() const
         throw std::logic_error {"the Core ML decoder keeps its logits only under "
                                 "CoreMLDecoderOptions::keepsLogits"};
 
-    return logits.toFloats();
+    if (lastLogitRows == nullptr)
+        throw std::logic_error {"no prediction has written logits yet"};
+
+    const auto rows = lastLogitRows->toFloats();
+    const auto rowLength = decoderShape.vocabularySize;
+
+    auto last = Vector<float> {};
+
+    for (auto index = rows.size() - rowLength; index < rows.size(); ++index)
+        last.add(rows[index]);
+
+    return last;
 }
 } // namespace WSP
 

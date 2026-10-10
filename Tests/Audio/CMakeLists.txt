@@ -1,4 +1,4 @@
-nano_add_executable(AudioTests
+whisper_add_test_executable(AudioTests
         SOURCES
         CaptureTests.cpp
         FormatTests.cpp

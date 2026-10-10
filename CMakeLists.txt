@@ -75,6 +75,10 @@ set(CMAKE_CXX_STANDARD 20)
 find_package(eacp REQUIRED)
 find_package(MakeASound REQUIRED)
 
+# The company every binary of this tree is stamped with (whisper_embed_app_info),
+# the one ModelFetch's directory and the bundle identifiers already name.
+set(EACP_COMPANY_NAME "eacp")
+
 # The recording the end-to-end tests and Transcribe run on: 352 kB of committed
 # audio, unlike the model, which is a download — at runtime, through
 # Model/ModelFetch.h, and no longer by this configure.

@@ -1,6 +1,6 @@
 # NO_MAIN: these reach the GPU, so they run inside eacp's event loop through
 # the shared entry point in Tests/Support.
-nano_add_executable(MelTests
+whisper_add_test_executable(MelTests
         NO_MAIN
         SOURCES
         FilterBankTests.cpp

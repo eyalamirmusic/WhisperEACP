@@ -67,7 +67,7 @@ timed runs, of which the **median** is what the columns compare:
 | column | what runs |
 | --- | --- |
 | `WhisperEACP` | our runtime, on eacp's device, from the F32 safetensors |
-| `WhisperEACP ANE` | the same with the encoder on Core ML (`Whisper::setEncoderBackend(coreML)`), compiled for `--units`, `cpuAndNeuralEngine` by default; the decoder stays on eacp's device. Only where the build and the OS have Core ML |
+| `WhisperEACP ANE` | the same with the encoder on Core ML (`Whisper::setEncoderBackend(coreML)`), compiled for `--units`, `cpuAndNeuralEngine` by default; the decoder stays on eacp's device. Only where the build and the OS have Core ML and `Whisper::supportsEncoderBackend` holds for `--units`; otherwise the header says why |
 | `whisper.cpp GPU` | whisper.cpp on its GPU backend — Metal on a Mac — from the F16 GGML file |
 | `whisper.cpp CPU` | the same context with `use_gpu` off: ggml's CPU backend, plus Accelerate through the BLAS backend on a Mac, at whisper.cpp's own default thread count |
 

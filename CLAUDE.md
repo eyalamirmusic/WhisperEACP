@@ -192,6 +192,19 @@ call site can see.
 
 Check `eacp/CMake/` and `makeasound/CMake/` before adding a module here.
 
+### Every executable names one company
+
+The root `CMakeLists.txt` sets `EACP_COMPANY_NAME` to `eacp`, the company
+`ModelFetch::directory()` and the bundle identifiers already name, and
+`whisper_set_default_target_setting` stamps eacp's `AppInfo` into every
+executable through `whisper_embed_app_info` (the tests through
+`whisper_add_test_executable`, NanoTest's executable with the same call after
+it; LiveTranscribe has it from `eacp_set_gui_subsystem`). That is what makes
+`eacp::ML::defaultCacheDirectory()` one folder for the whole tree,
+`~/Library/Caches/eacp/CoreML`, so the demo, `Transcribe`, the benchmark and
+`DeviceInfo --plan` compile each Core ML model once between them, under eacp's
+2 GiB least-recently-used budget. `DeviceInfo` prints the directory.
+
 ### Dependency order
 
 `find_package(eacp)` runs before `find_package(MakeASound)` in the root
@@ -244,9 +257,14 @@ shorter one, which appends one token's rows after all 448 capacity rows and
 puts them out as `appendedRowsFeature` for the caller to write back; which
 rows are valid is the `self_mask` and `cross_mask` inputs, the position is
 the `position` input, and `CoreMLNetOptions::selection` adds the suppression
-input and eacp's argmax, so a step's output is a token. Three step ops Core ML
-keeps on the CPU have engine forms beside them: the token and the position
-looked up by a one-hot product (`embedsTokenByProduct`,
+input and eacp's argmax, so a step's output is a token. Under
+`CoreMLNetOptions::opensSequence` the start and the prompt's step record into
+one program: the cross caches it fills feed its own attention, the self caches
+begin empty, so the prompt's rows attend causally among themselves under a
+constant mask and go out as `appendedRowsFeature`, and the prompt's positions
+are rows of the table, with no `position` or `self_mask` input. Three step
+ops Core ML keeps on the CPU have engine forms beside them: the token and
+the position looked up by a one-hot product (`embedsTokenByProduct`,
 `embedsPositionByProduct`, the token as two base-256 fp16 digits since fp16
 counts exactly only to 2048), and the argmax out of reductions
 (`CoreMLSelection::onTheEngine`, exact, ties to the lowest index).
@@ -266,10 +284,14 @@ on Core ML too, left fp16 in its array (`rowsAt`) for the decoder to copy row
 for row, never reaching the GPU. `CoreMLDecoder` (Apple only, the same guard)
 is the decoder as two Core ML models recorded from `recordSequenceStart` and
 `recordDecoderStep`: the start projects every cross cache out of the window's
-encoder rows straight into the arrays the step reads, and a step takes one
-token, the caches and the masks as inputs and gives back the next token and
-the eight new key and value rows, which it writes into the cache arrays at the
-position. A prompt goes in a token a step. Its masked attentions are
+encoder rows straight into the arrays the step reads and, in the same
+prediction, decodes the prompt (`CoreMLDecoderOptions::promptLength` tokens,
+two for tiny.en) and gives back the first sampled token with the prompt's key
+and value rows; a step takes one token, the caches and the masks as inputs
+and gives back the next token and the eight new key and value rows, which it
+writes into the cache arrays at the position. So `beginSequence` takes the
+prompt and the first step's suppression and returns a token, and a run makes
+as many predictions as the kernels make steps. Its masked attentions are
 matmul, an additive mask, softmax and matmul by default: eacp's fused masked
 op is correct but measured 2.24 ms a step against 0.68 on the CPU.
 `CoreMLEncoderOptions::frontEnd` puts the mel on Core ML too, as a model of its
@@ -285,6 +307,12 @@ the decoder each run on the kernels or on Core ML (`EncoderBackend`,
 time and none while a run is in flight; the decoder's Core ML units default to
 `cpu`, where a step measured fastest, and the suppression masks reach its
 steps as additive fp16 rows, so its tokens match the kernels'.
+`supportsEncoderBackend(backend, units)` is false, and `encoderBackendRefusal`
+says why, where Core ML would put the encoder's enumerated shapes on a CPU
+that traps (before macOS 27, under `cpu`, or `cpuAndNeuralEngine` with no
+engine), so the setters and the switches throw the `ModelError` before
+anything is built; `setCoreMLPlatform` replaces eacp's two predicates for a
+test. The decoder's programs are fixed-shape and are never refused for it.
 `EncoderBackend::coreMLWithMel` is the encoder with the Core ML mel in front,
 and the two-argument decoder switch moves the decoder between its units at run
 time. `setNeuralEngineThroughout()` is the preset for all of it on the engine:
@@ -436,7 +464,9 @@ Three forms, and the app says which one it took before printing the transcript:
 
 `--ane` is `Whisper::setNeuralEngineThroughout()`, and the report then splits
 the encode into the mel's prediction and the encoder's. The first `--ane` run
-on a machine compiles for the engine, about 15 s, into the app's own cache.
+on a machine compiles for the engine, about 15 s, into the cache every binary
+here shares, `~/Library/Caches/eacp/CoreML`, and every later run of any of them
+loads it.
 
 `--audio-ctx=N|audio` is `Whisper::setAudioContext`, whisper.cpp's `audio_ctx`:
 the encoder runs over N of its 1500 positions, or over what the recording
@@ -601,14 +631,17 @@ either or both halves on Core ML, with the step's engine forms as well;
 `DecoderBackendTests.cpp` is the decoder's switch. `Tests/Net/CoreMLMelTests.cpp`
 holds the Core ML mel to the kernels' cell by cell over speech, full-scale
 tones, quiet noise and silence, and `CoreMLEncoderTests.cpp` the encoder run
-from samples through it; `Tests/Whisper/NeuralEngineTests.cpp` is the
+from samples through it; `Tests/Whisper/RefusalTests.cpp` is that refusal on a stand-in platform;
+`Tests/Whisper/NeuralEngineTests.cpp` is the
 all-on-the-engine preset, its transcript, where Core ML placed its four models,
 and the switches that reach it at run time. Every Core ML model they compile
 goes to one fixed cache,
 `<temp>/whisper-eacp-tests/CoreML` (`sharedCoreMLCacheDirectory()` in
 `Tests/Model/Common.h`, handed over through `Whisper::setCoreMLCacheDirectory`
 and `CoreMLEncoderOptions::cacheDirectory`), so the 13.5 s engine compile is
-paid once per machine rather than once per test binary. The macOS CI runner
+paid once per machine rather than once per test binary, and kept apart from
+the apps' `~/Library/Caches/eacp/CoreML`, whose budget a test's programs would
+otherwise count against. The macOS CI runner
 places everything on the CPU, so `Tests/Net` holds every setting to the CPU's
 tolerance unless `EACP_REQUIRE_ANE=1`; `WHISPER_EACP_SLOW_TESTS=1` adds
 `Net/CoreML/errorByDepth`, which compiles one fixed program per depth into a

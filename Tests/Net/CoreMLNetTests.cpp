@@ -2,6 +2,7 @@
 
 #include <iostream>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 
@@ -521,9 +522,84 @@ auto tRecordsTheDecoderPrograms = test("Net/CoreML/recordsTheDecoderPrograms") =
     check(blob < 60'000'000);
 };
 
-// A step of more than one token, or causal attention over rows, is something
-// a fixed program with a mask over one appended row cannot express, and the
-// net says so rather than recording it.
+// The program that opens a sequence: the sequence start and the prompt's step
+// recorded into one. The cross caches it projects feed its own attention
+// rather than coming back in as inputs, and the prompt's rows begin the self
+// caches, so it reads only the encoder rows, the prompt, the cross mask and
+// the suppression row, takes no position and no self mask, and puts out every
+// cross cache, the prompt's rows of every self cache and the token after the
+// prompt. In the engine forms its prompt is digits and nothing is gathered:
+// the positions are rows of the table, fixed at record time.
+auto tRecordsTheOpeningProgram = test("Net/CoreML/recordsTheOpeningProgram") = []
+{
+    if (!hasWhisperModel())
+        return;
+
+    const auto config = ModelConfig::fromFile(modelFile("config.json"));
+    const auto shape = DecoderShape::fromConfig(config, encoderPositions);
+    const auto file = SafeTensors::fromFile(modelFile("model.safetensors"));
+    const auto weights =
+        DecoderWeights {file, shape, WeightPacking::Float, WeightPlacement::Host};
+    constexpr auto promptLength = 2;
+
+    const auto recordOpening = [&](bool engineForms)
+    {
+        auto options = CoreMLNetOptions {};
+        options.selection = CoreMLSelection {};
+        options.selection->onTheEngine = engineForms;
+        options.embedsTokenByProduct = engineForms;
+        options.embedsPositionByProduct = engineForms;
+        options.omittedOutputs = {"hidden_states", "logits"};
+        options.opensSequence = true;
+
+        auto net = std::make_unique<CoreMLNet>(options);
+        auto caches = makeDecoderCaches(*net, shape);
+
+        recordSequenceStart(
+            *net,
+            shape,
+            weights,
+            caches,
+            namedBinding({shape.crossPositions, shape.width}, "rows"),
+            shape.crossPositions);
+        recordStep(*net, shape, weights, caches, promptLength);
+
+        check(net->isValid());
+
+        const auto& inputs = net->inputNames();
+        check(inputs.size() == 4);
+        check(hasName(inputs, "rows"));
+        check(hasName(inputs, CoreMLNet::crossMaskFeature));
+        check(hasName(inputs, "suppression"));
+        check(!hasName(inputs, CoreMLNet::positionFeature));
+        check(!hasName(inputs, CoreMLNet::selfMaskFeature));
+        check(!hasName(inputs, CoreMLNet::cacheFeature(caches.crossKeys[0])));
+
+        const auto& outputs = net->outputNames();
+        check(outputs.size() == 4 * shape.layers + 1);
+        check(hasName(outputs, "next_token"));
+        check(hasName(outputs, CoreMLNet::cacheFeature(caches.crossKeys[0])));
+        check(hasName(outputs, CoreMLNet::appendedRowsFeature(caches.selfKeys[0])));
+        check(caches.selfKeys[0].rows == promptLength);
+
+        return net;
+    };
+
+    const auto onTheCpu = recordOpening(false);
+    check(hasName(onTheCpu->inputNames(), "tokens"));
+
+    const auto onTheEngine = recordOpening(true);
+    check(hasName(onTheEngine->inputNames(), CoreMLNet::tokenDigitsFeature));
+
+    const auto text = onTheEngine->graph().toText();
+    check(text.find("gather") == std::string::npos);
+    check(text.find("reduce_argmax") == std::string::npos);
+};
+
+// A step of more than one token outside the program that opens a sequence,
+// or causal attention over rows, is something a fixed program with a mask
+// over one appended row cannot express, and the net says so rather than
+// recording it.
 auto tRefusesWhatADecoderStepCannotRun =
     test("Net/CoreML/refusesWhatADecoderStepCannotRun") = []
 {

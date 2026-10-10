@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -58,6 +59,29 @@ enum class CoreMLComputeUnits
 
 using EncoderComputeUnits = CoreMLComputeUnits;
 using DecoderComputeUnits = CoreMLComputeUnits;
+
+// eacp's two answers on whether a model with enumerated input shapes, which
+// the encoder and the Core ML mel are, may run here: whether this OS runs one
+// on Core ML's CPU path at all (before macOS 27 its first prediction traps in
+// BNNS), and whether these units leave Core ML nothing but the CPU on this
+// machine. The decoder's programs are fixed-shape and ask neither. A test
+// replaces them to stand in for a machine it is not.
+bool coreMLRunsEnumeratedShapesOnTheCpu();
+bool coreMLIsCpuOnly(CoreMLComputeUnits units);
+
+struct CoreMLPlatform
+{
+    std::function<bool()> enumeratedShapesRunOnTheCpu =
+        coreMLRunsEnumeratedShapesOnTheCpu;
+    std::function<bool(CoreMLComputeUnits)> isCpuOnly = coreMLIsCpuOnly;
+};
+
+constexpr bool enumeratedShapesTrap(bool runOnTheCpu, bool cpuOnly)
+{
+    return cpuOnly && !runOnTheCpu;
+}
+
+bool enumeratedShapesTrap(CoreMLComputeUnits units, const CoreMLPlatform& platform);
 
 // The whole runtime, from 30 s of samples to text: the mel front-end, the
 // encoder, the decoder's KV-cached loop, and the greedy search that turns the
@@ -217,8 +241,10 @@ public:
 
     // The kernels by default. Set before prepare(), which builds the encoder
     // for it; a call after is a std::logic_error, and switchEncoderBackend is
-    // the way to move a prepared one. prepare() refuses a backend this build
-    // or this machine cannot run with a ModelError, and on either Core ML
+    // the way to move a prepared one. A backend this build or this machine
+    // cannot run under the units chosen so far is a ModelError here, before
+    // anything is built, so a caller that wants other units than the default
+    // sets them first; prepare() refuses the same, and on either Core ML
     // backend an audio context outside enumeratedAudioContexts() as well.
     EncoderBackend encoderBackend() const { return chosenEncoderBackend; }
     void setEncoderBackend(EncoderBackend backend);
@@ -255,19 +281,34 @@ public:
 
     // Both Core ML backends wherever this build has eacp's Core ML runner and
     // the OS loads a specification 8 program, the floor for the encoder with
-    // its attention unfused; where it also loads 9, the fused program is built
-    // instead.
-    static bool supportsEncoderBackend(EncoderBackend backend);
+    // its attention unfused, and the platform would not put the encoder's
+    // enumerated shapes on a CPU that traps under these units; where the OS
+    // also loads 9, the fused program is built instead.
+    static bool supportsEncoderBackend(
+        EncoderBackend backend,
+        EncoderComputeUnits units = EncoderComputeUnits::cpuAndNeuralEngine,
+        const CoreMLPlatform& platform = {});
 
-    // Set before prepare(), like the backend, and read only on Core ML.
+    // Why not, in a sentence, or empty where supportsEncoderBackend holds.
+    static std::string encoderBackendRefusal(
+        EncoderBackend backend,
+        EncoderComputeUnits units = EncoderComputeUnits::cpuAndNeuralEngine,
+        const CoreMLPlatform& platform = {});
+
+    // Set before prepare(), like the backend, and read only on Core ML; units
+    // the chosen Core ML backend cannot run under are a ModelError.
     EncoderComputeUnits encoderComputeUnits() const { return chosenComputeUnits; }
     void setEncoderComputeUnits(EncoderComputeUnits units);
 
+    // What every refusal above asks, eacp's own by default.
+    const CoreMLPlatform& coreMLPlatform() const { return platform; }
+    void setCoreMLPlatform(CoreMLPlatform replacement);
+
     // Where the compiled Core ML models are cached, the encoder's and the
     // decoder's both, set before prepare() like the units; empty, the default,
-    // is eacp::ML::defaultCacheDirectory(), the app's own, so binaries that
-    // share one directory compile each model once. The encoder's name for it
-    // is the older one and the same setting.
+    // is eacp::ML::defaultCacheDirectory(), the company's folder, so every
+    // binary of this tree compiles each model once between them. The
+    // encoder's name for it is the older one and the same setting.
     const eacp::FilePath& coreMLCacheDirectory() const { return cacheDirectory; }
     void setCoreMLCacheDirectory(const eacp::FilePath& directory);
 
@@ -555,6 +596,8 @@ private:
     void requireWhisperShapes() const;
     void requireRunnableEncoder() const;
     void requireRunnableEncoder(EncoderBackend backend) const;
+    void requireSupportedEncoder(EncoderBackend backend,
+                                 EncoderComputeUnits units) const;
     void requireAudioContextForBackend(EncoderBackend backend, int positions) const;
     void requireRunnableDecoder(DecoderBackend backend) const;
 
@@ -654,6 +697,7 @@ private:
     EncoderComputeUnits chosenComputeUnits = EncoderComputeUnits::cpuAndNeuralEngine;
     DecoderBackend chosenDecoderBackend = DecoderBackend::kernels;
     DecoderComputeUnits chosenDecoderUnits = DecoderComputeUnits::cpu;
+    CoreMLPlatform platform;
     eacp::FilePath cacheDirectory;
     bool coreMLCacheHit = false;
     double coreMLLoadSeconds = 0.0;

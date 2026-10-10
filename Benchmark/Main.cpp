@@ -213,14 +213,22 @@ bool parseUnits(std::string_view text, WSP::EncoderComputeUnits& units)
     return false;
 }
 
-bool canRunTheEncoderOnCoreML()
+bool canRunTheEncoderOnCoreML(WSP::EncoderComputeUnits units)
 {
-    return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML);
+    return WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML, units);
 }
 
 bool canRunTheDecoderOnCoreML()
 {
     return WSP::Whisper::supportsDecoderBackend(WSP::DecoderBackend::coreML);
+}
+
+bool canRunEverythingOnTheEngine()
+{
+    return WSP::Whisper::supportsEncoderBackend(
+               WSP::EncoderBackend::coreMLWithMel,
+               WSP::EncoderComputeUnits::cpuAndNeuralEngine)
+           && canRunTheDecoderOnCoreML();
 }
 
 const char* shortNameOf(WSP::DecoderComputeUnits units)
@@ -255,8 +263,8 @@ public:
                WSP::DecoderComputeUnits decoderUnits = WSP::DecoderComputeUnits::cpu)
     {
         whisper.load(WSP::ModelFetch::directory());
-        whisper.setEncoderBackend(backendToUse);
         whisper.setEncoderComputeUnits(unitsToUse);
+        whisper.setEncoderBackend(backendToUse);
         whisper.setDecoderBackend(decoderToUse);
         whisper.setDecoderComputeUnits(decoderUnits);
 
@@ -888,8 +896,10 @@ void printCoreMLContestant(const Contestants& contestants, const Request& reques
 
     if (contestant == nullptr)
     {
-        std::printf("  WhisperEACP ANE not run: this build or this OS cannot run "
-                    "the encoder on Core ML\n");
+        std::printf("  WhisperEACP ANE not run: %s\n",
+                    WSP::Whisper::encoderBackendRefusal(WSP::EncoderBackend::coreML,
+                                                        request.units)
+                        .c_str());
         return;
     }
 
@@ -1366,20 +1376,21 @@ Contestants makeOurContestants(int audioContext, const Request& request)
     contestants.ours = addOurRuntime(
         contestants, audioContext, WSP::EncoderBackend::kernels, units);
 
-    if (canRunTheEncoderOnCoreML())
+    if (canRunTheEncoderOnCoreML(units))
         contestants.onCoreML = addOurRuntime(
             contestants, audioContext, WSP::EncoderBackend::coreML, units);
 
-    if (!canRunTheEncoderOnCoreML() || !canRunTheDecoderOnCoreML())
-        return contestants;
+    if (canRunTheEncoderOnCoreML(units) && canRunTheDecoderOnCoreML())
+        for (auto decoderUnits: request.decoderUnits)
+            addOurRuntime(contestants,
+                          audioContext,
+                          WSP::EncoderBackend::coreML,
+                          units,
+                          WSP::DecoderBackend::coreML,
+                          decoderUnits);
 
-    for (auto decoderUnits: request.decoderUnits)
-        addOurRuntime(contestants,
-                      audioContext,
-                      WSP::EncoderBackend::coreML,
-                      units,
-                      WSP::DecoderBackend::coreML,
-                      decoderUnits);
+    if (!canRunEverythingOnTheEngine())
+        return contestants;
 
     addOurRuntime(contestants,
                   audioContext,

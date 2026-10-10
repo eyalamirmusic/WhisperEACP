@@ -816,9 +816,12 @@ auto tRefusesRowsTooSmall = test("Net/CoreML/refusesARowsBufferTooSmall") = []
 auto tRefusesAContextOutsideTheSet =
     test("Net/CoreML/refusesAContextOutsideTheSet") = []
 {
-    auto whisper = Whisper {};
-    whisper.setEncoderBackend(EncoderBackend::coreML);
-    check(throwsModelError([&] { whisper.setAudioContext(600); }));
+    if (Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+    {
+        auto whisper = Whisper {};
+        whisper.setEncoderBackend(EncoderBackend::coreML);
+        check(throwsModelError([&] { whisper.setAudioContext(600); }));
+    }
 
     if (!canRun())
         return;

@@ -98,6 +98,17 @@ double secondsSince(std::chrono::steady_clock::time_point start)
     return std::chrono::duration<double>(elapsed).count();
 }
 
+void printEncoderSupport()
+{
+    const auto refusal =
+        WSP::Whisper::encoderBackendRefusal(WSP::EncoderBackend::coreML);
+
+    if (refusal.empty())
+        std::printf("  encoder on Core ML        yes\n");
+    else
+        std::printf("  encoder on Core ML        no: %s\n", refusal.c_str());
+}
+
 void printEncoderPlan()
 {
     if (!WSP::ModelFetch::isAvailable())
@@ -152,9 +163,14 @@ void printCoreMLInfo()
                 yesOrNo(eacp::ML::isSupported()));
     std::printf("  fused attention (spec 9)  %s\n",
                 yesOrNo(eacp::ML::supportsSpecification(9)));
+    std::printf("  enumerated shapes on CPU  %s\n",
+                yesOrNo(eacp::ML::enumeratedShapesRunOnTheCpu()));
     std::printf(
-        "  encoder on Core ML        %s\n",
-        yesOrNo(WSP::Whisper::supportsEncoderBackend(WSP::EncoderBackend::coreML)));
+        "  cpuAndNeuralEngine is CPU %s\n",
+        yesOrNo(eacp::ML::isCpuOnly(eacp::ML::ComputeUnits::cpuAndNeuralEngine)));
+    printEncoderSupport();
+    std::printf("  compiled models           %s\n",
+                eacp::ML::defaultCacheDirectory().str().c_str());
 
     if (readsThePlan)
         printEncoderPlan();

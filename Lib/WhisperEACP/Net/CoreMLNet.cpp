@@ -62,7 +62,7 @@ void CoreMLNet::requireFixedShape(std::string_view op) const
                                   "program has none"};
 }
 
-const CoreMLNet::CacheInfo& CoreMLNet::cacheInfo(const Cache& cache) const
+CoreMLNet::CacheInfo& CoreMLNet::cacheInfo(const Cache& cache)
 {
     requireFixedShape("a cache");
 
@@ -152,9 +152,10 @@ Tensor CoreMLNet::input(const Binding& source, const Shape& shape, DType type)
 
         if (type == DType::int32 && shape.rank() == 1
             && netOptions.embedsTokenByProduct)
-            return make(
-                namedInput(tokenDigitsFeature, {1, 2}, eacp::ML::DType::float16),
-                Layout::tokens);
+            return make(namedInput(tokenDigitsFeature,
+                                   {shape[0], 2},
+                                   eacp::ML::DType::float16),
+                        Layout::tokens);
 
         if (type == DType::int32 && shape.rank() == 1)
             return make(namedInput(name, graphShape(shape), eacp::ML::DType::int32),
@@ -288,21 +289,26 @@ eacp::ML::Tensor CoreMLNet::oneHot(eacp::ML::Tensor index, int count)
     return program.apply(counting(count), index, isIndex);
 }
 
-// [1, vocabulary]: the outer product of the two digits' one-hot rows, laid
-// out a radix to a row and cut to the vocabulary.
-eacp::ML::Tensor CoreMLNet::oneHotToken(eacp::ML::Tensor digits, int vocabulary)
+// [tokens, vocabulary]: per token, the outer product of its two digits'
+// one-hot rows, laid out a radix to a row and cut to the vocabulary.
+eacp::ML::Tensor CoreMLNet::oneHotTokens(eacp::ML::Tensor digits, int vocabulary)
 {
+    const auto tokens = extentOf(digits, 2, 0);
     const auto highCount = (vocabulary + tokenRadix - 1) / tokenRadix;
-    const auto high = program.slice(digits, {0, 0}, {1, 1});
-    const auto low = program.slice(digits, {0, 1}, {1, 2});
+    const auto high = program.slice(digits, {0, 0}, {tokens, 1});
+    const auto low = program.slice(digits, {0, 1}, {tokens, 2});
 
-    const auto highColumn = program.reshape(oneHot(high, highCount), {highCount, 1});
+    const auto highColumns =
+        program.reshape(oneHot(high, highCount), {tokens, highCount, 1});
+    const auto lowRows =
+        program.reshape(oneHot(low, tokenRadix), {tokens, 1, tokenRadix});
     const auto product = [](const eacp::GPU::Float& a, const eacp::GPU::Float& b)
     { return a * b; };
-    const auto grid = program.apply(highColumn, oneHot(low, tokenRadix), product);
+    const auto grid = program.apply(highColumns, lowRows, product);
 
-    return program.slice(
-        program.reshape(grid, {1, highCount * tokenRadix}), {0, 0}, {1, vocabulary});
+    return program.slice(program.reshape(grid, {tokens, highCount * tokenRadix}),
+                         {0, 0},
+                         {tokens, vocabulary});
 }
 
 // The scores a radix to a row, padded with fp16's lowest; the lowest row whose
@@ -407,6 +413,10 @@ Tensor CoreMLNet::cached(const Cache& cache)
     requireFixedShape("cached");
 
     const auto& info = cacheInfo(cache);
+
+    if (info.filled)
+        return make(*info.filled, Layout::wholeCache, info.capacity);
+
     const auto whole = namedInput(
         cacheFeature(cache), {info.capacity, info.width}, eacp::ML::DType::float16);
 
@@ -524,20 +534,24 @@ Tensor CoreMLNet::attention(const Tensor& queries,
     return make(mergeHeads(attended), Layout::rows);
 }
 
-// Which keys a query may attend to, [1, keys], 1 or 0: over an appended cache
-// the self mask's capacity rows and the step's own rows after them, always
-// allowed; over a whole cache the cross mask. A step's rows are one token's,
-// since a causal mask among several appended rows is not built here: a prompt
-// is fed a token a step.
+// Which keys a query may attend to, 1 or 0: over a whole cache the cross
+// mask, [1, keys]; over the rows a sequence's opening appended to empty caches
+// each row's own and earlier ones, [rows, rows]; over a cache a step appended
+// to the self mask's capacity rows and the step's own rows after them, always
+// allowed, [1, keys]. A step past the opening attends from one token.
 eacp::ML::Tensor CoreMLNet::allowedKeys(const Value& keys, eacp::ML::Tensor queries)
 {
     if (keys.layout == Layout::wholeCache)
         return namedInput(
             crossMaskFeature, {1, keys.maskedRows}, eacp::ML::DType::float16);
 
+    if (keys.maskedRows == 0)
+        return causalMask(extentOf(queries, 2, 0));
+
     if (program.isValid() && extentOf(queries, 2, 0) != 1)
         throw std::logic_error {"a Core ML decoder step attends from one token; "
-                                "feed a prompt a token a step"};
+                                "only the program that opens a sequence takes "
+                                "several"};
 
     const auto appended = extentOf(keys.tensor, 2, 0) - keys.maskedRows;
     const auto name =
@@ -559,13 +573,45 @@ eacp::ML::Tensor CoreMLNet::allowedKeys(const Value& keys, eacp::ML::Tensor quer
     return allowed;
 }
 
-// One token looked up and its position added, the position an input: the
-// program serves every step of a sequence, so firstPosition, the one the body
-// records with, is the run time's to give.
+// [rows, rows], 1 on and below the diagonal: each of a prompt's rows attends
+// to itself and the rows before it.
+eacp::ML::Tensor CoreMLNet::causalMask(int rows)
+{
+    const auto name = "causal_mask_" + std::to_string(rows);
+
+    if (const auto* found = masks.getValue(name))
+        return *found;
+
+    auto allowed = Vector<float> {};
+
+    for (auto row = 0; row < rows; ++row)
+        for (auto column = 0; column < rows; ++column)
+            allowed.add(column <= row ? 1.0f : 0.0f);
+
+    const auto mask = program.halfConstant(name, {rows, rows}, allowed);
+    masks.emplace(name, mask);
+
+    return mask;
+}
+
+eacp::ML::Tensor CoreMLNet::positionRows(const Weight& positionTable,
+                                         int firstPosition,
+                                         int count)
+{
+    return program.slice(weightOf(positionTable),
+                         {firstPosition, 0},
+                         {firstPosition + count, positionTable.dimension(1)});
+}
+
+// The tokens looked up and their positions added. A step embeds one token at
+// the position input, since one program serves every step of a sequence and
+// firstPosition, the one the body records with, is the run time's to give; the
+// program that opens a sequence embeds the whole prompt at the positions it
+// records with.
 Tensor CoreMLNet::embed(const Tensor& tokens,
                         const Weight& tokenTable,
                         const Weight& positionTable,
-                        int)
+                        int firstPosition)
 {
     requireFixedShape("embed");
 
@@ -574,19 +620,24 @@ Tensor CoreMLNet::embed(const Tensor& tokens,
     if (value.layout != Layout::tokens)
         throw std::logic_error {"the Core ML net embeds only token ids"};
 
-    if (!netOptions.embedsTokenByProduct && program.isValid()
-        && program.shape(value.tensor)[0] != 1)
-        throw std::logic_error {"a Core ML decoder step embeds one token; feed a "
-                                "prompt a token a step"};
+    const auto tokenCount = program.isValid() ? program.shape(value.tensor)[0] : 1;
+
+    if (!netOptions.opensSequence && tokenCount != 1)
+        throw std::logic_error {"a Core ML decoder step embeds one token; only "
+                                "the program that opens a sequence takes "
+                                "several"};
 
     const auto token =
         netOptions.embedsTokenByProduct
-            ? program.matmul(oneHotToken(value.tensor, tokenTable.dimension(0)),
+            ? program.matmul(oneHotTokens(value.tensor, tokenTable.dimension(0)),
                              weightOf(tokenTable))
             : program.gather(weightOf(tokenTable), value.tensor, 0);
 
     const auto offset = [&]
     {
+        if (netOptions.opensSequence)
+            return positionRows(positionTable, firstPosition, tokenCount);
+
         if (!netOptions.embedsPositionByProduct)
             return program.gather(
                 weightOf(positionTable),
@@ -603,8 +654,10 @@ Tensor CoreMLNet::embed(const Tensor& tokens,
     return make(sum(token, offset), Layout::rows);
 }
 
-// A projection that fills the cache writes it out; a shorter one appends to
-// the cache read in, and writes out only the rows it made.
+// A projection that fills the cache writes it out, and keeps it for what
+// reads the cache later in the same program; a shorter one appends to the
+// cache read in, or to an empty one in the program that opens a sequence, and
+// writes out only the rows it made.
 Tensor CoreMLNet::appendLinear(Cache& cache,
                                const Tensor& input,
                                const Weight& weight,
@@ -612,7 +665,7 @@ Tensor CoreMLNet::appendLinear(Cache& cache,
 {
     requireFixedShape("appendLinear");
 
-    const auto info = cacheInfo(cache);
+    auto& info = cacheInfo(cache);
     const auto projected =
         valueOf(linear(input, weight, bias, Activation::none)).tensor;
     const auto count = extentOf(projected, 2, 0);
@@ -620,6 +673,7 @@ Tensor CoreMLNet::appendLinear(Cache& cache,
     if (count == info.capacity)
     {
         declareOutput(projected, cacheFeature(cache));
+        info.filled = projected;
         cache.rows = count;
 
         return make(projected, Layout::rows);
@@ -628,6 +682,14 @@ Tensor CoreMLNet::appendLinear(Cache& cache,
     if (program.isValid() && (count <= 0 || count > info.capacity))
         throw std::logic_error {"a cache of " + std::to_string(info.capacity)
                                 + " rows was appended " + std::to_string(count)};
+
+    if (netOptions.opensSequence)
+    {
+        declareOutput(projected, appendedRowsFeature(cache));
+        cache.rows = count;
+
+        return make(projected, Layout::appendedCache, 0);
+    }
 
     const auto stored = namedInput(
         cacheFeature(cache), {info.capacity, info.width}, eacp::ML::DType::float16);
@@ -646,7 +708,7 @@ Cache CoreMLNet::makeCache(int capacityRows, int width)
     if (capacityRows <= 0 || width <= 0)
         throw std::logic_error {"a cache needs rows and a width"};
 
-    caches.add(CacheInfo {capacityRows, width});
+    caches.add(CacheInfo {capacityRows, width, std::nullopt});
 
     return Cache {caches.size() - 1, 0};
 }

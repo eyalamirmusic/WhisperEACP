@@ -3,7 +3,7 @@
 # and the autorelease pool the Metal backend is written against.
 # Tests/Support/GpuTestMain.cpp is that entry point, shared by every
 # GPU-touching test module.
-nano_add_executable(GPUTests
+whisper_add_test_executable(GPUTests
         NO_MAIN
         SOURCES
         ComputeSmokeTests.cpp

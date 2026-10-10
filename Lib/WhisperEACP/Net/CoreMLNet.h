@@ -63,6 +63,15 @@ struct CoreMLNetOptions
     bool embedsTokenByProduct = false;
     bool embedsPositionByProduct = false;
 
+    // A decoder program that opens a sequence: recordSequenceStart and the
+    // prompt's recordDecoderStep recorded into one program. A cache the start
+    // fills is read back inside the program rather than as an input, and every
+    // other cache begins empty, so the prompt's rows are all a self cache
+    // holds: attended causally among themselves, with no self mask, and put out
+    // as appendedRowsFeature. The prompt's positions are the ones the body
+    // records with, rows of the table rather than the position input.
+    bool opensSequence = false;
+
     // An encoder program's: the mel input as [1, frames, bands] rather than
     // [1, bands, frames], and transposed inside, which is the layout a Core ML
     // mel (CoreMLMel.h) hands a context's frames over in.
@@ -99,9 +108,11 @@ struct CoreMLNetOptions
 // whole under crossMaskFeature, the same for the encoder rows a sequence
 // attends to. A step embeds one token, and the position it takes is the
 // positionFeature input rather than the firstPosition the body records with,
-// since one program serves every position. The masks reach the fused
-// attention as its bool mask (eacp's G9), or an additive one in front of the
-// softmax without it.
+// since one program serves every position. A program that opens a sequence
+// (CoreMLNetOptions::opensSequence) is the start and the prompt in one: the
+// cross caches it fills feed its own attention, and the prompt's tokens all
+// go in at once. The masks reach the fused attention as its bool mask (eacp's
+// G9), or an additive one in front of the softmax without it.
 //
 // A Tensor is a MIL value, and MIL values are immutable, so there is nothing
 // to reclaim when the last copy goes.
@@ -227,6 +238,7 @@ private:
     {
         int capacity = 0;
         int width = 0;
+        std::optional<eacp::ML::Tensor> filled;
     };
 
     Tensor make(eacp::ML::Tensor tensor, Layout layout, int maskedRows = 0);
@@ -253,11 +265,14 @@ private:
 
     eacp::ML::Tensor counting(int count);
     eacp::ML::Tensor oneHot(eacp::ML::Tensor index, int count);
-    eacp::ML::Tensor oneHotToken(eacp::ML::Tensor digits, int vocabulary);
+    eacp::ML::Tensor oneHotTokens(eacp::ML::Tensor digits, int vocabulary);
 
     void requireFixedShape(std::string_view op) const;
-    const CacheInfo& cacheInfo(const Cache& cache) const;
+    CacheInfo& cacheInfo(const Cache& cache);
     eacp::ML::Tensor allowedKeys(const Value& keys, eacp::ML::Tensor queries);
+    eacp::ML::Tensor causalMask(int rows);
+    eacp::ML::Tensor
+        positionRows(const Weight& positionTable, int firstPosition, int count);
 
     eacp::ML::Tensor splitHeads(eacp::ML::Tensor rowsToSplit, int heads);
     eacp::ML::Tensor mergeHeads(eacp::ML::Tensor perHead);

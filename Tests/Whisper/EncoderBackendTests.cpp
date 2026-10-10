@@ -91,7 +91,9 @@ auto tEncoderBackendDefaults = test("Whisper/encoderBackendDefaults") = []
 
 #if EACP_HAS_COREML
     check(Whisper::supportsEncoderBackend(EncoderBackend::coreML)
-          == (eacp::ML::isSupported() && eacp::ML::supportsSpecification(8)));
+          == (eacp::ML::isSupported() && eacp::ML::supportsSpecification(8)
+              && !enumeratedShapesTrap(EncoderComputeUnits::cpuAndNeuralEngine,
+                                       CoreMLPlatform {})));
 #else
     check(!Whisper::supportsEncoderBackend(EncoderBackend::coreML));
 #endif
@@ -100,8 +102,18 @@ auto tEncoderBackendDefaults = test("Whisper/encoderBackendDefaults") = []
     whisper.setEncoderComputeUnits(EncoderComputeUnits::cpu);
     check(whisper.encoderComputeUnits() == EncoderComputeUnits::cpu);
 
-    whisper.setEncoderBackend(EncoderBackend::coreML);
-    check(whisper.encoderBackend() == EncoderBackend::coreML);
+    if (Whisper::supportsEncoderBackend(EncoderBackend::coreML,
+                                        EncoderComputeUnits::cpu))
+    {
+        whisper.setEncoderBackend(EncoderBackend::coreML);
+        check(whisper.encoderBackend() == EncoderBackend::coreML);
+    }
+    else
+    {
+        check(throwsModelError(
+            [&] { whisper.setEncoderBackend(EncoderBackend::coreML); }));
+        check(whisper.encoderBackend() == EncoderBackend::kernels);
+    }
 
     whisper.setEncoderBackend(EncoderBackend::kernels);
     check(whisper.encoderBackend() == EncoderBackend::kernels);
@@ -114,6 +126,9 @@ auto tCoreMLAudioContextIsEnumerated =
     auto kernels = Whisper {};
     kernels.setAudioContext(600);
     check(kernels.audioContext() == 600);
+
+    if (!Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+        return;
 
     auto coreML = Whisper {};
     coreML.setEncoderBackend(EncoderBackend::coreML);
@@ -137,13 +152,25 @@ auto tCoreMLAudioContextIsEnumerated =
 };
 
 // prepare() checks what setAudioContext could not, since the context may have
-// been set before the backend was, and refuses a backend it cannot run. Both
-// before anything reaches the device.
+// been set before the backend was; a backend this machine cannot run is
+// refused sooner, by the setter. Both before anything reaches the device.
 auto tPrepareRefusesAnUnrunnableEncoder =
     test("Whisper/prepareRefusesAnUnrunnableEncoder") = []
 {
     if (!hasWhisperModel())
         return;
+
+    if (!Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+    {
+        auto unsupported = Whisper {};
+        unsupported.load(modelDirectory());
+
+        const auto backendRefusal = modelErrorFrom(
+            [&] { unsupported.setEncoderBackend(EncoderBackend::coreML); });
+        check(mentions(backendRefusal, "Core ML"));
+        check(unsupported.encoderBackend() == EncoderBackend::kernels);
+        return;
+    }
 
     auto early = Whisper {};
     early.load(modelDirectory());
@@ -153,17 +180,6 @@ auto tPrepareRefusesAnUnrunnableEncoder =
     const auto contextRefusal = modelErrorFrom([&] { early.prepare(); });
     check(mentions(contextRefusal, "600"));
     check(!early.isPrepared());
-
-    if (Whisper::supportsEncoderBackend(EncoderBackend::coreML))
-        return;
-
-    auto unsupported = Whisper {};
-    unsupported.load(modelDirectory());
-    unsupported.setEncoderBackend(EncoderBackend::coreML);
-
-    const auto backendRefusal = modelErrorFrom([&] { unsupported.prepare(); });
-    check(mentions(backendRefusal, "Core ML"));
-    check(!unsupported.isPrepared());
 };
 
 auto tEncoderBackendIsChosenBeforePrepare =
@@ -387,8 +403,18 @@ auto tSwitchRefusesWhatItCannotRun =
     test("Whisper/switchRefusesWhatItCannotRun") = []
 {
     auto unprepared = Whisper {};
-    unprepared.switchEncoderBackend(EncoderBackend::coreML);
-    check(unprepared.encoderBackend() == EncoderBackend::coreML);
+
+    if (Whisper::supportsEncoderBackend(EncoderBackend::coreML))
+    {
+        unprepared.switchEncoderBackend(EncoderBackend::coreML);
+        check(unprepared.encoderBackend() == EncoderBackend::coreML);
+    }
+    else
+    {
+        check(throwsModelError(
+            [&] { unprepared.switchEncoderBackend(EncoderBackend::coreML); }));
+    }
+
     check(!unprepared.isPrepared());
 
     auto resolved = unprepared.switchEncoderBackendAsync(EncoderBackend::kernels);

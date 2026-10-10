@@ -21,7 +21,7 @@ endif ()
 # front-end, the filterbank the loader publishes, the vocabulary, and the two
 # halves of the model with the greedy search on top. whisper is whisper.cpp's
 # own library.
-nano_add_executable(OracleTests
+whisper_add_test_executable(OracleTests
         NO_MAIN
         SOURCES
         DecoderOracleTests.cpp

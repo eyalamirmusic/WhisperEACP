@@ -5,7 +5,7 @@
 # what lets these tests reuse Tests/Kernels/Common.h and Tests/Model/Common.h
 # instead of keeping a third copy of the GPU plumbing and the safetensors
 # assembly.
-nano_add_executable(EncoderTests
+whisper_add_test_executable(EncoderTests
         NO_MAIN
         SOURCES
         EncoderTests.cpp

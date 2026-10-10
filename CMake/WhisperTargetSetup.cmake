@@ -21,11 +21,31 @@ function(whisper_set_default_warnings_level target)
     endif ()
 endfunction()
 
+# Every executable here carries eacp's AppInfo, named under the company the
+# root CMakeLists sets in EACP_COMPANY_NAME, so the folders eacp derives from it
+# are one per tree rather than one per binary: ML::defaultCacheDirectory() is
+# <Caches>/<company>/CoreML, and the apps and the benchmark compile a Core ML
+# model into it once between them. eacp_set_gui_subsystem embeds it already,
+# which the AppInfo.json among the target's sources tells apart.
+function(whisper_embed_app_info target)
+    get_target_property(type ${target} TYPE)
+    if (NOT type STREQUAL "EXECUTABLE")
+        return()
+    endif ()
+
+    get_target_property(sources ${target} SOURCES)
+    list(FILTER sources INCLUDE REGEX "/AppInfo\\.json$")
+    if (NOT sources)
+        eacp_embed_app_info(${target})
+    endif ()
+endfunction()
+
 # The bundle plists come from eacp rather than from a copy here: an app of ours
 # is an eacp app, and eacp's TargetSetup publishes EACP_MACOS_PLIST and
 # EACP_IOS_PLIST when it is included, top-level project or not.
 function(whisper_set_default_target_setting target)
     whisper_set_default_warnings_level(${target})
+    whisper_embed_app_info(${target})
 
     set_target_properties(${target} PROPERTIES
             INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)

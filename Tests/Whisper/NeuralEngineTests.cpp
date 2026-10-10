@@ -114,6 +114,13 @@ auto tPresetSetsTheFour = test("Whisper/NeuralEngine/presetSetsTheFour") = []
     auto whisper = Whisper {};
     check(!whisper.isOnNeuralEngineThroughout());
 
+    if (!Whisper::supportsEncoderBackend(EncoderBackend::coreMLWithMel))
+    {
+        check(throwsModelError([&] { whisper.setNeuralEngineThroughout(); }));
+        check(whisper.encoderBackend() == EncoderBackend::kernels);
+        return;
+    }
+
     whisper.setNeuralEngineThroughout();
 
     check(whisper.isOnNeuralEngineThroughout());

@@ -6,7 +6,7 @@
 # Tests/Decoder/Common.h includes Tests/Encoder/Common.h, which is where the
 # safetensors builder, packHalf and the layer norm and linear references
 # already live. The decoder's own target does not depend on the encoder's.
-nano_add_executable(DecoderTests
+whisper_add_test_executable(DecoderTests
         NO_MAIN
         SOURCES
         DecoderShapeTests.cpp

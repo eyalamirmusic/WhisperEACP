@@ -6,7 +6,7 @@
 # second copy of the same pair of environment variables — and lets
 # PackedWeightsTests.cpp drive one decode step through Tests/Decoder/Common.h's
 # harness rather than assembling a second one here.
-nano_add_executable(WhisperTests
+whisper_add_test_executable(WhisperTests
         NO_MAIN
         SOURCES
         CoreMLDecoderTests.cpp
@@ -15,6 +15,7 @@ nano_add_executable(WhisperTests
         LiveTranscriberTests.cpp
         NeuralEngineTests.cpp
         PackedWeightsTests.cpp
+        RefusalTests.cpp
         TranscribeTests.cpp
         WhisperTests.cpp
         ${WHISPER_MODEL_TEST_MAIN}

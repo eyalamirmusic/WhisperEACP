@@ -1,4 +1,4 @@
-nano_add_executable(NetTests
+whisper_add_test_executable(NetTests
         NO_MAIN
         SOURCES
         CoreMLEncoderTests.cpp

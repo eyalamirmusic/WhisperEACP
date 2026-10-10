@@ -3,7 +3,7 @@
 # four files the fetch fetches, so they take the main that fetches them.
 # whisper-model comes along for ModelFetch rather than for anything the tokenizer
 # itself reads.
-nano_add_executable(TokenizerTests
+whisper_add_test_executable(TokenizerTests
         NO_MAIN
         SOURCES
         TokenizerTests.cpp
