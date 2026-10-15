@@ -268,9 +268,50 @@ eacp's GPU layer is main-thread only — so a run of the model is a few tens of
 milliseconds the window waits for, and only the device callback is on a thread
 of its own. `--autostart` opens the default input as soon as the model is ready
 and logs a line a second to stdout, which is how a run is checked without a hand
-on the mouse. `--coreml` runs the encoder on Core ML's Neural Engine, where
-the machine has it; a run then comes back on a later tick and the window is
-never held for the encode.
+on the mouse.
+
+It starts with everything on the Neural Engine, the encoder on "Core ML + mel"
+and the decoder on "Core ML (engine)", where the machine has one; a run then
+comes back on a later tick and the window is never held for the encode. The
+model is prepared on Metal and switched once it is ready, so a switch the
+machine cannot make leaves that half on Metal with the reason on the error
+line. `--gpu` starts both halves on Metal instead, `--coreml` the encoder on
+"Core ML" with the mel on the GPU, and `--coreml-decoder` the decoder on "Core
+ML (CPU)"; the two boxes move either half at any time.
+
+### Building for an iPhone
+
+The `ios-device` preset generates an Xcode project that builds Live Transcribe
+for a physical iPhone, signed automatically under the development team in
+`WHISPER_EACP_IOS_TEAM`:
+
+```bash
+cmake --preset ios-device                  # build-ios/WhisperEACP.xcodeproj
+cmake --build --preset ios-device          # LiveTranscribe, Debug, signed
+open build-ios/WhisperEACP.xcodeproj       # then run the LiveTranscribe scheme on the phone
+```
+
+The build preset passes `-allowProvisioningUpdates`, so Xcode registers the
+bundle identifier and fetches a profile on its own; the same from `xcodebuild`
+is
+
+```bash
+xcodebuild -project build-ios/WhisperEACP.xcodeproj -scheme LiveTranscribe \
+           -configuration Debug -destination 'generic/platform=iOS' \
+           -allowProvisioningUpdates build
+```
+
+`WHISPER_EACP_IOS_TEAM` is the Apple team ID the app is signed with; to sign
+under another, configure with `-DWHISPER_EACP_IOS_TEAM=<team ID>`. Left empty,
+a device build is not signed and does not install. The console apps and the
+tests are left out of an iOS tree, since a phone has nowhere to run them.
+
+The phone starts as a Mac does, with everything on the Neural Engine: the
+encoder on "Core ML + mel", the decoder on "Core ML (engine)". Core ML needs
+iOS 17; below it the switch is refused and the app stays on Metal, with
+the reason on the error line. The first launch downloads the 151 MB model into
+the app's own sandbox, and the first Core ML switch compiles the encoder for
+the engine before the first run.
 
 ## Testing
 

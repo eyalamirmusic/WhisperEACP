@@ -89,6 +89,7 @@ private:
     MakeASound::Error applySelection();
     void prepareForStream();
     void rememberWhetherRateIsNative();
+    void adoptDefaultInput();
     void discardQueued();
 
     // Eight seconds at 16 kHz: long enough that a main thread busy with a

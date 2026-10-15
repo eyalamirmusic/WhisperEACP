@@ -59,6 +59,33 @@ function(whisper_set_default_target_setting target)
     endif ()
 endfunction()
 
+# Signing for an iPhone, under the Xcode generator only, the way MakeASound's
+# plugin setup does it. eacp names a development team only when it is the
+# top-level project, so a tree that fetches it signs nothing unless it says so:
+# with WHISPER_EACP_IOS_TEAM set, Xcode signs automatically under that team;
+# without one, device builds are left unsigned rather than failing on a missing
+# identity.
+function(whisper_sign_ios_app target)
+    if (NOT IOS OR NOT CMAKE_GENERATOR STREQUAL "Xcode")
+        return()
+    endif ()
+
+    set_target_properties(${target} PROPERTIES
+            XCODE_ATTRIBUTE_TARGETED_DEVICE_FAMILY "1,2")
+
+    if (WHISPER_EACP_IOS_TEAM)
+        set_target_properties(${target} PROPERTIES
+                XCODE_ATTRIBUTE_DEVELOPMENT_TEAM "${WHISPER_EACP_IOS_TEAM}"
+                XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Automatic"
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "Apple Development")
+    else ()
+        set_target_properties(${target} PROPERTIES
+                XCODE_ATTRIBUTE_CODE_SIGN_STYLE "Manual"
+                XCODE_ATTRIBUTE_CODE_SIGN_IDENTITY "-"
+                "XCODE_ATTRIBUTE_CODE_SIGNING_ALLOWED[sdk=iphoneos*]" "NO")
+    endif ()
+endfunction()
+
 function(whisper_enable_unity_build target)
     if (WHISPER_EACP_UNITY_BUILD)
         set_target_properties(${target} PROPERTIES UNITY_BUILD ON)

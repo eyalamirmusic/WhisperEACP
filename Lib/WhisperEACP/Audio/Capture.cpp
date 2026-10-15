@@ -52,6 +52,18 @@ CaptureLevel measureLevel(Span<const float> samples)
 Capture::Capture()
 {
     manager.emplace();
+    monoBlock.resize(scratchCapacity);
+
+    adoptDefaultInput();
+}
+
+// iOS lists a microphone only once the session is in a category that records,
+// and MakeASound applies the session at open, after the device was chosen. So
+// the category is set here first, which is also what brings up the permission
+// prompt. A no-op everywhere without an audio session.
+void Capture::adoptDefaultInput()
+{
+    MakeASound::applySessionConfig({}, true);
 
     streamConfig = manager->getDefaultInputConfig();
 
@@ -60,7 +72,6 @@ Capture::Capture()
     // resamples. canCaptureNatively() only says whether that conversion happens.
     streamConfig.sampleRate = sampleRate;
 
-    monoBlock.resize(scratchCapacity);
     rememberWhetherRateIsNative();
 }
 
@@ -145,6 +156,9 @@ MakeASound::Error Capture::setChannels(int first, int count)
 
 MakeASound::Error Capture::start()
 {
+    if (!streamConfig.input.has_value())
+        adoptDefaultInput();
+
     if (!streamConfig.input.has_value())
     {
         lastError = MakeASound::Error::NO_DEVICES_FOUND;

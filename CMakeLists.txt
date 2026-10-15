@@ -59,6 +59,12 @@ option(WHISPER_EACP_UNITY_BUILD
         "Compile WhisperEACP libraries as CMake unity builds" OFF)
 option(WHISPER_EACP_CI_BUILD "Mirror the exact flag set used by CI builds" OFF)
 
+# The Apple development team an iPhone build of the apps is signed with, under
+# the Xcode generator. Left empty, a device build is not signed at all, which
+# compiles and links but does not install; the ios-device preset names one.
+set(WHISPER_EACP_IOS_TEAM "" CACHE STRING
+        "Apple development team ID that signs the apps for an iOS device")
+
 if (WHISPER_EACP_CI_BUILD)
     set(WHISPER_EACP_UNITY_BUILD ON CACHE BOOL
             "Compile WhisperEACP libraries as CMake unity builds" FORCE)
@@ -139,8 +145,16 @@ if (WHISPER_EACP_ENABLE_APPS)
     add_subdirectory(Apps)
 endif ()
 
+# Off by default on iOS: every suite is a console executable, which a phone has
+# no way to launch.
+if (PROJECT_IS_TOP_LEVEL AND NOT IOS)
+    set(whisper_tests_by_default ON)
+else ()
+    set(whisper_tests_by_default OFF)
+endif ()
+
 option(WHISPER_EACP_ENABLE_TESTS "Enable tests for WhisperEACP"
-        ${PROJECT_IS_TOP_LEVEL})
+        ${whisper_tests_by_default})
 
 if (WHISPER_EACP_ENABLE_TESTS)
     enable_testing()

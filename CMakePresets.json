@@ -1,0 +1,28 @@
+{
+    "version": 6,
+    "configurePresets": [
+        {
+            "name": "ios-device",
+            "displayName": "iPhone (Xcode, signed)",
+            "description": "An Xcode project that builds LiveTranscribe for a physical iPhone, signed with the personal team.",
+            "generator": "Xcode",
+            "binaryDir": "${sourceDir}/build-ios",
+            "cacheVariables": {
+                "CMAKE_SYSTEM_NAME": "iOS",
+                "CMAKE_OSX_SYSROOT": "iphoneos",
+                "CMAKE_OSX_ARCHITECTURES": "arm64",
+                "WHISPER_EACP_UNITY_BUILD": "OFF",
+                "WHISPER_EACP_IOS_TEAM": "LK9GL8NWU4"
+            }
+        }
+    ],
+    "buildPresets": [
+        {
+            "name": "ios-device",
+            "configurePreset": "ios-device",
+            "configuration": "Debug",
+            "targets": ["LiveTranscribe"],
+            "nativeToolOptions": ["-allowProvisioningUpdates"]
+        }
+    ]
+}

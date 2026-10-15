@@ -19,6 +19,7 @@ set_target_properties(LiveTranscribe PROPERTIES
 
 eacp_set_gui_subsystem(LiveTranscribe)
 whisper_set_default_target_setting(LiveTranscribe)
+whisper_sign_ios_app(LiveTranscribe)
 
 # Opening the capture side needs NSMicrophoneUsageDescription, which eacp's
 # template does not carry, and macOS kills an app that asks for the microphone

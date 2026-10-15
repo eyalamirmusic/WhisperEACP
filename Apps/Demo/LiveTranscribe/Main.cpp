@@ -23,8 +23,8 @@ namespace LiveTranscribe
 namespace
 {
 constexpr auto usage =
-    "usage: LiveTranscribe [--autostart] [--coreml] [--coreml-decoder] [--ane]\n"
-    "                      [model directory]\n"
+    "usage: LiveTranscribe [--autostart] [--gpu] [--coreml] [--coreml-decoder]\n"
+    "                      [--ane] [model directory]\n"
     "\n"
     "  model directory  a HuggingFace Whisper repo: config.json,\n"
     "                   preprocessor_config.json, model.safetensors and\n"
@@ -33,16 +33,19 @@ constexpr auto usage =
     "  --autostart      open the default input as soon as the model is ready,\n"
     "                   and log a status line a second to stdout, so a run can\n"
     "                   be checked without a hand on the mouse.\n"
-    "  --coreml         start with the encoder on Core ML's Neural Engine rather\n"
-    "                   than the GPU kernels, where the machine can; the encoder\n"
-    "                   box switches between the two at any time. The first\n"
-    "                   switch on a machine compiles it for the engine, about\n"
-    "                   14 s, with the window live throughout.\n"
-    "  --coreml-decoder start with the decoder on Core ML (the CPU) rather than\n"
-    "                   the GPU kernels; the decoder box switches it too.\n"
-    "  --ane            start with everything on the Neural Engine: the encoder\n"
-    "                   box on \"Core ML + mel\" and the decoder box on\n"
-    "                   \"Core ML (engine)\", which leave the GPU idle.\n";
+    "  --gpu            start with both halves on the GPU kernels, \"GPU (Metal)\".\n"
+    "  --coreml         start with the encoder on \"Core ML\": the Neural Engine,\n"
+    "                   with the mel on the GPU.\n"
+    "  --coreml-decoder start with the decoder on \"Core ML (CPU)\".\n"
+    "  --ane            the default: everything on the Neural Engine, the\n"
+    "                   encoder box on \"Core ML + mel\" and the decoder box on\n"
+    "                   \"Core ML (engine)\", which leave the GPU idle.\n"
+    "\n"
+    "  Each switch names where a half starts, and the boxes move either half at\n"
+    "  any time. The model is prepared on the kernels and switched once it is\n"
+    "  ready; the first switch on a machine compiles for the engine, about 15 s,\n"
+    "  with the window live throughout, and one the machine cannot make leaves\n"
+    "  that half on the kernels with the reason on the error line.\n";
 
 constexpr auto ticksPerSecond = 30;
 constexpr auto ticksBetweenDeviceScans = ticksPerSecond * 5;
@@ -51,9 +54,8 @@ struct Arguments
 {
     std::string modelDirectory;
     bool autostart = false;
-    bool coreML = false;
-    bool coreMLDecoder = false;
-    bool allOnTheEngine = false;
+    WSP::EncoderBackend encoder = WSP::EncoderBackend::coreMLWithMel;
+    DecoderChoice decoder = decoderOnTheEngine;
     bool understood = true;
 };
 
@@ -67,12 +69,20 @@ Arguments parseArguments(int argc, char* argv[])
 
         if (argument == "--autostart")
             arguments.autostart = true;
+        else if (argument == "--gpu")
+        {
+            arguments.encoder = WSP::EncoderBackend::kernels;
+            arguments.decoder = {};
+        }
         else if (argument == "--coreml")
-            arguments.coreML = true;
+            arguments.encoder = WSP::EncoderBackend::coreML;
         else if (argument == "--coreml-decoder")
-            arguments.coreMLDecoder = true;
+            arguments.decoder = decoderOnTheCpu;
         else if (argument == "--ane")
-            arguments.allOnTheEngine = true;
+        {
+            arguments.encoder = WSP::EncoderBackend::coreMLWithMel;
+            arguments.decoder = decoderOnTheEngine;
+        }
         else if (arguments.modelDirectory.empty() && !argument.starts_with("--"))
             arguments.modelDirectory = argv[i];
         else
@@ -191,10 +201,7 @@ struct App
         std::fflush(stdout);
     }
 
-    Session session {arguments.modelDirectory,
-                     arguments.coreML,
-                     arguments.coreMLDecoder,
-                     arguments.allOnTheEngine};
+    Session session {arguments.modelDirectory, arguments.encoder, arguments.decoder};
 
     MainPanel panel {session};
     eacp::Graphics::Window window {makeWindowOptions()};

@@ -54,12 +54,37 @@ and a configure downloads nothing of it — see "Fetching the model" below. A
 build directory from before that change keeps a stale `WHISPER_EACP_FETCH_MODEL`
 entry in its cache, which nothing reads.
 
+- `WHISPER_EACP_IOS_TEAM` (default empty): the Apple development team ID
+  `whisper_sign_ios_app` signs an iOS app with under the Xcode generator,
+  automatic signing and device family `1,2`. Empty, an iphoneos build is left
+  unsigned. On iOS, `Apps/Console` is not added and
+  `WHISPER_EACP_ENABLE_TESTS` defaults off, since a phone runs neither.
+
 - `WHISPER_EACP_ENABLE_WHISPER_CPP` (default `OFF`): fetches whisper.cpp and
   its GGML `tiny.en`, and builds `Tests/Oracle` against it.
 
 - `WHISPER_EACP_ENABLE_BENCHMARK` (default `OFF`): the same fetch with
   whisper.cpp's backends on, and the `Benchmark` target. See the benchmark
   section below for what that does to the oracle when both are on.
+
+### Building for an iPhone
+
+`CMakePresets.json` carries `ios-device`: the Xcode generator into
+`build-ios/`, `CMAKE_SYSTEM_NAME=iOS`, arm64, and `WHISPER_EACP_IOS_TEAM`
+set to the user's personal team, `LK9GL8NWU4`. It is for local phone tests,
+not for publishing.
+
+```bash
+cmake --preset ios-device
+cmake --build --preset ios-device      # LiveTranscribe, Debug, -allowProvisioningUpdates
+open build-ios/WhisperEACP.xcodeproj   # run the LiveTranscribe scheme on the phone
+```
+
+On iOS `Apps/Demo/LiveTranscribe` starts as it does on a Mac, with everything
+on the Neural Engine (`Arguments` in `Main.cpp`, the same on both platforms).
+Core ML needs iOS 17;
+below it the switch is refused and the app stays on the kernels. The first
+launch fetches the 151 MB model into the app's sandbox.
 
 ### The benchmark, and which whisper.cpp a tree gets
 
@@ -521,15 +546,22 @@ at runtime — the encoder to the Neural Engine with the mel on the GPU, "Core
 ML", or with the mel on Core ML too, "Core ML + mel"; the decoder to the CPU,
 "Core ML (CPU)", or to the engine, "Core ML (engine)", a `DecoderChoice` of
 backend and units. The last of each is everything on the Neural Engine, which
-`--ane` asks for from the start. Two
+is where the demo starts. Two
 boxes rather than one of every combination, because the runtime switches the
 halves apart and so does `Session`: each box is one request, and a second row
 because the first has no room for two more boxes at the window's minimum
 width. Each is there only where its `Whisper::supports...Backend` holds, and
 each follows the session rather than the click; both grey out while either
 half switches, since the session makes one switch at a time, the encoder's
-first when both are asked for. The model is always prepared on the kernels.
-`--coreml`, `--coreml-decoder` and `--ane` only make Core ML the first switches.
+first when both are asked for. The model is always prepared on the kernels,
+and where each half starts is only the first switch: "Core ML + mel" and "Core
+ML (engine)" by default on every platform (`--ane` names that), both halves
+left on the kernels under `--gpu`, the encoder on "Core ML" under `--coreml`
+and the decoder on "Core ML (CPU)" under `--coreml-decoder`, each of those
+two moving only its own half. `Session`'s constructor takes the two starts, an
+`EncoderBackend` and a `DecoderChoice`, and requests whichever is not the
+kernels. A refused switch leaves that half on the kernels, so the default is
+safe on a Mac with no engine and on iOS below 17.
 `Session::requestEncoderBackend` and `requestDecoderChoice` remember the
 choice. What follows is the encoder's switch, and the decoder's is the same
 through `switchDecoderBackendAsync(backend, units)`. The first tick with no

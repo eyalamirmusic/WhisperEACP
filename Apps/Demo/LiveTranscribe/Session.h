@@ -52,16 +52,12 @@ enum class ModelState
 class Session
 {
 public:
-    // encoderOnCoreML asks for the encoder on Core ML (the Neural Engine) from
-    // the start, and decoderOnCoreML the decoder (the CPU): the model is
-    // prepared on the kernels and switched as soon as it is Ready, exactly as
-    // the two request calls would. allOnTheEngine asks for everything on the
-    // Neural Engine instead, the mel with the encoder and the decoder too,
-    // Whisper::setNeuralEngineThroughout() made as two switches.
+    // Where each half starts: the model is prepared on the kernels and
+    // switched as soon as it is Ready, exactly as the two request calls would,
+    // so a half asked for on the kernels is never switched at all.
     Session(std::string modelDirectoryToUse,
-            bool encoderOnCoreML,
-            bool decoderOnCoreML,
-            bool allOnTheEngine);
+            WSP::EncoderBackend encoderAtStart,
+            const DecoderChoice& decoderAtStart);
 
     // Called once the state has settled on Ready or Failed, which is what the
     // app's autostart hangs off: the model arrives over the network now, so

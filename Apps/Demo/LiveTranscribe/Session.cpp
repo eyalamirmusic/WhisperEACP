@@ -49,24 +49,17 @@ std::string backendName(const DecoderChoice& choice)
 }
 
 Session::Session(std::string modelDirectoryToUse,
-                 bool encoderOnCoreML,
-                 bool decoderOnCoreML,
-                 bool allOnTheEngine)
+                 WSP::EncoderBackend encoderAtStart,
+                 const DecoderChoice& decoderAtStart)
     : modelDirectory(std::move(modelDirectoryToUse))
 {
     message = "loading model...";
 
-    if (encoderOnCoreML)
-        requestedBackend = WSP::EncoderBackend::coreML;
+    if (encoderAtStart != WSP::EncoderBackend::kernels)
+        requestedBackend = encoderAtStart;
 
-    if (decoderOnCoreML)
-        requestedDecoder = decoderOnTheCpu;
-
-    if (allOnTheEngine)
-    {
-        requestedBackend = WSP::EncoderBackend::coreMLWithMel;
-        requestedDecoder = decoderOnTheEngine;
-    }
+    if (decoderAtStart != DecoderChoice {})
+        requestedDecoder = decoderAtStart;
 }
 
 DecoderChoice Session::decoderChoice() const
