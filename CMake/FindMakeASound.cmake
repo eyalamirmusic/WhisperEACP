@@ -6,4 +6,4 @@ include(CPM)
 CPMAddPackage(
         NAME MakeASound
         GITHUB_REPOSITORY eyalamirmusic/makeasound
-        GIT_TAG main)
+        GIT_TAG develop)
