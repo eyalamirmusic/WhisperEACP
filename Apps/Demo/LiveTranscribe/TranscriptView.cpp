@@ -138,7 +138,8 @@ void TranscriptView::paint(UI::Graphics& g)
 
         first = false;
 
-        g.setColour(line.pending ? theme.accent : theme.text);
+        g.setColour(
+            theme.get(line.pending ? UI::ThemeKeys::accent : UI::ThemeKeys::text));
         g.drawText(line.text,
                    UI::Rect {textInset, y, layoutWidth - 2.f * textInset, step});
 
