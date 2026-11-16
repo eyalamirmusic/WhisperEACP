@@ -2,6 +2,8 @@
 
 #include "Common.h"
 
+#include <WhisperEACP/Core/Utils/Half.h>
+
 #include <algorithm>
 #include <cstring>
 
@@ -126,11 +128,8 @@ inline Vector<float> packedHalves(const Vector<float>& values,
 
     for (auto i = 0; i < values.size(); ++i)
     {
-        auto half = (_Float16) values[i];
-        widened[i] = (float) half;
-
-        auto bits = std::uint16_t {};
-        std::memcpy(&bits, &half, sizeof(bits));
+        const auto bits = packHalf(values[i]);
+        widened[i] = halfToFloat(bits);
 
         auto word = std::uint32_t {};
         std::memcpy(&word, &words[i / 2], sizeof(word));
