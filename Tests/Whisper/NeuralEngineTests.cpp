@@ -240,7 +240,9 @@ auto tSwitchToTheMelOnCoreML =
     whisper->switchEncoderBackend(EncoderBackend::coreML);
     check(whisper->encoderBackend() == EncoderBackend::coreML);
     check(sameTokens(whisper->transcribe(jfkSamples()), kernelTokens()));
+#if EACP_HAS_COREML
     check(throwsLogicError([&] { whisper->melComputePlan(); }));
+#endif
 
     auto pending = whisper->switchEncoderBackendAsync(EncoderBackend::coreMLWithMel);
     check(whisper->isSwitchingEncoder());
