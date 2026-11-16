@@ -2,6 +2,7 @@
 
 #include <NanoTest/NanoTest.h>
 
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cmath>
@@ -27,9 +28,19 @@ bool near(float value, float expected)
     return std::abs(value - expected) < tolerance;
 }
 
+// MakeASound's Buffer reads through a table of per-channel pointers rather than
+// one contiguous block, so the planar data is copied into an owning one.
 MakeASound::Buffer planarBlock(Span<float> data, int channels)
 {
-    return MakeASound::Buffer {data.data(), channels, data.size() / channels};
+    const auto frames = (int) data.size() / channels;
+    auto block = MakeASound::Buffer {channels, frames};
+
+    for (auto channel = 0; channel < channels; ++channel)
+        std::copy_n(data.begin() + channel * frames,
+                    frames,
+                    block.getChannelPointer(channel));
+
+    return block;
 }
 
 bool liveCaptureRequested()
