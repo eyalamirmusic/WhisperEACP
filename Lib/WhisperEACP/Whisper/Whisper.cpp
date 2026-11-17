@@ -821,10 +821,10 @@ eacp::Threads::Async<void> Whisper::switchEncoderBackendAsync(EncoderBackend bac
         return promise.get();
     }
 
-#if EACP_HAS_COREML
     requireIdle();
     requireRunnableEncoder(backend);
 
+#if EACP_HAS_COREML
     const auto hostWeights = EncoderWeights {
         *weightsFile, encoder->shape(), weightPacking(), WeightPlacement::Host};
 

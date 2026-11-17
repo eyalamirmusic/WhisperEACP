@@ -11,6 +11,7 @@ target_include_directories(whisper-core PUBLIC ${CMAKE_CURRENT_LIST_DIR}/../../)
 target_link_libraries(whisper-core PUBLIC eacp-gpu)
 
 target_sources(whisper-core PRIVATE
+        Utils/Half.cpp
         Utils/Version.cpp)
 
 # The one place the library's own version lives is project(), so read it from

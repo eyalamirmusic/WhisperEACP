@@ -42,6 +42,15 @@ void setLabelText(UI::Label& label, std::string text)
         label.setText(std::move(text));
 }
 
+// A control that is waiting on something is drawn in the outline colour in
+// place of the accent.
+UI::Color availabilityAccent(bool available)
+{
+    const auto& theme = UI::defaultTheme();
+
+    return theme.get(available ? UI::ThemeKeys::accent : UI::ThemeKeys::outline);
+}
+
 void fillBox(UI::ComboBox& box,
              WSP::Vector<int>& ids,
              const MakeASound::UI::DropdownInfo& info)
@@ -77,7 +86,7 @@ MainRoot::MainRoot(Session& sessionToUse)
                        &decoderCaption,
                        &footer})
     {
-        label->setColour(UI::defaultTheme().dimText);
+        label->setColour(UI::defaultTheme().get(UI::ThemeKeys::dimText));
         label->setFontSize(smallText);
     }
 
@@ -213,8 +222,7 @@ void MainRoot::applyStartButtonState()
     if (available != startIsAvailable)
     {
         startIsAvailable = available;
-        startButton.setAccentColour(available ? UI::defaultTheme().accent
-                                              : UI::defaultTheme().outline);
+        startButton.setAccentColour(availabilityAccent(available));
     }
 
     const auto capturing = session.isCapturing();
@@ -240,8 +248,7 @@ void MainRoot::applyBackendBoxState()
     if (available != backendBoxIsAvailable)
     {
         backendBoxIsAvailable = available;
-        backendBox.setAccentColour(available ? UI::defaultTheme().accent
-                                             : UI::defaultTheme().outline);
+        backendBox.setAccentColour(availabilityAccent(available));
     }
 
     if (backendBox.isPopupOpen())
@@ -273,8 +280,7 @@ void MainRoot::applyDecoderBoxState()
     if (available != decoderBoxIsAvailable)
     {
         decoderBoxIsAvailable = available;
-        decoderBox.setAccentColour(available ? UI::defaultTheme().accent
-                                             : UI::defaultTheme().outline);
+        decoderBox.setAccentColour(availabilityAccent(available));
     }
 
     if (decoderBox.isPopupOpen())
@@ -391,7 +397,7 @@ std::string MainRoot::footerText() const
 
 void MainRoot::paint(UI::Graphics& g)
 {
-    g.fillAll(UI::defaultTheme().background);
+    g.fillAll(UI::defaultTheme().get(UI::ThemeKeys::background));
 }
 
 void MainRoot::resized()
@@ -472,7 +478,7 @@ MainPanel::MainPanel(Session& session)
     : root(session)
 {
     setFontPointSize(13.f);
-    setBackgroundColour(UI::defaultTheme().background);
+    setBackgroundColour(UI::defaultTheme().get(UI::ThemeKeys::background));
     setRootComponent(root);
 }
 } // namespace LiveTranscribe

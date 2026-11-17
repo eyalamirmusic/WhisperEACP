@@ -86,7 +86,7 @@ void LevelMeter::paint(UI::Graphics& g)
     const auto bounds = getLocalBounds();
     const auto corner = std::min(bounds.h * 0.5f, 4.f);
 
-    g.setColour(theme.panel);
+    g.setColour(theme.get(UI::ThemeKeys::panel));
     g.fillRoundedRect(bounds, corner);
 
     if (fillPosition > 0.f)
@@ -101,11 +101,11 @@ void LevelMeter::paint(UI::Graphics& g)
         const auto left =
             std::min(bounds.w * peakPosition, bounds.w - peakTickWidth);
 
-        g.setColour(theme.text);
+        g.setColour(theme.get(UI::ThemeKeys::text));
         g.fillRect({bounds.x + left, bounds.y, peakTickWidth, bounds.h});
     }
 
-    g.setColour(theme.outline);
+    g.setColour(theme.get(UI::ThemeKeys::outline));
     g.drawRoundedRect(bounds, corner);
 }
 } // namespace LiveTranscribe
