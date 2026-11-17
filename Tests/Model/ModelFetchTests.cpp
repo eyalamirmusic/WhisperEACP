@@ -47,15 +47,20 @@ auto tDirectoryIsSharedByEveryBinary = test("ModelFetch/directoryIsShared") = []
     check(!directory.empty());
     check(directory.is_absolute());
     check(directory == ModelFetch::directory());
-    check(mentions(directory.string(), eacp::FilePath::appDataDirectory().str()));
-    check(mentions(directory.string(), "WhisperEACP"));
+
+    // FilePath spells every path with forward slashes, and a std::filesystem
+    // path's string() is native, so the two are compared in the generic form.
+    const auto text = directory.generic_string();
+
+    check(mentions(text, eacp::FilePath::appDataDirectory().str()));
+    check(mentions(text, "WhisperEACP"));
 
     // The per-binary folder is not an ancestor of it: that one is named after
     // the running executable, so ModelTests would hold a copy of its own.
     const auto perBinary = eacp::FilePath::appSupportDirectory().str();
 
     check(!perBinary.empty());
-    check(directory.string().rfind(perBinary, 0) != 0);
+    check(text.rfind(perBinary, 0) != 0);
 };
 
 // Four files, each at the pinned revision rather than at main, and each with the
